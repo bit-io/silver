@@ -283,7 +283,7 @@ fn resolve_auto_margins(ml_in: int, mr_in: int, avail_w: int, used_w: int) -> st
             if mr < 0 is mr = 0 end
         end
     end
-    return BoxSides { top: 0, right: mr, bottom: 0, left: ml }
+    return style::BoxSides { top: 0, right: mr, bottom: 0, left: ml }
 end
 
 fn layout_node(win_handle: int, dom: dom::Dom, sheet: css::Stylesheet, node_id: int,
