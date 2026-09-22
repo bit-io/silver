@@ -49,5 +49,5 @@ pub fn apply_state(dom: dom::Dom, store: string) -> dom::Dom is
             out_nodes = array_push(out_nodes, n)
         end
     end
-    return Dom { nodes: out_nodes }
+    return dom::Dom { nodes: out_nodes }
 end
