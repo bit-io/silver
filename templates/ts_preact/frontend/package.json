@@ -1,0 +1,12 @@
+{
+  "name": "silver-ts-preact-frontend",
+  "private": true,
+  "version": "0.2.0",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": { "preact": "^10.19.0" },
+  "devDependencies": { "esbuild": "^0.21.0", "typescript": "^5.4.0" }
+}
