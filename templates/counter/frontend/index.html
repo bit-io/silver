@@ -1,12 +1,12 @@
 <div class="page">
     <div class="card">
         <h1>Licznik</h1>
-        <p>Wartość: <span class="count">{{count}}</span></p>
-        <div class="button plus" id="inc" on-click="increment">
-            <span>+ Zwiększ</span>
+        <p class="count" id="count">{{count}}</p>
+        <div class="row">
+            <button class="btn" on-click="decrement">−1</button>
+            <button class="btn primary" on-click="increment">+1</button>
+            <button class="btn ghost" id="reset">reset (JS)</button>
         </div>
-        <div class="button minus" id="dec" on-click="decrement">
-            <span>- Zmniejsz</span>
-        </div>
+        <p class="hint" id="hint">Skróty: strzałka ↑ / ↓, spacja = +1</p>
     </div>
 </div>
