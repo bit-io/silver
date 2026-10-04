@@ -1,0 +1,27 @@
+[package]
+-> name        => dashboard-template
+-> version     => 0.2.0
+-> description => Przykład Silver — pulpit: zadania w tle, on_tick, grid, przejścia CSS, wykresy z JS
+-> authors     => ["Bit Developers"]
+-> license     => MIT
+-> lang        => h#
+
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+[dependencies]
+-> silver => ^0.2
+
+[default-build]
+-> profile => release
+-> target  => h#
+-> emit    => bin
+-> run     => true
+
+[commands]
+-> dev
+--> run => bit run
+--> description => Uruchom aplikację
