@@ -2,16 +2,44 @@
 -> name        => silver
 -> version     => 0.2.0
 -> description => Tauri-podobny framework okienkowy z własnym silnikiem renderującym (bez WebView)
--> author      => Bytes Developers
+-> authors     => ["Bit Developers"]
 -> license     => MIT
+-> lang        => h#
+
+[layout]
+-> src => src
 
 [build]
--> lang   => h#
--> entry  => src/lib.h#
--> output => build/silver
--> emit   => lib
+-> link => static
+-> native          => sh native/build.sh
+-> native-lib-path => native/build
+-> native-skip-if  => native/build/libsilvershim.a
 
-[deps]
--> SDL2       => static
--> SDL2_image => static
--> quickjs    => static
+[lib]
+-> output => hlib
+
+[commands]
+! `bit test` — wykonuje testy dostępne bez okna: sprawdzenie typów całej biblioteki + CLI + testów,
+! test dymny warstwy natywnej. Testy #[test] z src/engine_tests.h# uruchamia runner H# (h# test lub odpowiednik,
+! zależnie od wersji toolchaina) — tu sprawdzamy ich składnię i typy.
+-> test
+--> run => sh native/tests/run-all.sh
+--> description => Typy H# + test natywny (SDL2/QuickJS/DOM) [+ run-js.sh gdy jest node]
+-> native
+--> run => sh native/build.sh
+--> description => Zbuduj biblioteki natywne (libsilvershim.a, libsilverjs.a, libsilverdialogs.a)
+-> native-test
+--> run => sh native/tests/run.sh
+--> description => Test dymny warstwy natywnej (SDL2 + QuickJS, wymaga Xvfb bez ekranu)
+-> engine-check
+--> run => h# check src/lib.h# src/cli/silver_cli.h#
+--> description => Sprawdź składnię i typy całej biblioteki oraz CLI
+-> templates
+--> run => python3 tools/gen_templates.py
+--> description => Wygeneruj src/cli/templates_data.h# z templates/ i packaging/
+-> js-embed
+--> run => python3 native/gen_api_embed.py
+--> description => Wygeneruj native/silver_api_embed.h z src/js/*.js
+-> js-test
+--> run => sh native/tests/run-js.sh
+--> description => Zbuduj szablony TS/Svelte (npm + esbuild) i uruchom je w QuickJS na lustrze DOM
