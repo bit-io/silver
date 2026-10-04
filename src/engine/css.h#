@@ -1,138 +1,91 @@
 mod dom
+mod cssval
 
 pub struct CssDecl is
-    pub prop: string
+    pub prop:      string
+    pub val:       string
+    pub important: bool
+end
+
+pub struct AttrSel is
+    pub name: string
+    pub op:   string    ;; "" (istnieje) | "=" | "~=" | "|=" | "^=" | "$=" | "*="
     pub val:  string
 end
 
+;; Pojedynczy selektor złożony (bez kombinatorów), np. `a.btn#x[href]:hover`
+pub struct Compound is
+    pub tag:     string      ;; "" = dowolny ("*")
+    pub id:      string
+    pub classes: [string]
+    pub attrs:   [AttrSel]
+    pub pseudos: [string]    ;; np. "hover", "nth-child(2n+1)"
+    pub nots:    [string]    ;; wnętrza :not(...) — lista selektorów po przecinku
+    pub iss:     [string]    ;; wnętrza :is()/:where()
+end
+
 pub struct CssRule is
-    pub selector: string     ;; np. ".button", "#title", "p", ".card p",
-                              ;; ".a > .b", ".a + .b", ".a ~ .b", ".btn:hover"
+    pub selector: string
     pub decls:    [CssDecl]
+    pub media:    string       ;; "" = zawsze
+    pub order:    int
+    pub spec:     int
+    pub comps:    [Compound]   ;; od lewej do prawej
+    pub combs:    [string]     ;; combs[i] = kombinator między comps[i-1] a comps[i]
+    pub pelem:    string       ;; "" | "before" | "after"
 end
 
 pub struct Stylesheet is
     pub rules: [CssRule]
 end
 
-;; Rozbudowa: rozłożony na proste selektory + kombinatory między nimi
-;; złożony selektor (" " = potomek, ">" = bezpośrednie dziecko,
-;; "+" = najbliższy poprzedni rodzony, "~" = dowolny poprzedni rodzony).
-;; `sels[n-1]` to zawsze selektor węzła docelowego (ten, do którego
-;; dopasowujemy regułę); `combs[i]` to kombinator MIĘDZY `sels[i-1]` a
-;; `sels[i]` ("none" dla i==0).
 pub struct SelectorPath is
     pub sels:  [string]
     pub combs: [string]
 end
 
-;; Rozbudowa v0.2: stan interakcji (mysz/focus) do rozwiązywania
-;; pseudoklas `:hover`/`:focus`/`:active`. `hovered_id`: id węzła pod
-;; kursorem (`-1` = brak/mysz poza treścią). `focused_id`: `attr_id`
-;; focusowanego elementu (dziś w praktyce tylko `<input>` — patrz
-;; `app.h#`); `""` = nic nie ma focusu. `active_id`: id węzła, na
-;; którym trzymany jest wciśnięty przycisk myszy (od `mouse_down` do
-;; `mouse_up`, patrz `app::handle_mouse_down`/`handle_mouse_up`);
-;; `-1` = nic nie jest wciśnięte. Budowana raz na klatkę w `app.h#` i
-;; przekazywana przez `layout::layout_i` do wszystkiego, co rozwiązuje
-;; styl. Osobny parametr zamiast pola na `dom::DomNode`, bo `dom::Dom`
-;; z `app.h#` jest współdzielony/przechowywany między klatkami (hot
-;; reload, `template::apply_state`) — nie chcemy co klatkę mutować
-;; węzły tylko po to, żeby zakodować coś, co i tak jest tylko
-;; właściwością BIEŻĄCEJ klatki.
+;; Stan wejścia/środowiska dla pseudoklas i @media, budowany raz na klatkę.
 pub struct InteractionState is
-    pub hovered_id: int
-    pub focused_id: string
-    pub active_id:  int
+    pub hovered_id:  int
+    pub focused_id:  string   ;; attr_id elementu z fokusem ("" = brak)
+    pub active_id:   int
+    pub focused_node: int     ;; id węzła z fokusem (-1 = brak)
+    pub viewport_w:  int
+    pub viewport_h:  int
+    pub dark:        bool
 end
 
 pub fn no_interaction() -> InteractionState is
-    return InteractionState { hovered_id: -1, focused_id: "", active_id: -1 }
+    return InteractionState { hovered_id: -1, focused_id: "", active_id: -1, focused_node: -1,
+                              viewport_w: 800, viewport_h: 600, dark: false }
 end
 
-;; Rozbicie prostego tokenu selektora na część "bazową" (tag/.class/
-;; #id) i opcjonalną pseudoklasę po dwukropku, np. ".btn:hover" ->
-;; base=".btn", pseudo="hover". Brak dwukropka -> pseudo="".
-pub struct TokenParts is
-    pub base:   string
-    pub pseudo: string
+pub fn interaction(hovered: int, focused_node: int, active: int) -> InteractionState is
+    return InteractionState { hovered_id: hovered, focused_id: "", active_id: active,
+                              focused_node: focused_node, viewport_w: 800, viewport_h: 600, dark: false }
 end
 
-fn parse_token_parts(token: string) -> TokenParts is
-    let colon: int = string_find(token, ":")
-    if colon < 0 is return TokenParts { base: token, pseudo: "" } end
-    return TokenParts {
-        base: string_slice(token, 0, colon),
-        pseudo: string_slice(token, colon + 1, string_len(token))
-    }
+;; Zgodność z 0.1: fokus po attr_id zamiast id węzła.
+pub fn ix_legacy(hovered: int, focused_id: string, active: int) -> InteractionState is
+    return InteractionState { hovered_id: hovered, focused_id: focused_id, active_id: active, focused_node: -1,
+                              viewport_w: 800, viewport_h: 600, dark: false }
 end
 
-fn parse_decls(block: string) -> [CssDecl] is
-    let mut decls: [CssDecl] = []
-    let items: [string] = string_split(block, ";")
-    let count: int = array_len(items)
-    let mut i: int = 0
-    while i < count is
-        let raw: string = string_trim(items[i])
-        i += 1
-        if raw == "" is continue end
-        let colon: int = string_find(raw, ":")
-        if colon < 0 is continue end
-        let prop: string = string_trim(string_slice(raw, 0, colon))
-        let val:  string = string_trim(string_slice(raw, colon + 1, string_len(raw)))
-        if prop != "" is
-            decls = array_push(decls, CssDecl { prop: prop, val: val })
-        end
-    end
-    return decls
+pub fn empty_sheet() -> Stylesheet is
+    return Stylesheet { rules: [] }
 end
 
-pub fn parse(css: string) -> Stylesheet is
-    let stripped: string = strip_comments(css)
-    let mut rules: [CssRule] = []
-    let n: int = string_len(stripped)
-    let mut p: int = 0
-    while p < n is
-        let open: int = find_char(stripped, "{", p)
-        if open < 0 is
-            p = n
-            continue
-        end
-        let selector_group: string = string_trim(string_slice(stripped, p, open))
-        let close: int = find_char(stripped, "}", open)
-        if close < 0 is
-            p = n
-            continue
-        end
-        let block: string = string_slice(stripped, open + 1, close)
-        let decls: [CssDecl] = parse_decls(block)
-
-        ;; Rozbudowa: grupowanie selektorów przecinkiem, np.
-        ;; ".btn, .link { ... }" — dokładnie jak w prawdziwym CSS, to
-        ;; skrót na dwie osobne reguły z tymi samymi deklaracjami.
-        let group: [string] = string_split(selector_group, ",")
-        let gcount: int = array_len(group)
-        let mut gi: int = 0
-        while gi < gcount is
-            let sel: string = string_trim(group[gi])
-            gi += 1
-            if sel != "" is
-                rules = array_push(rules, CssRule { selector: sel, decls: decls })
-            end
-        end
-        p = close + 1
-    end
-    return Stylesheet { rules: rules }
+;; ---------- pomocnicze ----------
+fn find_char(s: string, ch: string, from: int) -> int is
+    return dom::find_from(s, ch, from)
 end
 
-;; Usuwa komentarze `/* ... */` (w tym wieloliniowe) przed parsowaniem —
-;; rozbudowa v0.2. Bez tego kroku komentarz umieszczony przed selektorem
-;; wciągnąłby się jako część selektora (parser szuka po prostu
-;; najbliższego `{`), co po cichu psuje regułę zamiast dać błąd, więc
-;; brak wsparcia dla komentarzy był realną pułapką, nie tylko brakiem
-;; funkcji. Nie obsługuje `//` (nie jest to poprawny komentarz CSS) ani
-;; komentarzy zagnieżdżonych (CSS też ich nie zna).
+fn is_ws(c: string) -> bool is
+    return c == " " || c == "\n" || c == "\t" || c == "\r"
+end
+
 fn strip_comments(css: string) -> string is
+    if string_find(css, "/*") < 0 is return css end
     let mut out: string = ""
     let n: int = string_len(css)
     let mut p: int = 0
@@ -144,223 +97,511 @@ fn strip_comments(css: string) -> string is
             continue
         end
         out = out + string_slice(css, p, start)
-        let end_marker: int = find_char(css, "*/", start + 2)
-        if end_marker < 0 is
-            ;; niedomknięty komentarz do końca pliku — reszta jest ucinana,
-            ;; tak jak zrobiłaby to prawdziwa przeglądarka.
+        let e: int = find_char(css, "*/", start + 2)
+        if e < 0 is
             p = n
             continue
         end
-        p = end_marker + 2
+        p = e + 2
     end
     return out
 end
 
-fn find_char(s: string, ch: string, from: int) -> int is
-    if from >= string_len(s) is return -1 end
-    let idx: int = string_find(string_slice(s, from, string_len(s)), ch)
-    if idx < 0 is return -1 end
-    return idx + from
-end
-
-;; Rozbicie POJEDYNCZEGO tokenu selektora (bez pseudoklasy — tę zdejmuje
-;; wcześniej `parse_token_parts`) na tag/klasy/id, np. "div.btn.primary"
-;; -> tag="div", classes=["btn","primary"], id="". CSS pozwala łączyć
-;; tag + dowolną liczbę klas + id BEZ kombinatora, żeby wymagać ich
-;; wszystkich naraz na JEDNYM elemencie (w przeciwieństwie do np.
-;; ".a .b", gdzie spacja oznacza "gdziekolwiek w przodkach").
-pub struct CompoundSimple is
-    pub tag:     string    ;; "" = dowolny tag
-    pub classes: [string]
-    pub id:      string    ;; "" = bez wymogu id
-end
-
-fn parse_compound_simple(token: string) -> CompoundSimple is
-    let mut tag: string = ""
-    let mut classes: [string] = []
-    let mut id: string = ""
-    let n: int = string_len(token)
-    let mut seg_start: int = 0
-    let mut seg_kind: string = "tag"
-    let mut i: int = 0
-    while i < n is
-        let c: string = string_slice(token, i, i + 1)
-        if c == "." || c == "#" is
-            let seg: string = string_slice(token, seg_start, i)
-            if seg != "" is
-                if seg_kind == "tag" is tag = seg
-                elsif seg_kind == "class" is classes = array_push(classes, seg)
-                else is id = seg end
-            end
-            seg_kind = if c == "." then "class" else "id"
-            seg_start = i + 1
-        end
-        i += 1
-    end
-    let last: string = string_slice(token, seg_start, n)
-    if last != "" is
-        if seg_kind == "tag" is tag = last
-        elsif seg_kind == "class" is classes = array_push(classes, last)
-        else is id = last end
-    end
-    return CompoundSimple { tag: tag, classes: classes, id: id }
-end
-
-fn compound_simple_matches(cs: CompoundSimple, tag: string, id: string, node_classes: [string]) -> bool is
-    if cs.tag != "" && cs.tag != tag is return false end
-    if cs.id != "" && cs.id != id is return false end
-    let need: int = array_len(cs.classes)
-    let mut i: int = 0
-    while i < need is
-        let want: string = cs.classes[i]
-        let mut found: bool = false
-        let mut j: int = 0
-        while j < array_len(node_classes) is
-            if node_classes[j] == want is found = true end
-            j += 1
-        end
-        if !found is return false end
-        i += 1
-    end
-    return true
-end
-
-;; Czy PROSTY (bez kombinatorów) selektor pasuje do węzła o danym
-;; tagu/id/klasach — obsługuje pojedyncze tag/`.class`/`#id`, a od tej
-;; rozbudowy też DOWOLNĄ ich kombinację bez kombinatora, np.
-;; "div.btn.primary" albo "#card.active" (patrz `parse_compound_simple`
-;; wyżej — poprzednia wersja tej funkcji sprawdzała tylko PIERWSZY
-;; token po kropce, więc ".btn.primary" po cichu nigdy nie dopasowywało
-;; niczego — realny błąd, nie tylko brak funkcji, złapany przy pisaniu
-;; demo w szablonie `kitchen_sink`, które od początku miało dokładnie
-;; taki selektor). Dla selektora złożonego kombinatorem (" "/">"/"+"/"~"
-;; w środku) to wciąż "działa" bez crasha, ale najpewniej nie znajdzie
-;; dopasowania — np. ".card p" zaczyna się od "." więc trafia w gałąź
-;; klasy i szuka klasy dosłownie nazwanej "card p", której żaden
-;; element nie ma. To zamierzone bezpieczne zachowanie starego,
-;; "płaskiego" API (`matching_decls`/`resolve` bez kontekstu drzewa) —
-;; pełne wsparcie kombinatorów i pseudoklas jest w
-;; `matching_decls_ctx`/`style::resolve_ctx`, których używa silnik
-;; layoutu (ma dostęp do `dom::Dom` i `InteractionState`). Nie obsługuje
-;; pseudoklas — wołający powinien podać samą część bazową (patrz
-;; `node_matches_simple` niżej, które robi to rozbicie przed
-;; wywołaniem tej funkcji).
-pub fn selector_matches(selector: string, tag: string, id: string, classes: [string]) -> bool is
-    let cs: CompoundSimple = parse_compound_simple(selector)
-    return compound_simple_matches(cs, tag, id, classes)
-end
-
-;; Specyficzność prostego selektora (jednego tokenu, może mieć
-;; pseudoklasę i/lub kilka klas naraz, np. ".btn.primary:hover"):
-;; id=3 (jeśli jest `#id`), inaczej class-poziom=2 jeśli jest
-;; przynajmniej jedna `.class` ALBO pseudoklasa, inaczej sam tag=1.
-;; UPROSZCZENIE: to wciąż jeden "poziom" na token, nie suma — dwie
-;; klasy na tym samym tokenie (`.btn.primary`) liczą się tyle samo co
-;; jedna (obie=2), mimo że w prawdziwym CSS `.btn.primary` (2×10) bije
-;; samo `.btn` (1×10). Patrz też komentarz przy `specificity` niżej.
-fn specificity_simple(token: string) -> int is
-    let parts: TokenParts = parse_token_parts(token)
-    let cs: CompoundSimple = parse_compound_simple(parts.base)
-    if cs.id != "" is return 3 end
-    if array_len(cs.classes) > 0 || parts.pseudo != "" is return 2 end
-    return 1
-end
-
-;; Specyficzność selektora złożonego — UPROSZCZENIE: liczymy tylko
-;; specyficzność ostatniego (docelowego) prostego selektora, nie sumę
-;; wszystkich jak w prawdziwym CSS (`#a .b` naprawdę miałoby 3+2=5, tu
-;; ma 2, bo ostatni token to `.b`). W praktyce dla typowych reguł
-;; (".card p", ".a > .b", ".btn:hover", ".btn.primary") daje sensowną,
-;; przewidywalną kolejność w prostej 3-koszykowej kaskadzie poniżej —
-;; patrz ROADMAP.md, jeśli kiedyś zajdzie potrzeba pełnego sumowania.
-pub fn specificity(selector: string) -> int is
-    let path: SelectorPath = tokenize_selector(selector)
-    let n: int = array_len(path.sels)
-    if n == 0 is return 1 end
-    return specificity_simple(path.sels[n - 1])
-end
-
-;; Otacza kombinatory (">", "+", "~") spacjami, żeby dalszy
-;; split-po-spacji zawsze wydzielił je jako osobne tokeny niezależnie
-;; od tego, czy autor CSS napisał "a>b", "a > b" czy "a >b" (i tak
-;; samo dla "+"/"~"). Rozbudowa (`:nth-child`): pomija znaki wewnątrz
-;; nawiasów — argument pseudoklasy jak `nth-child(2n+1)` zawiera
-;; dosłowny znak "+", który NIE jest kombinatorem rodzeństwa. Naiwny
-;; `string_replace` na całym selektorze rozbiłby taki argument w pół
-;; (`nth-child(2n` + kombinator + `1)`) — złapane właśnie przy pisaniu
-;; tej rozbudowy, zanim trafiło do jakiegokolwiek szablonu.
-fn normalize_combinators(selector: string) -> string is
-    let mut out: string = ""
-    let n: int = string_len(selector)
+;; Indeks domykającego `}` dla `{` na pozycji `open` (z zagnieżdżeniem i cudzysłowami); -1 gdy brak.
+fn matching_brace(s: string, open: int) -> int is
+    let n: int = string_len(s)
     let mut depth: int = 0
-    let mut i: int = 0
+    let mut quote: string = ""
+    let mut i: int = open
     while i < n is
-        let c: string = string_slice(selector, i, i + 1)
-        if c == "(" is depth += 1
-        elsif c == ")" is depth -= 1
-        end
-        if depth == 0 && (c == ">" || c == "+" || c == "~") is
-            out = out + " " + c + " "
-        else is
-            out = out + c
+        let c: string = string_at(s, i)
+        if quote != "" is
+            if c == quote is quote = "" end
+        elsif c == "\"" || c == "'" is
+            quote = c
+        elsif c == "{" is
+            depth += 1
+        elsif c == "}" is
+            depth -= 1
+            if depth == 0 is return i end
         end
         i += 1
     end
+    return -1
+end
+
+;; ---------- deklaracje ----------
+;; Podział po `;` z poszanowaniem nawiasów i cudzysłowów (url(data:…;base64,…)).
+fn split_decls(block: string) -> [string] is
+    let n: int = string_len(block)
+    let mut out: [string] = []
+    let mut depth: int = 0
+    let mut quote: string = ""
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(block, i)
+        if quote != "" is
+            if c == quote is quote = "" end
+            cur = cur + c
+        elsif c == "\"" || c == "'" is
+            quote = c
+            cur = cur + c
+        elsif c == "(" is
+            depth += 1
+            cur = cur + c
+        elsif c == ")" is
+            depth -= 1
+            cur = cur + c
+        elsif c == ";" && depth <= 0 is
+            out = array_push(out, cur)
+            cur = ""
+        else is
+            cur = cur + c
+        end
+        i += 1
+    end
+    if string_trim(cur) != "" is out = array_push(out, cur) end
     return out
 end
 
-;; Rozbija selektor złożony na proste selektory + kombinatory między
-;; nimi. Selektor prosty (bez spacji/kombinatorów) zwraca ścieżkę
-;; jednoelementową — więc ta funkcja jest bezpieczna do wołania zawsze,
-;; nie tylko dla faktycznie złożonych selektorów.
-pub fn tokenize_selector(selector: string) -> SelectorPath is
-    let norm: string = normalize_combinators(selector)
-    let raw: [string] = string_split(string_trim(norm), " ")
-    let mut sels:  [string] = []
-    let mut combs: [string] = []
-    let mut pending_comb: string = ""
-    let count: int = array_len(raw)
+pub fn parse_decls(block: string) -> [CssDecl] is
+    let mut decls: [CssDecl] = []
+    let items: [string] = split_decls(block)
     let mut i: int = 0
-    while i < count is
-        let t: string = string_trim(raw[i])
+    while i < array_len(items) is
+        let raw: string = string_trim(items[i])
         i += 1
-        if t == "" is continue end
+        if raw == "" is continue end
+        let colon: int = string_find(raw, ":")
+        if colon < 0 is continue end
+        let mut prop: string = string_trim(string_slice(raw, 0, colon))
+        let mut val: string = string_trim(string_slice(raw, colon + 1, string_len(raw)))
+        let mut important: bool = false
+        let bang: int = string_find(val, "!")
+        if bang >= 0 is
+            let flag: string = string_lower(string_replace(string_slice(val, bang + 1, string_len(val)), " ", ""))
+            if flag == "important" is
+                important = true
+                val = string_trim(string_slice(val, 0, bang))
+            end
+        end
+        if !string_starts_with(prop, "--") is prop = string_lower(prop) end
+        if prop != "" is
+            decls = array_push(decls, CssDecl { prop: prop, val: val, important: important })
+        end
+    end
+    return decls
+end
+
+;; ---------- selektory ----------
+fn is_ident_char(c: string) -> bool is
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "-" || c == "_"
+end
+
+;; Wnętrze nawiasu zaczynającego się na `open` ("(") → indeks domknięcia
+fn paren_end(s: string, open: int) -> int is
+    let n: int = string_len(s)
+    let mut depth: int = 0
+    let mut i: int = open
+    while i < n is
+        let c: string = string_at(s, i)
+        if c == "(" is depth += 1 end
+        if c == ")" is
+            depth -= 1
+            if depth == 0 is return i end
+        end
+        i += 1
+    end
+    return n - 1
+end
+
+fn bracket_end(s: string, open: int) -> int is
+    let n: int = string_len(s)
+    let mut quote: string = ""
+    let mut i: int = open
+    while i < n is
+        let c: string = string_at(s, i)
+        if quote != "" is
+            if c == quote is quote = "" end
+        elsif c == "\"" || c == "'" is
+            quote = c
+        elsif c == "]" is
+            return i
+        end
+        i += 1
+    end
+    return n - 1
+end
+
+fn parse_attr_sel(inner: string) -> AttrSel is
+    let ops: [string] = ["~=", "|=", "^=", "$=", "*=", "="]
+    let mut i: int = 0
+    while i < array_len(ops) is
+        let idx: int = string_find(inner, ops[i])
+        if idx > 0 is
+            let name: string = string_lower(string_trim(string_slice(inner, 0, idx)))
+            let mut val: string = string_trim(string_slice(inner, idx + string_len(ops[i]), string_len(inner)))
+            if string_len(val) >= 2 && (string_starts_with(val, "\"") || string_starts_with(val, "'")) is
+                val = string_slice(val, 1, string_len(val) - 1)
+            end
+            let mut vv: string = val
+            if string_ends_with(vv, " i") is vv = string_trim(string_slice(vv, 0, string_len(vv) - 2)) end
+            return AttrSel { name: name, op: ops[i], val: vv }
+        end
+        i += 1
+    end
+    return AttrSel { name: string_lower(string_trim(inner)), op: "", val: "" }
+end
+
+struct ParsedCompound is
+    pub comp:  Compound
+    pub pelem: string
+end
+
+fn empty_compound() -> Compound is
+    return Compound { tag: "", id: "", classes: [], attrs: [], pseudos: [], nots: [], iss: [] }
+end
+
+fn parse_compound(token: string) -> ParsedCompound is
+    let n: int = string_len(token)
+    let mut c: Compound = empty_compound()
+    let mut pelem: string = ""
+    let mut i: int = 0
+    ;; tag / *
+    let mut j: int = 0
+    while j < n && (is_ident_char(string_at(token, j)) || string_at(token, j) == "*" || string_at(token, j) == "|") is j += 1 end
+    if j > 0 is
+        let t: string = string_lower(string_slice(token, 0, j))
+        c.tag = if t == "*" then "" else t
+        i = j
+    end
+    while i < n is
+        let ch: string = string_at(token, i)
+        if ch == "." is
+            let mut k: int = i + 1
+            while k < n && is_ident_char(string_at(token, k)) is k += 1 end
+            c.classes = array_push(c.classes, string_slice(token, i + 1, k))
+            i = k
+        elsif ch == "#" is
+            let mut k: int = i + 1
+            while k < n && is_ident_char(string_at(token, k)) is k += 1 end
+            c.id = string_slice(token, i + 1, k)
+            i = k
+        elsif ch == "[" is
+            let e: int = bracket_end(token, i)
+            c.attrs = array_push(c.attrs, parse_attr_sel(string_slice(token, i + 1, e)))
+            i = e + 1
+        elsif ch == ":" is
+            let double: bool = i + 1 < n && string_at(token, i + 1) == ":"
+            let start: int = if double then i + 2 else i + 1
+            let mut k: int = start
+            while k < n && is_ident_char(string_at(token, k)) is k += 1 end
+            let name: string = string_lower(string_slice(token, start, k))
+            let mut arg: string = ""
+            let mut has_arg: bool = false
+            if k < n && string_at(token, k) == "(" is
+                let e: int = paren_end(token, k)
+                arg = string_slice(token, k + 1, e)
+                has_arg = true
+                k = e + 1
+            end
+            if double || name == "before" || name == "after" is
+                pelem = name
+            elsif name == "not" && has_arg is
+                c.nots = array_push(c.nots, arg)
+            elsif (name == "is" || name == "where" || name == "matches") && has_arg is
+                c.iss = array_push(c.iss, arg)
+            elsif has_arg is
+                c.pseudos = array_push(c.pseudos, name + "(" + string_trim(arg) + ")")
+            else is
+                c.pseudos = array_push(c.pseudos, name)
+            end
+            i = k
+        else is
+            i += 1
+        end
+    end
+    return ParsedCompound { comp: c, pelem: pelem }
+end
+
+;; Dzieli selektor na tokeny i kombinatory poza [] i ().
+fn split_selector_tokens(sel: string) -> [string] is
+    let n: int = string_len(sel)
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut depth: int = 0
+    let mut quote: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(sel, i)
+        if quote != "" is
+            if c == quote is quote = "" end
+            cur = cur + c
+        elsif c == "\"" || c == "'" is
+            quote = c
+            cur = cur + c
+        elsif c == "(" || c == "[" is
+            depth += 1
+            cur = cur + c
+        elsif c == ")" || c == "]" is
+            depth -= 1
+            cur = cur + c
+        elsif depth <= 0 && (c == ">" || c == "+" || c == "~") is
+            if cur != "" is out = array_push(out, cur) end
+            cur = ""
+            out = array_push(out, c)
+        elsif depth <= 0 && is_ws(c) is
+            if cur != "" is out = array_push(out, cur) end
+            cur = ""
+        else is
+            cur = cur + c
+        end
+        i += 1
+    end
+    if cur != "" is out = array_push(out, cur) end
+    return out
+end
+
+;; Zgodność wsteczna: rozbicie selektora na tokeny + nazwane kombinatory.
+pub fn tokenize_selector(selector: string) -> SelectorPath is
+    let raw: [string] = split_selector_tokens(string_trim(selector))
+    let mut sels: [string] = []
+    let mut combs: [string] = []
+    let mut pending: string = ""
+    let mut i: int = 0
+    while i < array_len(raw) is
+        let t: string = raw[i]
+        i += 1
         if t == ">" is
-            pending_comb = "child"
+            pending = "child"
             continue
         end
         if t == "+" is
-            pending_comb = "adjacent"
+            pending = "adjacent"
             continue
         end
         if t == "~" is
-            pending_comb = "general_sibling"
+            pending = "general_sibling"
             continue
         end
         sels = array_push(sels, t)
         if array_len(sels) == 1 is
             combs = array_push(combs, "none")
-        elsif pending_comb != "" is
-            combs = array_push(combs, pending_comb)
+        elsif pending != "" is
+            combs = array_push(combs, pending)
         else is
             combs = array_push(combs, "desc")
         end
-        pending_comb = ""
+        pending = ""
     end
     return SelectorPath { sels: sels, combs: combs }
 end
 
-;; Rozbicie argumentu formuły `:nth-child(...)` na współczynniki
-;; `a`/`b` postaci `an+b`, dokładnie jak w prawdziwym CSS. `odd` to
-;; skrót na `2n+1`, `even` na `2n`. Sama liczba (np. `3`) to `a=0,b=3`
-;; (dopasowuje TYLKO pozycję 3, nie ciąg arytmetyczny).
+fn compound_specificity(c: Compound) -> int is
+    let mut ids: int = if c.id != "" then 1 else 0
+    let mut cls: int = array_len(c.classes) + array_len(c.attrs) + array_len(c.pseudos)
+    let mut tags: int = if c.tag != "" then 1 else 0
+    let mut i: int = 0
+    while i < array_len(c.nots) is
+        let inner: int = selector_specificity(c.nots[i])
+        ids += inner / 10000
+        cls += (inner / 100) % 100
+        tags += inner % 100
+        i += 1
+    end
+    return ids * 10000 + cls * 100 + tags
+end
+
+;; Specyficzność: id*10000 + (klasy/atrybuty/pseudoklasy)*100 + tagi.
+;; Dla listy (a, b) bierze największą.
+pub fn selector_specificity(selector: string) -> int is
+    let parts: [string] = cssval::split_commas(selector)
+    let mut best: int = 0
+    let mut k: int = 0
+    while k < array_len(parts) is
+        let path: SelectorPath = tokenize_selector(parts[k])
+        let mut total: int = 0
+        let mut i: int = 0
+        while i < array_len(path.sels) is
+            let pc: ParsedCompound = parse_compound(path.sels[i])
+            total = total + compound_specificity(pc.comp)
+            if pc.pelem != "" is total = total + 1 end
+            i += 1
+        end
+        if total > best is best = total end
+        k += 1
+    end
+    return best
+end
+
+pub fn specificity(selector: string) -> int is
+    return selector_specificity(selector)
+end
+
+pub fn compile_rule(selector: string, decls: [CssDecl], media: string, order: int) -> CssRule is
+    let path: SelectorPath = tokenize_selector(selector)
+    let mut comps: [Compound] = []
+    let mut pelem: string = ""
+    let mut i: int = 0
+    while i < array_len(path.sels) is
+        let pc: ParsedCompound = parse_compound(path.sels[i])
+        comps = array_push(comps, pc.comp)
+        if pc.pelem != "" is pelem = pc.pelem end
+        i += 1
+    end
+    return CssRule {
+        selector: selector, decls: decls, media: media, order: order,
+        spec: selector_specificity(selector), comps: comps, combs: path.combs, pelem: pelem
+    }
+end
+
+;; ---------- parser arkusza ----------
+fn combine_media(outer: string, inner: string) -> string is
+    if outer == "" is return inner end
+    if inner == "" is return outer end
+    return outer + " and " + inner
+end
+
+fn parse_into(css: string, media: string, rules: [CssRule]) -> [CssRule] is
+    let mut acc: [CssRule] = rules
+    let n: int = string_len(css)
+    let mut p: int = 0
+    while p < n is
+        while p < n && is_ws(string_at(css, p)) is p += 1 end
+        if p >= n is break end
+        if string_at(css, p) == "@" is
+            let mut q: int = p + 1
+            while q < n && is_ident_char(string_at(css, q)) is q += 1 end
+            let name: string = string_lower(string_slice(css, p + 1, q))
+            let brace: int = find_char(css, "{", q)
+            let semi: int = find_char(css, ";", q)
+            let block_first: bool = brace >= 0 && (semi < 0 || brace < semi)
+            if !block_first is
+                p = if semi < 0 then n else semi + 1
+                continue
+            end
+            let close: int = matching_brace(css, brace)
+            if close < 0 is
+                p = n
+                continue
+            end
+            let prelude: string = string_trim(string_slice(css, q, brace))
+            let inner: string = string_slice(css, brace + 1, close)
+            if name == "media" is
+                acc = parse_into(inner, combine_media(media, string_lower(prelude)), acc)
+            elsif name == "supports" || name == "layer" || name == "container" is
+                acc = parse_into(inner, media, acc)
+            end
+            p = close + 1
+            continue
+        end
+        let open: int = find_char(css, "{", p)
+        if open < 0 is break end
+        let close: int = matching_brace(css, open)
+        if close < 0 is break end
+        let selector_group: string = string_trim(string_slice(css, p, open))
+        let decls: [CssDecl] = parse_decls(string_slice(css, open + 1, close))
+        let group: [string] = cssval::split_commas(selector_group)
+        let mut gi: int = 0
+        while gi < array_len(group) is
+            let sel: string = string_trim(group[gi])
+            gi += 1
+            if sel != "" is
+                acc = array_push(acc, compile_rule(sel, decls, media, array_len(acc)))
+            end
+        end
+        p = close + 1
+    end
+    return acc
+end
+
+pub fn parse(css: string) -> Stylesheet is
+    return Stylesheet { rules: parse_into(strip_comments(css), "", []) }
+end
+
+;; Łączy dwa arkusze (b ma wyższy priorytet przy remisie); przenumerowuje kolejność.
+pub fn concat(a: Stylesheet, b: Stylesheet) -> Stylesheet is
+    let mut rules: [CssRule] = []
+    let mut i: int = 0
+    while i < array_len(a.rules) is
+        let mut r: CssRule = a.rules[i]
+        r.order = array_len(rules)
+        rules = array_push(rules, r)
+        i += 1
+    end
+    i = 0
+    while i < array_len(b.rules) is
+        let mut r: CssRule = b.rules[i]
+        r.order = array_len(rules)
+        rules = array_push(rules, r)
+        i += 1
+    end
+    return Stylesheet { rules: rules }
+end
+
+;; ---------- @media ----------
+fn media_feature(feat: string, ix: InteractionState) -> bool is
+    let inner: string = string_trim(string_replace(string_replace(feat, "(", ""), ")", ""))
+    let colon: int = string_find(inner, ":")
+    if colon < 0 is return inner == "color" || inner == "hover" end
+    let name: string = string_trim(string_slice(inner, 0, colon))
+    let val: string = string_trim(string_slice(inner, colon + 1, string_len(inner)))
+    let env: cssval::LenEnv = cssval::LenEnv { em: 16, rem: 16, vw: ix.viewport_w, vh: ix.viewport_h }
+    if name == "min-width" is return ix.viewport_w >= cssval::parse_len(val, env).px end
+    if name == "max-width" is return ix.viewport_w <= cssval::parse_len(val, env).px end
+    if name == "min-height" is return ix.viewport_h >= cssval::parse_len(val, env).px end
+    if name == "max-height" is return ix.viewport_h <= cssval::parse_len(val, env).px end
+    if name == "prefers-color-scheme" is
+        return if ix.dark then val == "dark" else val == "light"
+    end
+    if name == "orientation" is
+        return if ix.viewport_w >= ix.viewport_h then val == "landscape" else val == "portrait"
+    end
+    if name == "prefers-reduced-motion" is return val == "no-preference" end
+    if name == "hover" || name == "pointer" is return true end
+    return false
+end
+
+pub fn media_matches(cond: string, ix: InteractionState) -> bool is
+    if string_trim(cond) == "" is return true end
+    let alts: [string] = string_split(string_lower(cond), ",")
+    let mut a: int = 0
+    while a < array_len(alts) is
+        let part0: string = string_trim(alts[a])
+        a += 1
+        let negate: bool = string_starts_with(part0, "not ")
+        let part: string = if negate then string_trim(string_slice(part0, 4, string_len(part0))) else part0
+        let terms: [string] = string_split(string_replace(part, ") and (", ")\u0001("), "\u0001")
+        let mut all_ok: bool = true
+        let mut t: int = 0
+        while t < array_len(terms) is
+            let sub: [string] = string_split(string_trim(terms[t]), " and ")
+            let mut s: int = 0
+            while s < array_len(sub) is
+                let tok: string = string_trim(sub[s])
+                s += 1
+                if tok == "" || tok == "screen" || tok == "all" || tok == "only screen" is continue end
+                if tok == "print" || tok == "speech" is
+                    all_ok = false
+                elsif string_starts_with(tok, "(") is
+                    if !media_feature(tok, ix) is all_ok = false end
+                end
+            end
+            t += 1
+        end
+        let res: bool = if negate then !all_ok else all_ok
+        if res is return true end
+    end
+    return false
+end
+
+;; ---------- nth ----------
 pub struct NthExpr is
     pub a: int
     pub b: int
 end
 
-;; Usuwa spacje i wiodący "+" (str_to_int nie zawsze go akceptuje),
-;; żeby "+1", " 1", "1" parsowały się tak samo.
 fn clean_int_part(s: string) -> string is
     let t: string = string_trim(s)
     if string_starts_with(t, "+") is return string_slice(t, 1, string_len(t)) end
@@ -368,28 +609,28 @@ fn clean_int_part(s: string) -> string is
 end
 
 pub fn parse_nth_expr(raw: string) -> NthExpr is
-    let arg: string = string_trim(raw)
+    let arg: string = string_lower(string_trim(raw))
     if arg == "odd" is return NthExpr { a: 2, b: 1 } end
     if arg == "even" is return NthExpr { a: 2, b: 0 } end
     let n_pos: int = string_find(arg, "n")
     if n_pos < 0 is
-        ;; sama liczba, bez "n" -> dopasowuje dokładnie jedną pozycję
         return NthExpr { a: 0, b: str_to_int(clean_int_part(arg)) }
     end
     let a_part: string = string_trim(string_slice(arg, 0, n_pos))
     let mut a: int = 1
-    if a_part == "-" is a = -1
-    elsif a_part == "" is a = 1
-    else is a = str_to_int(clean_int_part(a_part)) end
-    let b_part: string = string_trim(string_slice(arg, n_pos + 1, string_len(arg)))
+    if a_part == "-" is
+        a = -1
+    elsif a_part == "" || a_part == "+" is
+        a = 1
+    else is
+        a = str_to_int(clean_int_part(a_part))
+    end
+    let b_part: string = string_replace(string_slice(arg, n_pos + 1, string_len(arg)), " ", "")
     let mut b: int = 0
     if b_part != "" is b = str_to_int(clean_int_part(b_part)) end
     return NthExpr { a: a, b: b }
 end
 
-;; Czy 1-indeksowana pozycja `index` pasuje do formuły `an+b`, czyli
-;; czy istnieje CAŁKOWITE n >= 0 takie, że a*n+b == index. Dla `a==0`
-;; (sama liczba, np. `:nth-child(3)`) to zwykłe porównanie.
 pub fn nth_matches(expr: NthExpr, index: int) -> bool is
     if expr.a == 0 is return index == expr.b end
     let diff: int = index - expr.b
@@ -397,20 +638,22 @@ pub fn nth_matches(expr: NthExpr, index: int) -> bool is
     return diff / expr.a >= 0
 end
 
-;; 1-indeksowana pozycja węzła wśród RODZEŃSTWA BĘDĄCEGO ELEMENTAMI
-;; (węzły tekstowe pomijane — dokładnie jak w prawdziwym CSS, gdzie
-;; `:nth-child` liczy tylko elementy, nie tekst między nimi). `-1`,
-;; jeśli węzeł jakimś cudem nie jest wśród dzieci swojego rodzica
-;; (nie powinno się zdarzyć przy poprawnym `dom::Dom`).
-fn nth_child_index(dom: dom::Dom, node_id: int) -> int is
-    let parent: int = dom.nodes[node_id].parent
-    if parent < 0 is return 1 end   ;; root nie ma rodzeństwa -> jedyne dziecko
-    let kids: [int] = dom.nodes[parent].children
-    let kc: int = array_len(kids)
+;; ---------- drzewo ----------
+fn is_live_element(d: dom::Dom, id: int) -> bool is
+    let n: dom::DomNode = d.nodes[id]
+    return n.tag != "text" && !n.removed
+end
+
+;; numer (od 1) wśród rodzeństwa-elementów; `same_type` = liczy tylko ten sam tag
+fn sibling_index(d: dom::Dom, node_id: int, same_type: bool) -> int is
+    let parent: int = d.nodes[node_id].parent
+    if parent < 0 is return 1 end
+    let kids: [int] = d.nodes[parent].children
+    let tag: string = d.nodes[node_id].tag
     let mut idx: int = 0
     let mut i: int = 0
-    while i < kc is
-        if dom.nodes[kids[i]].tag != "text" is
+    while i < array_len(kids) is
+        if is_live_element(d, kids[i]) && (!same_type || d.nodes[kids[i]].tag == tag) is
             idx += 1
             if kids[i] == node_id is return idx end
         end
@@ -419,295 +662,339 @@ fn nth_child_index(dom: dom::Dom, node_id: int) -> int is
     return -1
 end
 
-;; Całkowita liczba rodzeństwa BĘDĄCEGO ELEMENTAMI (włącznie z samym
-;; `node_id`), czyli mianownik potrzebny dla `:last-child`,
-;; `:nth-last-child(...)` i `:only-child`. Root (bez rodzica) liczy się
-;; jako jedyne "dziecko" samego siebie — spójnie z `nth_child_index`.
-fn sibling_element_count(dom: dom::Dom, node_id: int) -> int is
-    let parent: int = dom.nodes[node_id].parent
+fn sibling_count(d: dom::Dom, node_id: int, same_type: bool) -> int is
+    let parent: int = d.nodes[node_id].parent
     if parent < 0 is return 1 end
-    let kids: [int] = dom.nodes[parent].children
-    let kc: int = array_len(kids)
-    let mut count: int = 0
+    let kids: [int] = d.nodes[parent].children
+    let tag: string = d.nodes[node_id].tag
+    let mut c: int = 0
     let mut i: int = 0
-    while i < kc is
-        if dom.nodes[kids[i]].tag != "text" is count += 1 end
+    while i < array_len(kids) is
+        if is_live_element(d, kids[i]) && (!same_type || d.nodes[kids[i]].tag == tag) is c += 1 end
         i += 1
     end
-    return count
+    return c
 end
 
-;; Czy `node_id` jest tym samym węzłem co `target`, ALBO jego
-;; przodkiem. Używane, żeby `:hover`/`:active` propagowały się w górę
-;; drzewa dokładnie tak, jak w prawdziwej przeglądarce: najechanie na
-;; tekst wewnątrz `<button><span>Click</span></button>` sprawia, że
-;; `:hover` dopasowuje TAKŻE `<button>` (i wszystkich przodków), nie
-;; tylko dosłownie trafiony liść. Bez tego `App.hovered_node`/
-;; `active_node` (node_id najgłębszego trafienia, patrz
-;; `paint::hit_test_any`) nigdy by nie zrównał się z id kontenera,
-;; który faktycznie ma regułę `:hover` w CSS.
-fn is_self_or_ancestor(dom: dom::Dom, target: int, node_id: int) -> bool is
+fn is_self_or_ancestor(d: dom::Dom, target: int, node_id: int) -> bool is
     let mut cur: int = node_id
     while cur >= 0 is
         if cur == target is return true end
-        cur = dom.nodes[cur].parent
+        cur = d.nodes[cur].parent
     end
     return false
 end
 
-;; Szuka węzła o dokładnie takim `attr_id` (pierwsze trafienie, w
-;; kolejności `dom.nodes`) — pomocnicze dla `:focus-within`, które w
-;; przeciwieństwie do `:focus` nie porównuje `attr_id` bezpośrednio,
-;; tylko musi najpierw ustalić, KTÓRY węzeł jest tym focusowanym, żeby
-;; potem sprawdzić czy `node_id` jest jego przodkiem. `""` (brak
-;; focusu) zawsze zwraca -1, żeby dwa elementy bez id nie "dzieliły"
-;; focusu (spójnie z `:focus`). O(liczba węzłów) na wywołanie — bez
-;; cache'owania, bo Silver i tak przelicza cały layout co klatkę.
-fn find_node_by_attr_id(dom: dom::Dom, attr_id: string) -> int is
-    if attr_id == "" is return -1 end
-    let n: int = array_len(dom.nodes)
+fn prev_element_sibling(d: dom::Dom, node_id: int) -> int is
+    let parent: int = d.nodes[node_id].parent
+    if parent < 0 is return -1 end
+    let kids: [int] = d.nodes[parent].children
+    let mut prev: int = -1
     let mut i: int = 0
-    while i < n is
-        if dom.nodes[i].attr_id == attr_id is return i end
+    while i < array_len(kids) is
+        if kids[i] == node_id is return prev end
+        if is_live_element(d, kids[i]) is prev = kids[i] end
         i += 1
     end
     return -1
 end
 
-;; Czy węzeł `node_id` w `dom` pasuje do JEDNEGO prostego tokenu
-;; selektora, łącznie z ewentualną pseudoklasą (np. ".card",
-;; "#title", "p", ".btn:hover") — pomocnicze dla `compound_matches`,
-;; żeby nie duplikować logiki `selector_matches`.
-;;
-;; Wspierane pseudoklasy: `:hover`/`:active` (patrz
-;; `InteractionState.hovered_id`/`active_id` — dopasowują węzeł LUB
-;; dowolnego jego POTOMKA pod kursorem/wciśnięciem, patrz
-;; `is_self_or_ancestor` wyżej — to zgodne z prawdziwym CSS), `:focus`
-;; (patrz `InteractionState.focused_id`, dopasowywane po `attr_id`
-;; węzła — pusty `attr_id` nigdy nie dopasowuje `:focus`, żeby dwa
-;; elementy bez id nie "dzieliły" focusu; `:focus` NIE propaguje się
-;; do przodków — dokładnie jak w prawdziwym CSS, w odróżnieniu od
-;; `:hover`/`:active`), `:focus-within` (jak `:focus`, ale DOPASOWUJE
-;; też przodków focusowanego elementu — patrz `find_node_by_attr_id` +
-;; `is_self_or_ancestor`), `:nth-child(...)`/`:nth-last-child(...)`
-;; (formuła `an+b`/`odd`/`even`/liczba — patrz `parse_nth_expr`/
-;; `nth_matches`/`nth_child_index`/`sibling_element_count`),
-;; `:first-child`/`:last-child`/`:only-child`. Wszystkie pseudoklasy
-;; pozycyjne NIE zależą od `interaction`, więc dopasowują identycznie
-;; na każdej klatce. Nieznana pseudoklasa (np. `:visited` —
-;; nieobsługiwana) bezpiecznie NIGDY nie dopasowuje, zamiast zgadywać.
-fn node_matches_simple(dom: dom::Dom, node_id: int, token: string, interaction: InteractionState) -> bool is
-    let n: dom::DomNode = dom.nodes[node_id]
-    let parts: TokenParts = parse_token_parts(token)
-    let classes: [string] = split_classes_local(n.attr_class)
-    if !selector_matches(parts.base, n.tag, n.attr_id, classes) is return false end
-    if parts.pseudo == "" is return true end
-    if parts.pseudo == "hover" is
-        return interaction.hovered_id >= 0 && is_self_or_ancestor(dom, node_id, interaction.hovered_id)
-    end
-    if parts.pseudo == "active" is
-        return interaction.active_id >= 0 && is_self_or_ancestor(dom, node_id, interaction.active_id)
-    end
-    if parts.pseudo == "focus" is
-        return n.attr_id != "" && n.attr_id == interaction.focused_id
-    end
-    if parts.pseudo == "focus-within" is
-        let focused_node: int = find_node_by_attr_id(dom, interaction.focused_id)
-        return focused_node >= 0 && is_self_or_ancestor(dom, node_id, focused_node)
-    end
-    if parts.pseudo == "first-child" is return nth_child_index(dom, node_id) == 1 end
-    if parts.pseudo == "last-child" is
-        return nth_child_index(dom, node_id) == sibling_element_count(dom, node_id)
-    end
-    if parts.pseudo == "only-child" is return sibling_element_count(dom, node_id) == 1 end
-    if string_starts_with(parts.pseudo, "nth-child(") && string_ends_with(parts.pseudo, ")") is
-        let arg: string = string_slice(parts.pseudo, 10, string_len(parts.pseudo) - 1)
-        let expr: NthExpr = parse_nth_expr(arg)
-        let idx: int = nth_child_index(dom, node_id)
-        if idx < 0 is return false end
-        return nth_matches(expr, idx)
-    end
-    if string_starts_with(parts.pseudo, "nth-last-child(") && string_ends_with(parts.pseudo, ")") is
-        let arg: string = string_slice(parts.pseudo, 15, string_len(parts.pseudo) - 1)
-        let expr: NthExpr = parse_nth_expr(arg)
-        let idx: int = nth_child_index(dom, node_id)
-        if idx < 0 is return false end
-        let idx_from_end: int = sibling_element_count(dom, node_id) - idx + 1
-        return nth_matches(expr, idx_from_end)
+fn attr_matches(d: dom::Dom, node_id: int, a: AttrSel) -> bool is
+    let node: dom::DomNode = d.nodes[node_id]
+    if !dom::has_attr(node, a.name) is return false end
+    if a.op == "" is return true end
+    let v: string = dom::get_attr(node, a.name)
+    if a.op == "=" is return v == a.val end
+    if a.op == "^=" is return a.val != "" && string_starts_with(v, a.val) end
+    if a.op == "$=" is return a.val != "" && string_ends_with(v, a.val) end
+    if a.op == "*=" is return a.val != "" && string_find(v, a.val) >= 0 end
+    if a.op == "|=" is return v == a.val || string_starts_with(v, a.val + "-") end
+    if a.op == "~=" is
+        let words: [string] = string_split(v, " ")
+        let mut i: int = 0
+        while i < array_len(words) is
+            if words[i] == a.val is return true end
+            i += 1
+        end
+        return false
     end
     return false
 end
 
-;; Duplikat `style::split_classes` — nie importujemy `style.h#` tutaj,
-;; żeby uniknąć cyklu (style.h# już importuje css.h#).
-fn split_classes_local(attr_class: string) -> [string] is
-    if string_trim(attr_class) == "" is return [] end
-    return string_split(string_trim(attr_class), " ")
+fn pseudo_matches(d: dom::Dom, node_id: int, ps: string, ix: InteractionState) -> bool is
+    let n: dom::DomNode = d.nodes[node_id]
+    if ps == "hover" is return ix.hovered_id >= 0 && is_self_or_ancestor(d, node_id, ix.hovered_id) end
+    if ps == "active" is return ix.active_id >= 0 && is_self_or_ancestor(d, node_id, ix.active_id) end
+    if ps == "focus" is
+        return (ix.focused_node >= 0 && ix.focused_node == node_id) || (n.attr_id != "" && n.attr_id == ix.focused_id)
+    end
+    if ps == "focus-within" is
+        let mut f: int = ix.focused_node
+        if f < 0 && ix.focused_id != "" is f = dom::find_by_id(d, ix.focused_id) end
+        return f >= 0 && is_self_or_ancestor(d, node_id, f)
+    end
+    if ps == "first-child" is return sibling_index(d, node_id, false) == 1 end
+    if ps == "last-child" is return sibling_index(d, node_id, false) == sibling_count(d, node_id, false) end
+    if ps == "only-child" is return sibling_count(d, node_id, false) == 1 end
+    if ps == "first-of-type" is return sibling_index(d, node_id, true) == 1 end
+    if ps == "last-of-type" is return sibling_index(d, node_id, true) == sibling_count(d, node_id, true) end
+    if ps == "empty" is return array_len(n.children) == 0 end
+    if ps == "root" is return n.parent == 0 && n.tag == "html" || node_id == 0 end
+    if ps == "disabled" is return n.disabled end
+    if ps == "enabled" is return !n.disabled && (n.tag == "input" || n.tag == "button" || n.tag == "select" || n.tag == "textarea") end
+    if ps == "checked" is return n.checked end
+    if ps == "link" || ps == "any-link" is return n.tag == "a" && n.attr_href != "" end
+    if ps == "read-only" is return n.readonly || n.tag != "input" && n.tag != "textarea" end
+    if ps == "placeholder-shown" is return n.attr_placeholder != "" && n.attr_value == "" end
+    if string_starts_with(ps, "nth-child(") is
+        let expr: NthExpr = parse_nth_expr(string_slice(ps, 10, string_len(ps) - 1))
+        let idx: int = sibling_index(d, node_id, false)
+        return idx > 0 && nth_matches(expr, idx)
+    end
+    if string_starts_with(ps, "nth-last-child(") is
+        let expr: NthExpr = parse_nth_expr(string_slice(ps, 15, string_len(ps) - 1))
+        let idx: int = sibling_index(d, node_id, false)
+        return idx > 0 && nth_matches(expr, sibling_count(d, node_id, false) - idx + 1)
+    end
+    if string_starts_with(ps, "nth-of-type(") is
+        let expr: NthExpr = parse_nth_expr(string_slice(ps, 12, string_len(ps) - 1))
+        let idx: int = sibling_index(d, node_id, true)
+        return idx > 0 && nth_matches(expr, idx)
+    end
+    return false
 end
 
-;; Poprzedni rodzeni węzła `node_id` (ten sam rodzic), w kolejności od
-;; NAJBLIŻSZEGO do najdalszego — pomocnicze dla kombinatorów "+"/"~".
-;; Pusta lista, jeśli węzeł jest pierwszym dzieckiem albo jest rootem
-;; (`parent < 0`).
-fn prev_siblings(dom: dom::Dom, node_id: int) -> [int] is
-    let self_parent: int = dom.nodes[node_id].parent
-    if self_parent < 0 is return [] end
-    let kids: [int] = dom.nodes[self_parent].children
-    let kc: int = array_len(kids)
-    let mut idx: int = -1
+fn list_matches(d: dom::Dom, node_id: int, list: string, ix: InteractionState) -> bool is
+    let items: [string] = cssval::split_commas(list)
     let mut i: int = 0
-    while i < kc is
-        if kids[i] == node_id is idx = i end
+    while i < array_len(items) is
+        let pc: ParsedCompound = parse_compound(string_trim(items[i]))
+        if compound_matches_node(d, node_id, pc.comp, ix) is return true end
         i += 1
     end
-    if idx <= 0 is return [] end
-    let mut out: [int] = []
-    let mut j: int = idx - 1
-    while j >= 0 is
-        out = array_push(out, kids[j])
-        j -= 1
-    end
-    return out
+    return false
 end
 
-;; Dopasowuje selektor złożony do węzła, chodząc po przodkach/
-;; rodzeństwie w `dom` (`DomNode.parent`/`.children`). Selektor
-;; jednoelementowy sprawdza tylko sam węzeł. Drzewo-świadome wsparcie
-;; dla " " (dowolny przodek), ">" (bezpośredni rodzic), "+" (najbliższy
-;; poprzedni rodzony) i "~" (dowolny poprzedni rodzony), plus
-;; pseudoklasy `:hover`/`:focus`/`:active`/`:nth-child` (patrz
-;; `node_matches_simple`).
-pub fn compound_matches(dom: dom::Dom, node_id: int, path: SelectorPath, interaction: InteractionState) -> bool is
-    let n: int = array_len(path.sels)
-    if n == 0 is return true end
-    if !node_matches_simple(dom, node_id, path.sels[n - 1], interaction) is return false end
-
-    let mut cur: int = node_id
-    let mut i: int = n - 2
-    while i >= 0 is
-        let comb: string = path.combs[i + 1]
-        if comb == "child" is
-            cur = dom.nodes[cur].parent
-            if cur < 0 is return false end
-            if !node_matches_simple(dom, cur, path.sels[i], interaction) is return false end
-        elsif comb == "adjacent" is
-            let sibs: [int] = prev_siblings(dom, cur)
-            if array_len(sibs) == 0 is return false end
-            let prev: int = sibs[0]
-            if !node_matches_simple(dom, prev, path.sels[i], interaction) is return false end
-            cur = prev
-        elsif comb == "general_sibling" is
-            let sibs: [int] = prev_siblings(dom, cur)
-            let mut found_s: bool = false
-            let mut si: int = 0
-            while si < array_len(sibs) is
-                if node_matches_simple(dom, sibs[si], path.sels[i], interaction) is
-                    found_s = true
-                    cur = sibs[si]
-                    break
-                end
-                si += 1
-            end
-            if !found_s is return false end
-        else is
-            let mut p: int = dom.nodes[cur].parent
-            let mut found: bool = false
-            while p >= 0 is
-                if node_matches_simple(dom, p, path.sels[i], interaction) is
-                    found = true
-                    cur = p
-                    break
-                end
-                p = dom.nodes[p].parent
-            end
-            if !found is return false end
-        end
-        i -= 1
+pub fn compound_matches_node(d: dom::Dom, node_id: int, c: Compound, ix: InteractionState) -> bool is
+    let n: dom::DomNode = d.nodes[node_id]
+    if c.tag != "" && c.tag != n.tag is return false end
+    if c.id != "" && c.id != n.attr_id is return false end
+    let mut i: int = 0
+    while i < array_len(c.classes) is
+        if !dom::has_class(n, c.classes[i]) is return false end
+        i += 1
+    end
+    i = 0
+    while i < array_len(c.attrs) is
+        if !attr_matches(d, node_id, c.attrs[i]) is return false end
+        i += 1
+    end
+    i = 0
+    while i < array_len(c.pseudos) is
+        if !pseudo_matches(d, node_id, c.pseudos[i], ix) is return false end
+        i += 1
+    end
+    i = 0
+    while i < array_len(c.nots) is
+        if list_matches(d, node_id, c.nots[i], ix) is return false end
+        i += 1
+    end
+    i = 0
+    while i < array_len(c.iss) is
+        if !list_matches(d, node_id, c.iss[i], ix) is return false end
+        i += 1
     end
     return true
 end
 
-;; Wspólne bucketowanie po specyficzności (3 koszyki: 1/2/reszta),
-;; dzielone przez `matching_decls` i `matching_decls_ctx`, żeby nie
-;; duplikować konkatenacji low/mid/high w dwóch miejscach.
-fn concat_buckets(low: [CssDecl], mid: [CssDecl], high: [CssDecl]) -> [CssDecl] is
-    let mut result: [CssDecl] = []
-    let mut k: int = 0
-    while k < array_len(low) is
-        result = array_push(result, low[k])
-        k += 1
+;; Dopasowanie od prawej do lewej z nawracaniem (comps[idx] do node_id).
+fn path_matches_from(d: dom::Dom, node_id: int, comps: [Compound], combs: [string], idx: int, ix: InteractionState) -> bool is
+    if !compound_matches_node(d, node_id, comps[idx], ix) is return false end
+    if idx == 0 is return true end
+    let comb: string = combs[idx]
+    if comb == "child" is
+        let p: int = d.nodes[node_id].parent
+        if p < 0 is return false end
+        return path_matches_from(d, p, comps, combs, idx - 1, ix)
     end
-    k = 0
-    while k < array_len(mid) is
-        result = array_push(result, mid[k])
-        k += 1
+    if comb == "adjacent" is
+        let prev: int = prev_element_sibling(d, node_id)
+        if prev < 0 is return false end
+        return path_matches_from(d, prev, comps, combs, idx - 1, ix)
     end
-    k = 0
-    while k < array_len(high) is
-        result = array_push(result, high[k])
-        k += 1
+    if comb == "general_sibling" is
+        let mut prev: int = prev_element_sibling(d, node_id)
+        while prev >= 0 is
+            if path_matches_from(d, prev, comps, combs, idx - 1, ix) is return true end
+            prev = prev_element_sibling(d, prev)
+        end
+        return false
     end
-    return result
+    let mut p: int = d.nodes[node_id].parent
+    while p >= 0 is
+        if path_matches_from(d, p, comps, combs, idx - 1, ix) is return true end
+        p = d.nodes[p].parent
+    end
+    return false
 end
 
-;; Zwraca deklaracje pasujące do węzła, posortowane od najmniej do
-;; najbardziej specyficznych (żeby ostatnia wygrywała przy nadpisywaniu
-;; w style::resolve — prosta kaskada bez !important).
-;;
-;; UWAGA: to jest "płaskie" API bez dostępu do drzewa DOM — selektory
-;; złożone (potomek/dziecko/rodzeństwo) i pseudoklasy nigdy tu nie
-;; trafią (patrz komentarz przy `selector_matches`). Używane
-;; bezpośrednio (np. w testach) oraz przez `style::resolve`. Silnik
-;; layoutu używa `matching_decls_ctx` niżej, który ma pełne wsparcie.
+pub fn rule_matches(d: dom::Dom, node_id: int, rule: CssRule, ix: InteractionState) -> bool is
+    let n: int = array_len(rule.comps)
+    if n == 0 is return false end
+    return path_matches_from(d, node_id, rule.comps, rule.combs, n - 1, ix)
+end
+
+;; ---------- kaskada ----------
+fn insert_sorted(decls: [CssDecl], keys: [int], d: CssDecl, key: int) -> [CssDecl] is
+    ;; wstawia `d` po ostatnim elemencie o kluczu <= key (stabilnie)
+    let mut out: [CssDecl] = []
+    let mut placed: bool = false
+    let mut i: int = 0
+    while i < array_len(decls) is
+        if !placed && keys[i] > key is
+            out = array_push(out, d)
+            placed = true
+        end
+        out = array_push(out, decls[i])
+        i += 1
+    end
+    if !placed is out = array_push(out, d) end
+    return out
+end
+
+fn insert_key(keys: [int], key: int) -> [int] is
+    let mut out: [int] = []
+    let mut placed: bool = false
+    let mut i: int = 0
+    while i < array_len(keys) is
+        if !placed && keys[i] > key is
+            out = array_push(out, key)
+            placed = true
+        end
+        out = array_push(out, keys[i])
+        i += 1
+    end
+    if !placed is out = array_push(out, key) end
+    return out
+end
+
+;; Deklaracje pasujące do węzła, posortowane rosnąco wg (important, specyficzność,
+;; kolejność) — kolejne nadpisują poprzednie. Węzły pseudo (before/after) dopasowują
+;; reguły z ::before/::after do swojego rodzica. `inline_style` dodawany na końcu.
+pub fn matching_decls_ctx(sheet: Stylesheet, d: dom::Dom, node_id: int, ix: InteractionState) -> [CssDecl] is
+    let node: dom::DomNode = d.nodes[node_id]
+    let target: int = if node.pseudo != "" then node.parent else node_id
+    let want_pelem: string = node.pseudo
+    let mut decls: [CssDecl] = []
+    let mut keys: [int] = []
+    let count: int = array_len(sheet.rules)
+    let mut i: int = 0
+    while i < count is
+        let rule: CssRule = sheet.rules[i]
+        i += 1
+        if rule.pelem != want_pelem is continue end
+        if target < 0 is continue end
+        if rule.media != "" && !media_matches(rule.media, ix) is continue end
+        if !rule_matches(d, target, rule, ix) is continue end
+        let mut j: int = 0
+        while j < array_len(rule.decls) is
+            let dc: CssDecl = rule.decls[j]
+            let key: int = (if dc.important then 1000000000000 else 0) + rule.spec * 100000 + rule.order
+            decls = insert_sorted(decls, keys, dc, key)
+            keys = insert_key(keys, key)
+            j += 1
+        end
+        if array_len(decls) > 4000 is break end
+    end
+    if node.attr_style != "" && node.pseudo == "" is
+        let inline: [CssDecl] = parse_decls(node.attr_style)
+        let mut j: int = 0
+        while j < array_len(inline) is
+            let dc: CssDecl = inline[j]
+            let key: int = (if dc.important then 1000000000000 else 0) + 99999 * 100000
+            decls = insert_sorted(decls, keys, dc, key)
+            keys = insert_key(keys, key)
+            j += 1
+        end
+    end
+    return decls
+end
+
+;; Wersja bez kontekstu drzewa (testy, proste zastosowania): dopasowuje po
+;; tagu/id/klasach pierwszy segment złożony reguły.
+pub fn selector_matches(selector: string, tag: string, id: string, classes: [string]) -> bool is
+    let pc: ParsedCompound = parse_compound(selector)
+    let c: Compound = pc.comp
+    if c.tag != "" && c.tag != tag is return false end
+    if c.id != "" && c.id != id is return false end
+    let mut i: int = 0
+    while i < array_len(c.classes) is
+        let mut found: bool = false
+        let mut j: int = 0
+        while j < array_len(classes) is
+            if classes[j] == c.classes[i] is found = true end
+            j += 1
+        end
+        if !found is return false end
+        i += 1
+    end
+    return true
+end
+
 pub fn matching_decls(sheet: Stylesheet, tag: string, id: string, classes: [string]) -> [CssDecl] is
-    let mut low:  [CssDecl] = []
-    let mut mid:  [CssDecl] = []
-    let mut high: [CssDecl] = []
-    let count: int = array_len(sheet.rules)
+    let mut d: dom::Dom = dom::empty()
+    d = dom::new_node(d, -1, "root")
+    d = dom::new_node(d, 0, tag)
+    d.nodes[1].attr_id = id
+    let mut cls: string = ""
     let mut i: int = 0
-    while i < count is
-        let rule: CssRule = sheet.rules[i]
+    while i < array_len(classes) is
+        cls = if cls == "" then classes[i] else cls + " " + classes[i]
         i += 1
-        if !selector_matches(rule.selector, tag, id, classes) is continue end
-        let spec: int = specificity(rule.selector)
-        let mut j: int = 0
-        let dc: int = array_len(rule.decls)
-        while j < dc is
-            if spec == 1 is low  = array_push(low,  rule.decls[j])
-            elsif spec == 2 is mid  = array_push(mid,  rule.decls[j])
-            else is high = array_push(high, rule.decls[j]) end
-            j += 1
-        end
     end
-    return concat_buckets(low, mid, high)
+    d.nodes[1].attr_class = cls
+    return matching_decls_ctx(sheet, d, 1, no_interaction())
 end
 
-;; Jak `matching_decls`, ale drzewo-świadome: rozwiązuje selektory
-;; złożone (" " = dowolny przodek, ">" = bezpośredni rodzic, "+"/"~" =
-;; rodzeństwo) i pseudoklasy `:hover`/`:focus`/`:active`/`:nth-child`
-;; chodząc po `dom::Dom` i sprawdzając `interaction`. Rozbudowa v0.2 —
-;; używana przez `style::resolve_ctx`, którego z kolei używa
-;; `engine/layout.h#`.
-pub fn matching_decls_ctx(sheet: Stylesheet, dom: dom::Dom, node_id: int, interaction: InteractionState) -> [CssDecl] is
-    let mut low:  [CssDecl] = []
-    let mut mid:  [CssDecl] = []
-    let mut high: [CssDecl] = []
-    let count: int = array_len(sheet.rules)
-    let mut i: int = 0
-    while i < count is
-        let rule: CssRule = sheet.rules[i]
-        i += 1
-        let path: SelectorPath = tokenize_selector(rule.selector)
-        if !compound_matches(dom, node_id, path, interaction) is continue end
-        let spec: int = specificity(rule.selector)
-        let mut j: int = 0
-        let dc: int = array_len(rule.decls)
-        while j < dc is
-            if spec == 1 is low  = array_push(low,  rule.decls[j])
-            elsif spec == 2 is mid  = array_push(mid,  rule.decls[j])
-            else is high = array_push(high, rule.decls[j]) end
-            j += 1
-        end
+;; ---------- zapytania po selektorze ----------
+pub fn node_matches_selector(d: dom::Dom, node_id: int, selector: string, ix: InteractionState) -> bool is
+    let group: [string] = cssval::split_commas(selector)
+    let mut g: int = 0
+    while g < array_len(group) is
+        let rule: CssRule = compile_rule(string_trim(group[g]), [], "", 0)
+        g += 1
+        if rule_matches(d, node_id, rule, ix) is return true end
     end
-    return concat_buckets(low, mid, high)
+    return false
+end
+
+;; Wszystkie żywe elementy pasujące do selektora, w kolejności dokumentu.
+pub fn query_all(d: dom::Dom, selector: string) -> [int] is
+    let mut out: [int] = []
+    let order: [int] = dom::document_order(d)
+    let ix: InteractionState = no_interaction()
+    let mut i: int = 0
+    while i < array_len(order) is
+        let id: int = order[i]
+        i += 1
+        if id == 0 || !is_live_element(d, id) is continue end
+        if node_matches_selector(d, id, selector, ix) is out = array_push(out, id) end
+    end
+    return out
+end
+
+pub fn query_first(d: dom::Dom, selector: string) -> int is
+    let all: [int] = query_all(d, selector)
+    if array_len(all) == 0 is return -1 end
+    return all[0]
+end
+
+;; Czy arkusz ma reguły z ::before/::after (app.h# generuje wtedy węzły treści).
+pub fn has_pseudo_elements(sheet: Stylesheet) -> bool is
+    let mut i: int = 0
+    while i < array_len(sheet.rules) is
+        if sheet.rules[i].pelem != "" is return true end
+        i += 1
+    end
+    return false
 end
