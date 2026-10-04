@@ -1,0 +1,212 @@
+mod ffi_shim
+
+pub struct Edit is
+    pub value:  string
+    pub cursor: int
+    pub anchor: int      ;; == cursor gdy brak zaznaczenia
+end
+
+pub fn make(value: string, cursor: int, anchor: int) -> Edit is
+    let n: int = string_len(value)
+    let c: int = if cursor < 0 then 0 elsif cursor > n then n else cursor
+    let a: int = if anchor < 0 then 0 elsif anchor > n then n else anchor
+    return Edit { value: value, cursor: c, anchor: a }
+end
+
+pub fn has_selection(e: Edit) -> bool is
+    return e.cursor != e.anchor
+end
+
+pub fn sel_lo(e: Edit) -> int is
+    if e.cursor < e.anchor is return e.cursor end
+    return e.anchor
+end
+
+pub fn sel_hi(e: Edit) -> int is
+    if e.cursor > e.anchor is return e.cursor end
+    return e.anchor
+end
+
+pub fn selected_text(e: Edit) -> string is
+    return string_slice(e.value, sel_lo(e), sel_hi(e))
+end
+
+fn char_at(s: string, from: int, to: int) -> string is
+    return string_slice(s, from, to)
+end
+
+fn is_word_char(c: string) -> bool is
+    if string_len(c) > 1 is return true end
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_"
+end
+
+;; Początek poprzedniego słowa (Ctrl+←).
+pub fn word_left_pos(s: string, pos: int) -> int is
+    let mut p: int = pos
+    while p > 0 is
+        let q: int = ffi_shim::silver_utf8_prev(s, p)
+        if is_word_char(char_at(s, q, p)) is break end
+        p = q
+    end
+    while p > 0 is
+        let q: int = ffi_shim::silver_utf8_prev(s, p)
+        if !is_word_char(char_at(s, q, p)) is break end
+        p = q
+    end
+    return p
+end
+
+;; Koniec bieżącego/następnego słowa (Ctrl+→).
+pub fn word_right_pos(s: string, pos: int) -> int is
+    let n: int = string_len(s)
+    let mut p: int = pos
+    while p < n is
+        let q: int = ffi_shim::silver_utf8_next(s, p)
+        if is_word_char(char_at(s, p, q)) is break end
+        p = q
+    end
+    while p < n is
+        let q: int = ffi_shim::silver_utf8_next(s, p)
+        if !is_word_char(char_at(s, p, q)) is break end
+        p = q
+    end
+    return p
+end
+
+pub fn line_start_pos(s: string, pos: int) -> int is
+    let mut p: int = pos
+    while p > 0 is
+        if string_slice(s, p - 1, p) == "\n" is break end
+        p -= 1
+    end
+    return p
+end
+
+pub fn line_end_pos(s: string, pos: int) -> int is
+    let n: int = string_len(s)
+    let mut p: int = pos
+    while p < n is
+        if string_slice(s, p, p + 1) == "\n" is break end
+        p += 1
+    end
+    return p
+end
+
+;; Wstawia tekst w miejsce zaznaczenia (albo w kursor).
+pub fn insert(e: Edit, text: string) -> Edit is
+    let lo: int = sel_lo(e)
+    let hi: int = sel_hi(e)
+    let v: string = string_slice(e.value, 0, lo) + text + string_slice(e.value, hi, string_len(e.value))
+    let c: int = lo + string_len(text)
+    return Edit { value: v, cursor: c, anchor: c }
+end
+
+pub fn delete_selection(e: Edit) -> Edit is
+    return insert(e, "")
+end
+
+pub fn backspace(e: Edit, word: bool) -> Edit is
+    if has_selection(e) is return delete_selection(e) end
+    if e.cursor <= 0 is return e end
+    let from: int = if word then word_left_pos(e.value, e.cursor) else ffi_shim::silver_utf8_prev(e.value, e.cursor)
+    let v: string = string_slice(e.value, 0, from) + string_slice(e.value, e.cursor, string_len(e.value))
+    return Edit { value: v, cursor: from, anchor: from }
+end
+
+pub fn delete_forward(e: Edit, word: bool) -> Edit is
+    if has_selection(e) is return delete_selection(e) end
+    let n: int = string_len(e.value)
+    if e.cursor >= n is return e end
+    let to: int = if word then word_right_pos(e.value, e.cursor) else ffi_shim::silver_utf8_next(e.value, e.cursor)
+    let v: string = string_slice(e.value, 0, e.cursor) + string_slice(e.value, to, n)
+    return Edit { value: v, cursor: e.cursor, anchor: e.cursor }
+end
+
+;; Ruch kursora; `extend` (Shift) zachowuje kotwicę.
+fn moved(e: Edit, new_pos: int, extend: bool) -> Edit is
+    return Edit { value: e.value, cursor: new_pos, anchor: if extend then e.anchor else new_pos }
+end
+
+pub fn move_left(e: Edit, word: bool, extend: bool) -> Edit is
+    if has_selection(e) && !extend is return moved(e, sel_lo(e), false) end
+    let p: int = if word then word_left_pos(e.value, e.cursor) else ffi_shim::silver_utf8_prev(e.value, e.cursor)
+    return moved(e, p, extend)
+end
+
+pub fn move_right(e: Edit, word: bool, extend: bool) -> Edit is
+    if has_selection(e) && !extend is return moved(e, sel_hi(e), false) end
+    let p: int = if word then word_right_pos(e.value, e.cursor) else ffi_shim::silver_utf8_next(e.value, e.cursor)
+    return moved(e, p, extend)
+end
+
+pub fn move_home(e: Edit, extend: bool, multiline: bool) -> Edit is
+    return moved(e, if multiline then line_start_pos(e.value, e.cursor) else 0, extend)
+end
+
+pub fn move_end(e: Edit, extend: bool, multiline: bool) -> Edit is
+    return moved(e, if multiline then line_end_pos(e.value, e.cursor) else string_len(e.value), extend)
+end
+
+pub fn select_all(e: Edit) -> Edit is
+    return Edit { value: e.value, cursor: string_len(e.value), anchor: 0 }
+end
+
+;; Zaznacza słowo wokół pozycji (dwuklik).
+pub fn select_word_at(e: Edit, pos: int) -> Edit is
+    let n: int = string_len(e.value)
+    let mut lo: int = pos
+    let mut hi: int = pos
+    while lo > 0 is
+        let q: int = ffi_shim::silver_utf8_prev(e.value, lo)
+        if !is_word_char(char_at(e.value, q, lo)) is break end
+        lo = q
+    end
+    while hi < n is
+        let q: int = ffi_shim::silver_utf8_next(e.value, hi)
+        if !is_word_char(char_at(e.value, hi, q)) is break end
+        hi = q
+    end
+    return Edit { value: e.value, cursor: hi, anchor: lo }
+end
+
+;; Limit długości (maxlength w znakach); 0 = bez limitu. Obcina `text` do wolnego miejsca.
+pub fn clamp_insert(e: Edit, text: string, maxlength: int) -> string is
+    if maxlength <= 0 is return text end
+    let used: int = ffi_shim::silver_utf8_len(e.value) - ffi_shim::silver_utf8_len(selected_text(e))
+    let room: int = maxlength - used
+    if room <= 0 is return "" end
+    if ffi_shim::silver_utf8_len(text) <= room is return text end
+    return string_slice(text, 0, ffi_shim::silver_utf8_offset(text, room))
+end
+
+;; Pozycja w pionie dla textarea: przesuwa kursor o `delta` wierszy (twardych), zachowując kolumnę.
+pub fn move_vertical(e: Edit, delta: int, extend: bool) -> Edit is
+    let col: int = e.cursor - line_start_pos(e.value, e.cursor)
+    let mut p: int = e.cursor
+    let mut d: int = delta
+    while d < 0 is
+        let ls: int = line_start_pos(e.value, p)
+        if ls == 0 is
+            p = 0
+            break
+        end
+        let prev_end: int = ls - 1
+        let prev_start: int = line_start_pos(e.value, prev_end)
+        let len: int = prev_end - prev_start
+        p = prev_start + (if col < len then col else len)
+        d += 1
+    end
+    while d > 0 is
+        let le: int = line_end_pos(e.value, p)
+        if le >= string_len(e.value) is
+            p = string_len(e.value)
+            break
+        end
+        let next_start: int = le + 1
+        let next_end: int = line_end_pos(e.value, next_start)
+        let len: int = next_end - next_start
+        p = next_start + (if col < len then col else len)
+        d -= 1
+    end
+    return moved(e, p, extend)
+end
