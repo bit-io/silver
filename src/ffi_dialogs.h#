@@ -1,6 +1,10 @@
 extern static [c, "silverdialogs"] is
     fn silver_dialog_open_file(title: string, filter_desc: string, filter_pattern: string) -> string
+    fn silver_dialog_open_file_ex(title: string, filter_desc: string, filter_pattern: string, default_path: string) -> string
+    fn silver_dialog_open_files(title: string, filter_desc: string, filter_pattern: string, default_path: string) -> string
     fn silver_dialog_save_file(title: string, default_name: string) -> string
+    fn silver_dialog_save_file_ex(title: string, default_path: string, filter_desc: string, filter_pattern: string) -> string
     fn silver_dialog_open_folder(title: string) -> string
+    fn silver_dialog_open_folder_ex(title: string, default_path: string) -> string
     fn silver_dialog_message(title: string, text: string, kind: string) -> bool
 end
