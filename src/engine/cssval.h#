@@ -1,0 +1,483 @@
+use "std -> conv" from "conv"
+
+pub struct Color is
+    pub r: int
+    pub g: int
+    pub b: int
+    pub a: int
+end
+
+;; Długość po rozwiązaniu: `px` + `pct` (setne części procenta, 5000 = 50%).
+;; `auto` = słowo kluczowe auto, `ok` = false gdy wartość nie dała się sparsować.
+pub struct Len is
+    pub px:   int
+    pub pct:  int
+    pub auto: bool
+    pub ok:   bool
+end
+
+pub struct LenEnv is
+    pub em:  int    ;; bieżący font-size (px)
+    pub rem: int
+    pub vw:  int    ;; szerokość viewportu (px)
+    pub vh:  int
+end
+
+pub fn default_env() -> LenEnv is
+    return LenEnv { em: 16, rem: 16, vw: 800, vh: 600 }
+end
+
+pub fn len_px(px: int) -> Len is
+    return Len { px: px, pct: 0, auto: false, ok: true }
+end
+
+pub fn len_auto() -> Len is
+    return Len { px: 0, pct: 0, auto: true, ok: true }
+end
+
+pub fn len_bad() -> Len is
+    return Len { px: 0, pct: 0, auto: false, ok: false }
+end
+
+;; Rozwiązuje `Len` względem `basis` (np. szerokości bloku zawierającego).
+pub fn px_of(l: Len, basis: int) -> int is
+    return l.px + basis * l.pct / 10000
+end
+
+;; ---------- kolory ----------
+fn named_table() -> string is
+    return ",aliceblue:f0f8ff,antiquewhite:faebd7,aqua:00ffff,aquamarine:7fffd4,azure:f0ffff,beige:f5f5dc,bisque:ffe4c4,black:000000,blanchedalmond:ffebcd,blue:0000ff,blueviolet:8a2be2,brown:a52a2a,burlywood:deb887,cadetblue:5f9ea0,chartreuse:7fff00,chocolate:d2691e,coral:ff7f50,cornflowerblue:6495ed,cornsilk:fff8dc,crimson:dc143c,cyan:00ffff,darkblue:00008b,darkcyan:008b8b,darkgoldenrod:b8860b,darkgray:a9a9a9,darkgreen:006400,darkgrey:a9a9a9,darkkhaki:bdb76b,darkmagenta:8b008b,darkolivegreen:556b2f,darkorange:ff8c00,darkorchid:9932cc,darkred:8b0000,darksalmon:e9967a,darkseagreen:8fbc8f,darkslateblue:483d8b,darkslategray:2f4f4f,darkslategrey:2f4f4f,darkturquoise:00ced1,darkviolet:9400d3,deeppink:ff1493,deepskyblue:00bfff,dimgray:696969,dimgrey:696969,dodgerblue:1e90ff,firebrick:b22222,floralwhite:fffaf0,forestgreen:228b22,fuchsia:ff00ff,gainsboro:dcdcdc,ghostwhite:f8f8ff,gold:ffd700,goldenrod:daa520,gray:808080,green:008000,greenyellow:adff2f,grey:808080,honeydew:f0fff0,hotpink:ff69b4,indianred:cd5c5c,indigo:4b0082,ivory:fffff0,khaki:f0e68c,lavender:e6e6fa,lavenderblush:fff0f5,lawngreen:7cfc00,lemonchiffon:fffacd,lightblue:add8e6,lightcoral:f08080,lightcyan:e0ffff,lightgoldenrodyellow:fafad2,lightgray:d3d3d3,lightgreen:90ee90,lightgrey:d3d3d3,lightpink:ffb6c1,lightsalmon:ffa07a,lightseagreen:20b2aa,lightskyblue:87cefa,lightslategray:778899,lightslategrey:778899,lightsteelblue:b0c4de,lightyellow:ffffe0,lime:00ff00,limegreen:32cd32,linen:faf0e6,magenta:ff00ff,maroon:800000,mediumaquamarine:66cdaa,mediumblue:0000cd,mediumorchid:ba55d3,mediumpurple:9370db,mediumseagreen:3cb371,mediumslateblue:7b68ee,mediumspringgreen:00fa9a,mediumturquoise:48d1cc,mediumvioletred:c71585,midnightblue:191970,mintcream:f5fffa,mistyrose:ffe4e1,moccasin:ffe4b5,navajowhite:ffdead,navy:000080,oldlace:fdf5e6,olive:808000,olivedrab:6b8e23,orange:ffa500,orangered:ff4500,orchid:da70d6,palegoldenrod:eee8aa,palegreen:98fb98,paleturquoise:afeeee,palevioletred:db7093,papayawhip:ffefd5,peachpuff:ffdab9,peru:cd853f,pink:ffc0cb,plum:dda0dd,powderblue:b0e0e6,purple:800080,rebeccapurple:663399,red:ff0000,rosybrown:bc8f8f,royalblue:4169e1,saddlebrown:8b4513,salmon:fa8072,sandybrown:f4a460,seagreen:2e8b57,seashell:fff5ee,sienna:a0522d,silver:c0c0c0,skyblue:87ceeb,slateblue:6a5acd,slategray:708090,slategrey:708090,snow:fffafa,springgreen:00ff7f,steelblue:4682b4,tan:d2b48c,teal:008080,thistle:d8bfd8,tomato:ff6347,turquoise:40e0d0,violet:ee82ee,wheat:f5deb3,white:ffffff,whitesmoke:f5f5f5,yellow:ffff00,yellowgreen:9acd32,"
+end
+
+;; "rrggbb" dla nazwy koloru albo "" gdy nazwa nieznana.
+pub fn color_named(name: string) -> string is
+    let key: string = "," + name + ":"
+    let idx: int = string_find(named_table(), key)
+    if idx < 0 is return "" end
+    let start: int = idx + string_len(key)
+    return string_slice(named_table(), start, start + 6)
+end
+
+;; Własny parser hex (nie polegamy na conv::hex_to_int).
+pub fn hex_pair(h: string) -> int is
+    let digits: string = "0123456789abcdef"
+    let lower: string = string_lower(h)
+    let mut result: int = 0
+    let mut i: int = 0
+    while i < string_len(lower) is
+        let idx: int = string_find(digits, string_slice(lower, i, i + 1))
+        if idx < 0 is return 0 end
+        result = result * 16 + idx
+        i += 1
+    end
+    return result
+end
+
+fn clamp255(n: int) -> int is
+    if n < 0 is return 0 end
+    if n > 255 is return 255 end
+    return n
+end
+
+pub fn is_hex_digits(s: string) -> bool is
+    let n: int = string_len(s)
+    if n == 0 is return false end
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_slice(s, i, i + 1)
+        let ok: bool = (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+;; Zamiana „np. 40%” lub „0.5” na 0..255 (alfa i kanały rgb)
+fn channel_value(tok: string, scale: int) -> int is
+    let t: string = string_trim(tok)
+    if string_ends_with(t, "%") is
+        let f: f64 = conv::str_to_float(string_trim(string_slice(t, 0, string_len(t) - 1)))
+        return clamp255(conv::float_to_int(f * conv::int_to_float(255) / 100.0 + 0.5))
+    end
+    let f: f64 = conv::str_to_float(t)
+    return clamp255(conv::float_to_int(f * conv::int_to_float(scale) + 0.5))
+end
+
+fn alpha_value(tok: string) -> int is
+    let t: string = string_trim(tok)
+    if string_ends_with(t, "%") is return channel_value(t, 1) end
+    let f: f64 = conv::str_to_float(t)
+    return clamp255(conv::float_to_int(f * 255.0 + 0.5))
+end
+
+fn split_args(inner: string) -> [string] is
+    let norm: string = string_replace(string_replace(string_replace(inner, "/", ","), "  ", " "), " ", ",")
+    let raw: [string] = string_split(norm, ",")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(raw) is
+        let t: string = string_trim(raw[i])
+        if t != "" is out = array_push(out, t) end
+        i += 1
+    end
+    return out
+end
+
+fn hue_to_rgb(p: f64, q: f64, t0: f64) -> f64 is
+    let mut t: f64 = t0
+    if t < 0.0 is t = t + 1.0 end
+    if t > 1.0 is t = t - 1.0 end
+    if t < 1.0 / 6.0 is return p + (q - p) * 6.0 * t end
+    if t < 0.5 is return q end
+    if t < 2.0 / 3.0 is return p + (q - p) * (2.0 / 3.0 - t) * 6.0 end
+    return p
+end
+
+fn hsl_to_color(h_deg: f64, s: f64, l: f64, a: int) -> Color is
+    let mut h: f64 = h_deg / 360.0
+    h = h - conv::int_to_float(conv::float_to_int(h))
+    if h < 0.0 is h = h + 1.0 end
+    if s <= 0.0 is
+        let v: int = clamp255(conv::float_to_int(l * 255.0 + 0.5))
+        return Color { r: v, g: v, b: v, a: a }
+    end
+    let q: f64 = if l < 0.5 then l * (1.0 + s) else l + s - l * s
+    let p: f64 = 2.0 * l - q
+    return Color {
+        r: clamp255(conv::float_to_int(hue_to_rgb(p, q, h + 1.0 / 3.0) * 255.0 + 0.5)),
+        g: clamp255(conv::float_to_int(hue_to_rgb(p, q, h) * 255.0 + 0.5)),
+        b: clamp255(conv::float_to_int(hue_to_rgb(p, q, h - 1.0 / 3.0) * 255.0 + 0.5)),
+        a: a
+    }
+end
+
+fn pct_to_unit(tok: string) -> f64 is
+    let t: string = string_trim(tok)
+    let body: string = if string_ends_with(t, "%") then string_slice(t, 0, string_len(t) - 1) else t
+    return conv::str_to_float(string_trim(body)) / 100.0
+end
+
+;; Czy `val` jest poprawnym kolorem (do odróżniania koloru od innych
+;; tokenów w skrótach typu `border: 1px solid red`).
+pub fn is_color(val: string) -> bool is
+    let v: string = string_trim(string_replace(val, "\u0001", ""))
+    let lower: string = string_lower(v)
+    if lower == "transparent" || lower == "currentcolor" is return true end
+    if string_starts_with(lower, "#") is
+        let n: int = string_len(lower) - 1
+        return (n == 3 || n == 4 || n == 6 || n == 8) && is_hex_digits(string_slice(lower, 1, string_len(lower)))
+    end
+    if string_starts_with(lower, "rgb(") || string_starts_with(lower, "rgba(") is return true end
+    if string_starts_with(lower, "hsl(") || string_starts_with(lower, "hsla(") is return true end
+    return color_named(lower) != ""
+end
+
+;; Parsuje kolor; przy błędzie zwraca czarny (a=255) — użyj `is_color`,
+;; jeśli musisz wiedzieć, czy wartość była poprawna.
+pub fn parse_color(val: string) -> Color is
+    let v: string = string_lower(string_trim(val))
+    if v == "transparent" is return Color { r: 0, g: 0, b: 0, a: 0 } end
+
+    if string_starts_with(v, "#") is
+        let hex: string = string_slice(v, 1, string_len(v))
+        let n: int = string_len(hex)
+        if is_hex_digits(hex) is
+            if n == 3 || n == 4 is
+                let r: int = hex_pair(string_slice(hex, 0, 1) + string_slice(hex, 0, 1))
+                let g: int = hex_pair(string_slice(hex, 1, 2) + string_slice(hex, 1, 2))
+                let b: int = hex_pair(string_slice(hex, 2, 3) + string_slice(hex, 2, 3))
+                let a: int = if n == 4 then hex_pair(string_slice(hex, 3, 4) + string_slice(hex, 3, 4)) else 255
+                return Color { r: r, g: g, b: b, a: a }
+            end
+            if n == 6 || n == 8 is
+                let a: int = if n == 8 then hex_pair(string_slice(hex, 6, 8)) else 255
+                return Color { r: hex_pair(string_slice(hex, 0, 2)), g: hex_pair(string_slice(hex, 2, 4)),
+                               b: hex_pair(string_slice(hex, 4, 6)), a: a }
+            end
+        end
+        return Color { r: 0, g: 0, b: 0, a: 255 }
+    end
+
+    let open: int = string_find(v, "(")
+    if open > 0 && string_ends_with(v, ")") is
+        let fname: string = string_trim(string_slice(v, 0, open))
+        let args: [string] = split_args(string_slice(v, open + 1, string_len(v) - 1))
+        let na: int = array_len(args)
+        if (fname == "rgb" || fname == "rgba") && na >= 3 is
+            let a: int = if na >= 4 then alpha_value(args[3]) else 255
+            return Color { r: channel_value(args[0], 1), g: channel_value(args[1], 1),
+                           b: channel_value(args[2], 1), a: a }
+        end
+        if (fname == "hsl" || fname == "hsla") && na >= 3 is
+            let hs: string = string_replace(string_replace(args[0], "deg", ""), "turn", "")
+            let mut hue: f64 = conv::str_to_float(hs)
+            if string_ends_with(args[0], "turn") is hue = hue * 360.0 end
+            let a: int = if na >= 4 then alpha_value(args[3]) else 255
+            return hsl_to_color(hue, pct_to_unit(args[1]), pct_to_unit(args[2]), a)
+        end
+        return Color { r: 0, g: 0, b: 0, a: 255 }
+    end
+
+    let hex: string = color_named(v)
+    if hex != "" is
+        return Color { r: hex_pair(string_slice(hex, 0, 2)), g: hex_pair(string_slice(hex, 2, 4)),
+                       b: hex_pair(string_slice(hex, 4, 6)), a: 255 }
+    end
+    return Color { r: 0, g: 0, b: 0, a: 255 }
+end
+
+pub fn color_lerp(a: Color, b: Color, t_pct: int) -> Color is
+    let t: int = if t_pct < 0 then 0 elsif t_pct > 100 then 100 else t_pct
+    return Color {
+        r: a.r + (b.r - a.r) * t / 100, g: a.g + (b.g - a.g) * t / 100,
+        b: a.b + (b.b - a.b) * t / 100, a: a.a + (b.a - a.a) * t / 100
+    }
+end
+
+;; ---------- długości ----------
+fn is_num_char(c: string) -> bool is
+    return (c >= "0" && c <= "9") || c == "." || c == "-" || c == "+"
+end
+
+;; Długość numerycznego prefiksu ("12.5px" -> 4)
+fn num_prefix_len(s: string) -> int is
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_slice(s, i, i + 1)
+        let ok: bool = (c >= "0" && c <= "9") || c == "." || ((c == "-" || c == "+") && i == 0)
+        if !ok is break end
+        i += 1
+    end
+    return i
+end
+
+;; Wartość calc w f64: `a` = px, `b` = procent (1.0 = 1%), `s` = skalar,
+;; `is_scalar` = liczba bez jednostki (potrzebne do * i /).
+struct CV is
+    pub a: f64
+    pub b: f64
+    pub s: f64
+    pub is_scalar: bool
+    pub ok: bool
+end
+
+struct CalcRes is
+    pub v:   CV
+    pub pos: int
+end
+
+fn cv_bad() -> CV is
+    return CV { a: 0.0, b: 0.0, s: 0.0, is_scalar: false, ok: false }
+end
+
+fn unit_to_cv(num: f64, unit: string, env: LenEnv) -> CV is
+    let f: f64 = num
+    if unit == "" is return CV { a: 0.0, b: 0.0, s: f, is_scalar: true, ok: true } end
+    if unit == "px" is return CV { a: f, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "%" is return CV { a: 0.0, b: f, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "em" is return CV { a: f * conv::int_to_float(env.em), b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "rem" is return CV { a: f * conv::int_to_float(env.rem), b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "vw" is return CV { a: f * conv::int_to_float(env.vw) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "vh" is return CV { a: f * conv::int_to_float(env.vh) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "vmin" is
+        let m: int = if env.vw < env.vh then env.vw else env.vh
+        return CV { a: f * conv::int_to_float(m) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true }
+    end
+    if unit == "vmax" is
+        let m: int = if env.vw > env.vh then env.vw else env.vh
+        return CV { a: f * conv::int_to_float(m) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true }
+    end
+    if unit == "pt" is return CV { a: f * 4.0 / 3.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "pc" is return CV { a: f * 16.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "cm" is return CV { a: f * 37.795, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "mm" is return CV { a: f * 3.7795, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "in" is return CV { a: f * 96.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    return cv_bad()
+end
+
+fn cv_skip_ws(s: string, pos: int) -> int is
+    let mut p: int = pos
+    while p < string_len(s) && string_slice(s, p, p + 1) == " " is p += 1 end
+    return p
+end
+
+fn cv_mul(x: CV, y: CV) -> CV is
+    if !x.ok || !y.ok is return cv_bad() end
+    if x.is_scalar && y.is_scalar is return CV { a: 0.0, b: 0.0, s: x.s * y.s, is_scalar: true, ok: true } end
+    if x.is_scalar is return CV { a: y.a * x.s, b: y.b * x.s, s: 0.0, is_scalar: false, ok: true } end
+    if y.is_scalar is return CV { a: x.a * y.s, b: x.b * y.s, s: 0.0, is_scalar: false, ok: true } end
+    return cv_bad()
+end
+
+fn cv_div(x: CV, y: CV) -> CV is
+    if !x.ok || !y.ok || !y.is_scalar || y.s == 0.0 is return cv_bad() end
+    if x.is_scalar is return CV { a: 0.0, b: 0.0, s: x.s / y.s, is_scalar: true, ok: true } end
+    return CV { a: x.a / y.s, b: x.b / y.s, s: 0.0, is_scalar: false, ok: true }
+end
+
+fn cv_add(x: CV, y: CV, sign: f64) -> CV is
+    if !x.ok || !y.ok is return cv_bad() end
+    if x.is_scalar != y.is_scalar is return cv_bad() end
+    if x.is_scalar is return CV { a: 0.0, b: 0.0, s: x.s + sign * y.s, is_scalar: true, ok: true } end
+    return CV { a: x.a + sign * y.a, b: x.b + sign * y.b, s: 0.0, is_scalar: false, ok: true }
+end
+
+fn calc_primary(s: string, pos: int, env: LenEnv) -> CalcRes is
+    let mut p: int = cv_skip_ws(s, pos)
+    if p >= string_len(s) is return CalcRes { v: cv_bad(), pos: p } end
+    if string_slice(s, p, p + 1) == "(" is
+        let inner: CalcRes = calc_sum(s, p + 1, env)
+        let mut q: int = cv_skip_ws(s, inner.pos)
+        if q < string_len(s) && string_slice(s, q, q + 1) == ")" is q += 1 end
+        return CalcRes { v: inner.v, pos: q }
+    end
+    let rest: string = string_slice(s, p, string_len(s))
+    let nl: int = num_prefix_len(rest)
+    if nl == 0 is return CalcRes { v: cv_bad(), pos: string_len(s) } end
+    let num: f64 = conv::str_to_float(string_slice(rest, 0, nl))
+    let mut q: int = p + nl
+    let mut unit: string = ""
+    while q < string_len(s) is
+        let c: string = string_slice(s, q, q + 1)
+        let is_alpha: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c == "%"
+        if !is_alpha is break end
+        unit = unit + string_lower(c)
+        q += 1
+    end
+    return CalcRes { v: unit_to_cv(num, unit, env), pos: q }
+end
+
+fn calc_product(s: string, pos: int, env: LenEnv) -> CalcRes is
+    let first: CalcRes = calc_primary(s, pos, env)
+    let mut acc: CV = first.v
+    let mut p: int = cv_skip_ws(s, first.pos)
+    while p < string_len(s) is
+        let op: string = string_slice(s, p, p + 1)
+        if op != "*" && op != "/" is break end
+        let rhs: CalcRes = calc_primary(s, p + 1, env)
+        acc = if op == "*" then cv_mul(acc, rhs.v) else cv_div(acc, rhs.v)
+        p = cv_skip_ws(s, rhs.pos)
+    end
+    return CalcRes { v: acc, pos: p }
+end
+
+fn calc_sum(s: string, pos: int, env: LenEnv) -> CalcRes is
+    let first: CalcRes = calc_product(s, pos, env)
+    let mut acc: CV = first.v
+    let mut p: int = cv_skip_ws(s, first.pos)
+    while p < string_len(s) is
+        let op: string = string_slice(s, p, p + 1)
+        if op != "+" && op != "-" is break end
+        let rhs: CalcRes = calc_product(s, p + 1, env)
+        acc = cv_add(acc, rhs.v, if op == "+" then 1.0 else -1.0)
+        p = cv_skip_ws(s, rhs.pos)
+    end
+    return CalcRes { v: acc, pos: p }
+end
+
+fn cv_to_len(v: CV) -> Len is
+    if !v.ok || v.is_scalar is return len_bad() end
+    return Len { px: conv::float_to_int(v.a + (if v.a < 0.0 then -0.5 else 0.5)),
+                 pct: conv::float_to_int(v.b * 100.0 + (if v.b < 0.0 then -0.5 else 0.5)),
+                 auto: false, ok: true }
+end
+
+pub fn eval_calc(expr: string, env: LenEnv) -> Len is
+    let r: CalcRes = calc_sum(expr, 0, env)
+    return cv_to_len(r.v)
+end
+
+;; Parsuje długość. Obsługuje też min()/max()/clamp() dla samych px (po
+;; rozwiązaniu jednostek) — przy mieszaniu z % zwraca pierwszy argument.
+pub fn parse_len(val: string, env: LenEnv) -> Len is
+    let v: string = string_trim(val)
+    let lower: string = string_lower(v)
+    if lower == "auto" is return len_auto() end
+    if lower == "" is return len_bad() end
+    if string_starts_with(lower, "calc(") && string_ends_with(lower, ")") is
+        return eval_calc(string_slice(lower, 5, string_len(lower) - 1), env)
+    end
+    if string_starts_with(lower, "min(") || string_starts_with(lower, "max(") || string_starts_with(lower, "clamp(") is
+        let open: int = string_find(lower, "(")
+        let args: [string] = string_split(string_slice(lower, open + 1, string_len(lower) - 1), ",")
+        let mut vals: [Len] = []
+        let mut i: int = 0
+        while i < array_len(args) is
+            vals = array_push(vals, parse_len(args[i], env))
+            i += 1
+        end
+        if array_len(vals) == 0 is return len_bad() end
+        if string_starts_with(lower, "clamp(") && array_len(vals) == 3 is
+            let lo: int = vals[0].px
+            let hi: int = vals[2].px
+            let mid: int = vals[1].px
+            return len_px(if mid < lo then lo elsif mid > hi then hi else mid)
+        end
+        let mut best: Len = vals[0]
+        let is_min: bool = string_starts_with(lower, "min(")
+        i = 1
+        while i < array_len(vals) is
+            if (is_min && vals[i].px < best.px) || (!is_min && vals[i].px > best.px) is best = vals[i] end
+            i += 1
+        end
+        return best
+    end
+    let nl: int = num_prefix_len(lower)
+    if nl == 0 is return len_bad() end
+    let num: f64 = conv::str_to_float(string_slice(lower, 0, nl))
+    let unit: string = string_slice(lower, nl, string_len(lower))
+    let cv: CV = unit_to_cv(num, unit, env)
+    if !cv.ok is return len_bad() end
+    if cv.is_scalar is
+        ;; „0” bez jednostki jest poprawną długością; inne liczby traktujemy jak px
+        return len_px(conv::float_to_int(cv.s + (if cv.s < 0.0 then -0.5 else 0.5)))
+    end
+    return cv_to_len(cv)
+end
+
+;; Podział wartości po spacjach z poszanowaniem nawiasów: `1px solid rgb(0, 0, 0)`
+pub fn split_top(val: string) -> [string] is
+    let n: int = string_len(val)
+    let mut out: [string] = []
+    let mut depth: int = 0
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_slice(val, i, i + 1)
+        if c == "(" is depth += 1 end
+        if c == ")" is depth -= 1 end
+        if (c == " " || c == "\t" || c == "\n") && depth <= 0 is
+            if cur != "" is out = array_push(out, cur) end
+            cur = ""
+        else is
+            cur = cur + c
+        end
+        i += 1
+    end
+    if cur != "" is out = array_push(out, cur) end
+    return out
+end
+
+;; Podział po przecinkach na poziomie 0 (poza nawiasami)
+pub fn split_commas(val: string) -> [string] is
+    let n: int = string_len(val)
+    let mut out: [string] = []
+    let mut depth: int = 0
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_slice(val, i, i + 1)
+        if c == "(" is depth += 1 end
+        if c == ")" is depth -= 1 end
+        if c == "," && depth <= 0 is
+            out = array_push(out, string_trim(cur))
+            cur = ""
+        else is
+            cur = cur + c
+        end
+        i += 1
+    end
+    if string_trim(cur) != "" is out = array_push(out, string_trim(cur)) end
+    return out
+end
