@@ -1,24 +1,33 @@
-.page { background: #f2f2f5; padding: 24px; }
-.card { background: white; padding: 20px; border: 1px; border-color: #dddddd; }
-h1 { color: #202020; font-size: 24px; }
-p  { color: #555555; font-size: 14px; }
-
-input {
-    display: block;
-    width: 300px;
-    padding: 8px;
-    margin: 8px;
-    border: 1px;
-    border-color: #cccccc;
-    background: white;
+* { box-sizing: border-box; }
+:root { --accent: #3a5edc; --bg: #f2f2f5; --card: #ffffff; --text: #202020; --muted: #666666; }
+body { background: var(--bg); color: var(--text); font-size: 15px; }
+.wrap { max-width: 760px; margin: 0 auto; padding: 24px; }
+h1 { font-size: 30px; margin-bottom: 4px; }
+.lead { color: var(--muted); }
+.panel { background: var(--card); border: 1px solid #dcdce2; border-radius: 12px; padding: 16px; margin: 16px 0;
+         box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
+.form { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.form textarea { width: 100%; height: 90px; }
+label { display: flex; gap: 6px; align-items: center; }
+input[type=text] { width: 200px; }
+input:focus, textarea:focus { border-color: var(--accent); outline: 2px solid #b9c6f5; }
+button { background: var(--accent); color: white; border-color: var(--accent); transition: 160ms; }
+button:hover { background: #2f4ec0; }
+.ok { color: #0a7a3a; font-weight: bold; }
+.flex { display: flex; gap: 8px; margin-bottom: 12px; }
+.box { background: #e8ecff; padding: 12px 18px; border-radius: 8px; }
+.grow { flex: 1; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.cell { background: #fff4d6; padding: 10px; border-radius: 6px; text-align: center; }
+.wide { grid-column: span 2; background: #ffe0e0; }
+a { color: var(--accent); }
+code { font-size: 14px; }
+.scroller { height: 120px; overflow: auto; border: 1px solid #ccc; padding: 6px 10px; border-radius: 6px; }
+.scroller p { margin: 0 0 6px 0; }
+@media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .flex { flex-direction: column; } }
+@media (prefers-color-scheme: dark) {
+    :root { --bg: #1d1e22; --card: #2a2c33; --text: #eeeeee; --muted: #aaaaaa; }
+    .panel { border-color: #444; }
+    .box { background: #3a3f55; } .cell { background: #4a4430; } .wide { background: #503535; }
+    input, textarea, select { background: #1f2026; color: #eeeeee; border-color: #555; }
 }
-
-.row {
-    display: flex;
-    flex-direction: row;
-    gap: 12px;
-    margin: 8px;
-}
-.btn { padding: 10px; background: #999999; }
-.btn.primary { background: #3a5edc; }
-.btn span { color: white; font-size: 14px; }
