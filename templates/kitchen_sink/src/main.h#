@@ -1,26 +1,32 @@
-use "silver -> app"    from "app"
-use "silver -> dialog" from "dialog"
+use "bit -> silver" from "silver"
 
-fn say_hello(args_json: string) -> string is
-    ;; app::input_value czyta na żywo to, co user wpisał w <input id="name">
-    ;; — command handler nie ma bezpośredniego dostępu do App (patrz
-    ;; komentarz w ROADMAP.md o closures), więc odczyt robimy w
-    ;; on_tick zamiast tutaj; tu tylko potwierdzamy kliknięcie.
-    dialog::info("Silver", "Kliknięto przycisk — sprawdź konsolę/log.")
-    return "{\"ok\": \"true\"}"
+;; Handlery HTML dostają JSON: id, value, checked, name, data-*.
+fn on_name(args: string) -> string is
+    ;; ui::* — handler zmienia widok bez dostępu do App
+    return ui::only(ui::set_text("hello", "Cześć, " + data::get_str(args, "value") + "!"))
 end
 
-fn sync(a: app::App) -> app::App is
-    let name: string = app::input_value(a, "name")
-    return app::set_state(a, "name", if name != "" then name else "(wpisz coś)")
+fn on_agree(args: string) -> string is
+    let on: bool = data::get_bool(args, "checked")
+    return ui::only(ui::set_text("agree-state", if on then "zgoda: TAK" else "zgoda: NIE"))
+end
+
+fn on_color(args: string) -> string is
+    return ui::only(ui::set_text("color-state", "kolor: " + data::get_str(args, "value")))
+end
+
+fn on_submit(args: string) -> string is
+    return ui::only(ui::set_text("status", "Formularz wysłany"))
 end
 
 fn main() is
-    let mut a = app::new("Kitchen Sink", 480, 360)
-    a = app::with_font(a, "frontend/fonts/DejaVuSans.ttf", 16)
+    let mut a = app::new("Silver — kitchen sink", 900, 700)
     a = app::load_html(a, "frontend/index.html")
     a = app::load_css(a, "frontend/style.css")
-    a = app::command(a, "say_hello", say_hello)
-    a = app::on_tick(a, sync)
+    a = app::command(a, "on_name", on_name)
+    a = app::command(a, "on_agree", on_agree)
+    a = app::command(a, "on_color", on_color)
+    a = app::command(a, "on_submit", on_submit)
+    a = app::enable_hot_reload(a)
     app::run(a)
 end
