@@ -1,0 +1,46 @@
+<div class="shell">
+  <aside class="side">
+    <h2>Pulpit</h2>
+    <a class="nav active" data-view="overview">Przegląd</a>
+    <a class="nav" data-view="tasks">Zadania w tle</a>
+    <a class="nav" data-view="about">O programie</a>
+    <div class="clock" id="clock">--:--:--</div>
+  </aside>
+
+  <main class="main">
+    <section id="overview" class="view">
+      <div class="cards">
+        <div class="card"><span class="label">Odwiedziny</span><b id="kpi-a">0</b></div>
+        <div class="card"><span class="label">Zamówienia</span><b id="kpi-b">0</b></div>
+        <div class="card"><span class="label">Przychód</span><b id="kpi-c">0</b></div>
+      </div>
+      <div class="panel">
+        <h3>Ostatnie 12 odczytów <small id="range"></small></h3>
+        <div id="chart" class="chart"></div>
+        <button id="shuffle">Losuj dane</button>
+      </div>
+    </section>
+
+    <section id="tasks" class="view hidden">
+      <div class="panel">
+        <h3>Zadanie w tle (H# spawn_task)</h3>
+        <p>UI nie zamarza — wynik wraca zdarzeniem.</p>
+        <button id="run">Uruchom <code>uname -a</code></button>
+        <pre id="task-out" class="out">(brak wyniku)</pre>
+      </div>
+      <div class="panel">
+        <h3>fetch() z JS</h3>
+        <button id="fetch">Pobierz https://example.com</button>
+        <pre id="fetch-out" class="out"></pre>
+      </div>
+    </section>
+
+    <section id="about" class="view hidden">
+      <div class="panel">
+        <h3>Silver 0.2</h3>
+        <p>Pulpit pokazuje: grid/flex, zmienne CSS, motyw ciemny przez <code>@media</code>,
+        przejścia, wykres zbudowany w JS z elementów <code>div</code>, zadania w tle i cykliczny <code>on_tick</code>.</p>
+      </div>
+    </section>
+  </main>
+</div>
