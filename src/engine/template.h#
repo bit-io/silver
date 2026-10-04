@@ -1,53 +1,197 @@
 mod dom
-use "std -> json" from "json"
+mod jsonlite
 
-fn substitute(text: string, store: string) -> string is
+fn truthy(v: string) -> bool is
+    let t: string = string_lower(string_trim(v))
+    return t != "" && t != "false" && t != "0" && t != "null"
+end
+
+;; Wartość klucza z obiektu JSON; "a.b" schodzi w głąb obiektów.
+pub fn lookup(store: string, key: string) -> string is
+    let dot: int = string_find(key, ".")
+    if dot < 0 is return jsonlite::get_str(store, key) end
+    let head: string = string_slice(key, 0, dot)
+    let rest: string = string_slice(key, dot + 1, string_len(key))
+    let inner: string = jsonlite::get_str(store, head)
+    if inner == "" is return "" end
+    return lookup(inner, rest)
+end
+
+fn scoped_value(key: string, store: string, scope_name: string, scope_val: string, scope_index: int) -> string is
+    if scope_name != "" is
+        if key == scope_name is return scope_val end
+        if key == "index" is return to_string(scope_index) end
+        if string_starts_with(key, scope_name + ".") is
+            return lookup(scope_val, string_slice(key, string_len(scope_name) + 1, string_len(key)))
+        end
+    end
+    return lookup(store, key)
+end
+
+;; Podstawia {{klucz}} z `store`; w pętli dodatkowo {{as.pole}}, {{as}}, {{index}}.
+pub fn substitute_scoped(text: string, store: string, scope_name: string, scope_val: string, scope_index: int) -> string is
+    if string_find(text, "{{{{") < 0 is return text end
     let n: int = string_len(text)
     let mut out: string = ""
     let mut p: int = 0
     while p < n is
-        if p + 1 < n && string_slice(text, p, p + 2) == "{{" is
-            let close: int = find_from(text, "}}", p + 2)
-            if close < 0 is
-                out = out + string_slice(text, p, n)
-                p = n
-            else is
-                let key: string = string_trim(string_slice(text, p + 2, close))
-                let val: string = json::get_str(store, key)
-                out = out + val
-                p = close + 2
-            end
-        else is
-            out = out + string_slice(text, p, p + 1)
-            p += 1
+        let open: int = dom::find_from(text, "{{{{", p)
+        if open < 0 is
+            out = out + string_slice(text, p, n)
+            p = n
+            continue
         end
+        out = out + string_slice(text, p, open)
+        let close: int = dom::find_from(text, "}}}}", open + 2)
+        if close < 0 is
+            out = out + string_slice(text, open, n)
+            p = n
+            continue
+        end
+        let key: string = string_trim(string_slice(text, open + 2, close))
+        let val: string = scoped_value(key, store, scope_name, scope_val, scope_index)
+        out = out + val
+        p = close + 2
     end
     return out
 end
 
-fn find_from(s: string, needle: string, from: int) -> int is
-    if from >= string_len(s) is return -1 end
-    let idx: int = string_find(string_slice(s, from, string_len(s)), needle)
-    if idx < 0 is return -1 end
-    return idx + from
+pub fn substitute(text: string, store: string) -> string is
+    return substitute_scoped(text, store, "", "", 0)
 end
 
-;; Zwraca NOWY Dom z podmienionymi placeholderami we wszystkich węzłach
-;; tekstowych. Wołaj raz na klatkę w app::frame, tuż przed layout::layout.
-pub fn apply_state(dom: dom::Dom, store: string) -> dom::Dom is
-    let mut out_nodes: [dom::DomNode] = []
-    let count: int = array_len(dom.nodes)
+;; Rozbija tablicę JSON ("[1,{"a":2},"x"]") na elementy najwyższego poziomu (każdy jako tekst JSON).
+pub fn split_json_array(arr: string) -> [string] is
+    return jsonlite::array_items(arr)
+end
+
+;; "\"abc\"" -> abc (elementy tekstowe tablicy); inne bez zmian
+fn unquote(v: string) -> string is
+    if string_len(v) >= 2 && string_starts_with(v, "\"") is return jsonlite::raw_to_str(v) end
+    return v
+end
+
+;; ---------- expand: if / each ----------
+fn next_sibling(d: dom::Dom, node_id: int) -> int is
+    let parent: int = d.nodes[node_id].parent
+    if parent < 0 is return -1 end
+    let kids: [int] = d.nodes[parent].children
     let mut i: int = 0
-    while i < count is
-        let n: dom::DomNode = dom.nodes[i]
+    while i < array_len(kids) is
+        if kids[i] == node_id is
+            if i + 1 < array_len(kids) is return kids[i + 1] end
+            return -1
+        end
         i += 1
-        if n.tag == "text" && string_find(n.text, "{{") >= 0 is
-            let mut nn: dom::DomNode = n
-            nn.text = substitute(n.text, store)
-            out_nodes = array_push(out_nodes, nn)
+    end
+    return -1
+end
+
+fn find_marked(d: dom::Dom, attr: string) -> int is
+    let order: [int] = dom::document_order(d)
+    let mut i: int = 0
+    while i < array_len(order) is
+        let id: int = order[i]
+        i += 1
+        if id == 0 || d.nodes[id].removed || d.nodes[id].tag == "text" is continue end
+        if dom::has_attr(d.nodes[id], attr) is return id end
+    end
+    return -1
+end
+
+pub fn expand(d0: dom::Dom, store: string) -> dom::Dom is
+    let mut d: dom::Dom = d0
+    let mut guard: int = 0
+    ;; warunki
+    while guard < 1000 is
+        guard += 1
+        let id: int = find_marked(d, "if")
+        let idn: int = find_marked(d, "if-not")
+        let pick: int = if id >= 0 then id else idn
+        if pick < 0 is break end
+        let is_not: bool = id < 0
+        let key: string = dom::get_attr(d.nodes[pick], if is_not then "if-not" else "if")
+        let ok: bool = truthy(lookup(store, key))
+        let show: bool = if is_not then !ok else ok
+        if show is
+            d = dom::remove_attr(d, pick, if is_not then "if-not" else "if")
         else is
-            out_nodes = array_push(out_nodes, n)
+            d = dom::remove_node(d, pick)
         end
     end
-    return dom::Dom { nodes: out_nodes }
+    ;; pętle
+    guard = 0
+    while guard < 500 is
+        guard += 1
+        let id: int = find_marked(d, "each")
+        if id < 0 is break end
+        let node: dom::DomNode = d.nodes[id]
+        let list_key: string = dom::get_attr(node, "each")
+        let var_name: string = if dom::has_attr(node, "as") then dom::get_attr(node, "as") else "item"
+        let before: int = next_sibling(d, id)
+        let parent: int = node.parent
+        let mut clone: dom::Dom = dom::remove_attr(dom::remove_attr(d, id, "each"), id, "as")
+        let proto: string = dom::outer_html(clone, id)
+        let items: [string] = split_json_array(lookup(store, list_key))
+        d = dom::remove_node(clone, id)
+        if parent >= 0 is
+            let mut i: int = 0
+            while i < array_len(items) is
+                let html: string = substitute_scoped(proto, store, var_name, unquote(items[i]), i)
+                d = dom::insert_html(d, parent, html, before)
+                i += 1
+            end
+        end
+    end
+    return d
+end
+
+;; ---------- apply_state: podstawienia w miejscu ----------
+fn templated(n: dom::DomNode, key: string) -> string is
+    return dom::get_attr(n, "~" + key)
+end
+
+fn sub_attr(d: dom::Dom, id: int, name: string, store: string) -> dom::Dom is
+    let n: dom::DomNode = d.nodes[id]
+    let shadow: string = dom::get_attr(n, "~" + name)
+    let cur: string = dom::get_attr(n, name)
+    let src: string = if shadow != "" then shadow else cur
+    if string_find(src, "{{{{") < 0 is return d end
+    let mut out: dom::Dom = d
+    if shadow == "" is out = dom::set_attr(out, id, "~" + name, cur) end
+    return dom::set_attr(out, id, name, substitute(src, store))
+end
+
+pub fn apply_state(d0: dom::Dom, store: string) -> dom::Dom is
+    let mut d: dom::Dom = d0
+    let count: int = array_len(d.nodes)
+    let mut id: int = 0
+    while id < count is
+        let n: dom::DomNode = d.nodes[id]
+        let cur: int = id
+        id += 1
+        if n.removed is continue end
+        if n.tag == "text" is
+            let shadow: string = dom::get_attr(n, "~text")
+            let src: string = if shadow != "" then shadow else n.text
+            if string_find(src, "{{{{") >= 0 is
+                if shadow == "" is d = dom::set_attr(d, cur, "~text", n.text) end
+                d.nodes[cur].text = substitute(src, store)
+            end
+            continue
+        end
+        let names: [string] = ["value", "placeholder", "src", "href", "title", "class", "style", "name", "id"]
+        let mut k: int = 0
+        while k < array_len(names) is
+            d = sub_attr(d, cur, names[k], store)
+            k += 1
+        end
+        let extra: [string] = dom::extra_attr_names(d.nodes[cur])
+        k = 0
+        while k < array_len(extra) is
+            d = sub_attr(d, cur, extra[k], store)
+            k += 1
+        end
+    end
+    return d
 end
