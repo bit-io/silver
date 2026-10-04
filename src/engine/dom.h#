@@ -1,187 +1,944 @@
 pub struct DomNode is
     pub id:         int
-    pub parent:     int         ;; -1 dla roota
+    pub parent:     int          ;; -1 dla roota i węzłów odłączonych
     pub tag:        string       ;; "div" | "text" | ... | "root"
-    pub text:       string        ;; treść dla tag == "text"
-    pub attr_id:    string         ;; wartość id="..."
-    pub attr_class: string          ;; wartość class="..." (rozdzielone spacją)
-    pub on_click:   string           ;; wartość on-click="..." (nazwa handlera)
-    pub attr_src:   string            ;; wartość src="..." (dla <img>)
-    pub attr_value: string             ;; wartość value="..." (dla <input>, stan początkowy)
+    pub text:       string       ;; treść dla tag == "text"
+    pub attr_id:    string
+    pub attr_class: string       ;; klasy rozdzielone spacją
+    pub on_click:   string       ;; nazwa komendy
+    pub attr_src:   string
+    pub attr_value: string
+    pub attr_style: string       ;; style="…"
+    pub attr_placeholder: string
+    pub attr_type:  string       ;; type="…" (text/password/checkbox/radio/…)
+    pub attr_name:  string
+    pub attr_href:  string
+    pub attr_title: string
+    pub on_input:   string       ;; on-input="komenda"
+    pub on_change:  string
+    pub on_submit:  string
+    pub on_keydown: string
+    pub on_hover:   string
+    pub attrs:      string       ;; pozostałe atrybuty: "\u0002nazwa\u0001wartość…"
+    pub disabled:   bool
+    pub checked:    bool
+    pub readonly:   bool
+    pub removed:    bool
+    pub glue:       bool         ;; bez białego znaku między tym węzłem a poprzednim rodzeństwem
+    pub pseudo:     string       ;; "" | "before" | "after" (treść generowana)
     pub children:   [int]
 end
 
 pub struct Dom is
-    pub nodes: [DomNode]
+    pub nodes:       [DomNode]
+    pub inline_css:  string      ;; zawartość elementów <style>
+    pub inline_js:   string      ;; zawartość <script> bez src
+    pub stylesheets: [string]    ;; <link rel="stylesheet" href="…">
+    pub scripts:     [string]    ;; <script src="…">
+    pub title:       string      ;; <title>
+end
+
+pub fn empty() -> Dom is
+    return Dom { nodes: [], inline_css: "", inline_js: "", stylesheets: [], scripts: [], title: "" }
 end
 
 fn is_space(c: string) -> bool is
-    return c == " " || c == "\n" || c == "\t" || c == "\r"
+    return c == " " || c == "\n" || c == "\t" || c == "\r" || c == "\u000c"
 end
 
-fn skip_spaces(html: string, pos: int) -> int is
-    let mut p: int = pos
-    while p < string_len(html) && is_space(string_at(html, p)) is
-        p += 1
-    end
-    return p
+fn is_name_char(c: string) -> bool is
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "-" || c == "_" || c == ":"
 end
 
-;; Szuka `needle` zaczynając od `from` (string_find zawsze szuka od
-;; początku stringa, więc robimy to na przesuniętym wycinku i wracamy
-;; z powrotem do indeksu w oryginalnym stringu).
-fn find_from(html: string, needle: string, from: int) -> int is
-    if from >= string_len(html) is return -1 end
-    let idx: int = string_find(string_slice(html, from, string_len(html)), needle)
+pub fn find_from(s: string, needle: string, from: int) -> int is
+    if from >= string_len(s) is return -1 end
+    let idx: int = string_find(string_slice(s, from, string_len(s)), needle)
     if idx < 0 is return -1 end
     return idx + from
 end
 
-fn new_node(dom: Dom, parent: int, tag: string) -> Dom is
-    let node: DomNode = DomNode {
-        id: array_len(dom.nodes), parent: parent, tag: tag, text: "",
+;; ---------- encje ----------
+fn named_entity(name: string) -> string is
+    if name == "amp" is return "&" end
+    if name == "lt" is return "<" end
+    if name == "gt" is return ">" end
+    if name == "quot" is return "\"" end
+    if name == "apos" is return "'" end
+    if name == "nbsp" is return "\u00a0" end
+    if name == "copy" is return "©" end
+    if name == "reg" is return "®" end
+    if name == "trade" is return "™" end
+    if name == "mdash" is return "—" end
+    if name == "ndash" is return "–" end
+    if name == "hellip" is return "…" end
+    if name == "laquo" is return "«" end
+    if name == "raquo" is return "»" end
+    if name == "bull" is return "•" end
+    if name == "middot" is return "·" end
+    if name == "euro" is return "€" end
+    if name == "pound" is return "£" end
+    if name == "yen" is return "¥" end
+    if name == "deg" is return "°" end
+    if name == "times" is return "×" end
+    if name == "divide" is return "÷" end
+    if name == "larr" is return "←" end
+    if name == "rarr" is return "→" end
+    if name == "uarr" is return "↑" end
+    if name == "darr" is return "↓" end
+    if name == "check" is return "✓" end
+    if name == "hearts" is return "♥" end
+    if name == "lsquo" is return "‘" end
+    if name == "rsquo" is return "’" end
+    if name == "ldquo" is return "“" end
+    if name == "rdquo" is return "”" end
+    if name == "sect" is return "§" end
+    if name == "para" is return "¶" end
+    if name == "plusmn" is return "±" end
+    if name == "frac12" is return "½" end
+    return ""
+end
+
+fn hex_val(s: string) -> int is
+    let digits: string = "0123456789abcdef"
+    let lower: string = string_lower(s)
+    let mut r: int = 0
+    let mut i: int = 0
+    while i < string_len(lower) is
+        let idx: int = string_find(digits, string_slice(lower, i, i + 1))
+        if idx < 0 is return -1 end
+        r = r * 16 + idx
+        i += 1
+    end
+    return r
+end
+
+fn codepoint_to_str(cp: int) -> string is
+    if cp <= 0 || cp > 1114111 is return "" end
+    if cp < 128 is return char_code_to_str(cp) end
+    return char_code_to_str(cp)
+end
+
+;; Dekoduje encje HTML w tekście/atrybucie.
+pub fn decode_entities(s: string) -> string is
+    if string_find(s, "&") < 0 is return s end
+    let n: int = string_len(s)
+    let mut out: string = ""
+    let mut p: int = 0
+    while p < n is
+        let amp: int = find_from(s, "&", p)
+        if amp < 0 is
+            out = out + string_slice(s, p, n)
+            p = n
+            continue
+        end
+        out = out + string_slice(s, p, amp)
+        let semi: int = find_from(s, ";", amp + 1)
+        if semi < 0 || semi - amp > 12 is
+            out = out + "&"
+            p = amp + 1
+            continue
+        end
+        let name: string = string_slice(s, amp + 1, semi)
+        let mut rep: string = ""
+        if string_starts_with(name, "#x") || string_starts_with(name, "#X") is
+            let cp: int = hex_val(string_slice(name, 2, string_len(name)))
+            rep = if cp > 0 then codepoint_to_str(cp) else ""
+        elsif string_starts_with(name, "#") is
+            let cp: int = str_to_int(string_slice(name, 1, string_len(name)))
+            rep = if cp > 0 then codepoint_to_str(cp) else ""
+        else is
+            rep = named_entity(name)
+        end
+        if rep == "" is
+            out = out + "&"
+            p = amp + 1
+        else is
+            out = out + rep
+            p = semi + 1
+        end
+    end
+    return out
+end
+
+;; Zwija białe znaki do pojedynczych spacji (bez przycinania).
+pub fn collapse_ws(s: string) -> string is
+    let norm: string = string_replace(string_replace(string_replace(s, "\n", " "), "\t", " "), "\r", " ")
+    let parts: [string] = string_split(norm, " ")
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is
+            out = if out == "" then parts[i] else out + " " + parts[i]
+        end
+        i += 1
+    end
+    ;; zachowaj pojedynczą spację na brzegach (ma znaczenie dla `glue`)
+    let lead: string = if string_len(norm) > 0 && string_starts_with(norm, " ") then " " else ""
+    let trail: string = if string_len(norm) > 0 && string_ends_with(norm, " ") && out != "" then " " else ""
+    return lead + out + trail
+end
+
+;; ---------- węzły ----------
+pub fn blank_node(id: int, parent: int, tag: string) -> DomNode is
+    return DomNode {
+        id: id, parent: parent, tag: tag, text: "",
         attr_id: "", attr_class: "", on_click: "", attr_src: "", attr_value: "",
-        children: []
+        attr_style: "", attr_placeholder: "", attr_type: "", attr_name: "", attr_href: "", attr_title: "",
+        on_input: "", on_change: "", on_submit: "", on_keydown: "", on_hover: "",
+        attrs: "", disabled: false, checked: false, readonly: false, removed: false,
+        glue: false, pseudo: "", children: []
     }
-    let mut d: Dom = Dom { nodes: array_push(dom.nodes, node) }
+end
+
+;; Dodaje węzeł na koniec tablicy i podłącza go jako ostatnie dziecko `parent`.
+pub fn new_node(dom: Dom, parent: int, tag: string) -> Dom is
+    let node: DomNode = blank_node(array_len(dom.nodes), parent, tag)
+    let mut d: Dom = Dom {
+        nodes: array_push(dom.nodes, node), inline_css: dom.inline_css, inline_js: dom.inline_js,
+        stylesheets: dom.stylesheets, scripts: dom.scripts, title: dom.title
+    }
     if parent >= 0 is
         d.nodes[parent].children = array_push(d.nodes[parent].children, node.id)
     end
     return d
 end
 
-;; Parsuje jeden atrybut `name="value"` od pos (po whitespace).
-;; Zwraca "name\u0001value\u0001nowa_pozycja" — proste "krotki jako
-;; string" zamiast wielokrotnych return values, których H# nie ma.
-fn parse_attr(html: string, pos: int) -> string is
-    let n: int = string_len(html)
-    let mut p: int = skip_spaces(html, pos)
-    let start: int = p
-    while p < n && string_at(html, p) != "=" && !is_space(string_at(html, p)) &&
-          string_at(html, p) != ">" && string_at(html, p) != "/" is
-        p += 1
-    end
-    let name: string = string_slice(html, start, p)
-    if name == "" is return "\u0001\u0001" + to_string(p) end
-
-    p = skip_spaces(html, p)
-    if p >= n || string_at(html, p) != "=" is
-        return name + "\u0001\u0001" + to_string(p)
-    end
-    p += 1
-    p = skip_spaces(html, p)
-    if p >= n || string_at(html, p) != "\"" is
-        return name + "\u0001\u0001" + to_string(p)
-    end
-    p += 1
-    let vstart: int = p
-    while p < n && string_at(html, p) != "\"" is
-        p += 1
-    end
-    let val: string = string_slice(html, vstart, p)
-    if p < n is p += 1 end   ;; zjedz zamykający "
-    return name + "\u0001" + val + "\u0001" + to_string(p)
+fn attrs_get(attrs: string, name: string) -> string is
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(attrs, key)
+    if idx < 0 is return "" end
+    let start: int = idx + string_len(key)
+    let end_idx: int = find_from(attrs, "\u0002", start)
+    return string_slice(attrs, start, if end_idx < 0 then string_len(attrs) else end_idx)
 end
 
-fn apply_attr(dom: Dom, node_id: int, name: string, val: string) -> Dom is
-    let mut d: Dom = dom
-    if name == "id" is
-        d.nodes[node_id].attr_id = val
-    elsif name == "class" is
-        d.nodes[node_id].attr_class = val
-    elsif name == "on-click" is
-        d.nodes[node_id].on_click = val
-    elsif name == "src" is
-        d.nodes[node_id].attr_src = val
-    elsif name == "value" is
-        d.nodes[node_id].attr_value = val
+fn attrs_has(attrs: string, name: string) -> bool is
+    return string_find(attrs, "\u0002" + name + "\u0001") >= 0
+end
+
+fn attrs_set(attrs: string, name: string, val: string) -> string is
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(attrs, key)
+    if idx < 0 is return attrs + key + val end
+    let start: int = idx + string_len(key)
+    let end_idx: int = find_from(attrs, "\u0002", start)
+    let tail: string = if end_idx < 0 then "" else string_slice(attrs, end_idx, string_len(attrs))
+    return string_slice(attrs, 0, idx) + key + val + tail
+end
+
+fn attrs_remove(attrs: string, name: string) -> string is
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(attrs, key)
+    if idx < 0 is return attrs end
+    let start: int = idx + string_len(key)
+    let end_idx: int = find_from(attrs, "\u0002", start)
+    let tail: string = if end_idx < 0 then "" else string_slice(attrs, end_idx, string_len(attrs))
+    return string_slice(attrs, 0, idx) + tail
+end
+
+;; Nazwy atrybutów w kolejności wstawienia.
+pub fn extra_attr_names(node: DomNode) -> [string] is
+    let parts: [string] = string_split(node.attrs, "\u0002")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is
+            let sep: int = string_find(parts[i], "\u0001")
+            if sep > 0 && string_slice(parts[i], 0, 1) != "~" is out = array_push(out, string_slice(parts[i], 0, sep)) end
+        end
+        i += 1
     end
+    return out
+end
+
+;; Odczyt dowolnego atrybutu (także data-*, aria-*, pól dedykowanych).
+pub fn get_attr(node: DomNode, name: string) -> string is
+    if name == "id" is return node.attr_id end
+    if name == "class" is return node.attr_class end
+    if name == "on-click" is return node.on_click end
+    if name == "src" is return node.attr_src end
+    if name == "value" is return node.attr_value end
+    if name == "style" is return node.attr_style end
+    if name == "placeholder" is return node.attr_placeholder end
+    if name == "type" is return node.attr_type end
+    if name == "name" is return node.attr_name end
+    if name == "href" is return node.attr_href end
+    if name == "title" is return node.attr_title end
+    if name == "on-input" is return node.on_input end
+    if name == "on-change" is return node.on_change end
+    if name == "on-submit" is return node.on_submit end
+    if name == "on-keydown" is return node.on_keydown end
+    if name == "on-hover" is return node.on_hover end
+    return attrs_get(node.attrs, name)
+end
+
+pub fn has_attr(node: DomNode, name: string) -> bool is
+    if name == "id" is return node.attr_id != "" end
+    if name == "class" is return node.attr_class != "" end
+    if name == "disabled" is return node.disabled end
+    if name == "checked" is return node.checked end
+    if name == "readonly" is return node.readonly end
+    if name == "value" is return node.attr_value != "" end
+    if name == "href" is return node.attr_href != "" end
+    if name == "src" is return node.attr_src != "" end
+    if name == "type" is return node.attr_type != "" end
+    if name == "style" is return node.attr_style != "" end
+    if name == "name" is return node.attr_name != "" end
+    if name == "placeholder" is return node.attr_placeholder != "" end
+    if name == "title" is return node.attr_title != "" end
+    return attrs_has(node.attrs, name)
+end
+
+fn set_attr_node(n: DomNode, name: string, val: string) -> DomNode is
+    let mut x: DomNode = n
+    if name == "id" is x.attr_id = val
+    elsif name == "class" is x.attr_class = val
+    elsif name == "on-click" is x.on_click = val
+    elsif name == "src" is x.attr_src = val
+    elsif name == "value" is x.attr_value = val
+    elsif name == "style" is x.attr_style = val
+    elsif name == "placeholder" is x.attr_placeholder = val
+    elsif name == "type" is x.attr_type = val
+    elsif name == "name" is x.attr_name = val
+    elsif name == "href" is x.attr_href = val
+    elsif name == "title" is x.attr_title = val
+    elsif name == "on-input" is x.on_input = val
+    elsif name == "on-change" is x.on_change = val
+    elsif name == "on-submit" is x.on_submit = val
+    elsif name == "on-keydown" is x.on_keydown = val
+    elsif name == "on-hover" is x.on_hover = val
+    elsif name == "disabled" is x.disabled = true
+    elsif name == "checked" is x.checked = true
+    elsif name == "readonly" is x.readonly = true
+    else is x.attrs = attrs_set(x.attrs, name, val) end
+    return x
+end
+
+fn remove_attr_node(n: DomNode, name: string) -> DomNode is
+    let mut x: DomNode = n
+    if name == "id" is x.attr_id = ""
+    elsif name == "class" is x.attr_class = ""
+    elsif name == "on-click" is x.on_click = ""
+    elsif name == "src" is x.attr_src = ""
+    elsif name == "value" is x.attr_value = ""
+    elsif name == "style" is x.attr_style = ""
+    elsif name == "placeholder" is x.attr_placeholder = ""
+    elsif name == "type" is x.attr_type = ""
+    elsif name == "name" is x.attr_name = ""
+    elsif name == "href" is x.attr_href = ""
+    elsif name == "title" is x.attr_title = ""
+    elsif name == "on-input" is x.on_input = ""
+    elsif name == "on-change" is x.on_change = ""
+    elsif name == "on-submit" is x.on_submit = ""
+    elsif name == "on-keydown" is x.on_keydown = ""
+    elsif name == "on-hover" is x.on_hover = ""
+    elsif name == "disabled" is x.disabled = false
+    elsif name == "checked" is x.checked = false
+    elsif name == "readonly" is x.readonly = false
+    else is x.attrs = attrs_remove(x.attrs, name) end
+    return x
+end
+
+pub fn set_attr(dom: Dom, node_id: int, name: string, val: string) -> Dom is
+    if node_id < 0 || node_id >= array_len(dom.nodes) is return dom end
+    let mut d: Dom = dom
+    d.nodes[node_id] = set_attr_node(d.nodes[node_id], string_lower(name), val)
     return d
 end
 
-;; Parsuje dzieci zaczynając od pos, aż napotka `</` (koniec rodzica)
-;; albo koniec stringa.
-pub fn parse_children(html: string, pos: int, parent: int, dom: Dom) -> Dom is
+pub fn remove_attr(dom: Dom, node_id: int, name: string) -> Dom is
+    if node_id < 0 || node_id >= array_len(dom.nodes) is return dom end
+    let mut d: Dom = dom
+    d.nodes[node_id] = remove_attr_node(d.nodes[node_id], string_lower(name))
+    return d
+end
+
+;; ---------- parser ----------
+fn is_void_tag(tag: string) -> bool is
+    return tag == "br" || tag == "hr" || tag == "img" || tag == "input" || tag == "meta" ||
+           tag == "link" || tag == "area" || tag == "base" || tag == "col" || tag == "embed" ||
+           tag == "source" || tag == "track" || tag == "wbr" || tag == "param"
+end
+
+fn is_raw_tag(tag: string) -> bool is
+    return tag == "script" || tag == "style" || tag == "textarea" || tag == "title"
+end
+
+fn is_block_start(tag: string) -> bool is
+    return tag == "div" || tag == "p" || tag == "ul" || tag == "ol" || tag == "h1" || tag == "h2" ||
+           tag == "h3" || tag == "h4" || tag == "h5" || tag == "h6" || tag == "table" || tag == "form" ||
+           tag == "pre" || tag == "blockquote" || tag == "section" || tag == "article" ||
+           tag == "header" || tag == "footer" || tag == "nav" || tag == "main" || tag == "aside" ||
+           tag == "hr" || tag == "fieldset" || tag == "dl"
+end
+
+fn stack_index_of(stack: [int], dom: Dom, tag: string) -> int is
+    let mut i: int = array_len(stack) - 1
+    while i >= 1 is
+        if dom.nodes[stack[i]].tag == tag is return i end
+        i -= 1
+    end
+    return -1
+end
+
+fn truncate_stack(stack: [int], keep: int) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < keep && i < array_len(stack) is
+        out = array_push(out, stack[i])
+        i += 1
+    end
+    return out
+end
+
+;; Niejawne domykanie (<li> domyka poprzednie <li>, <p> znika przed blokiem…)
+fn implied_close(stack: [int], dom: Dom, tag: string) -> [int] is
+    let top_tag: string = dom.nodes[stack[array_len(stack) - 1]].tag
+    if tag == "li" is
+        let idx: int = stack_index_of(stack, dom, "li")
+        let ul: int = stack_index_of(stack, dom, "ul")
+        let ol: int = stack_index_of(stack, dom, "ol")
+        let bound: int = if ul > ol then ul else ol
+        if idx > bound && idx > 0 is return truncate_stack(stack, idx) end
+    end
+    if tag == "option" && top_tag == "option" is return truncate_stack(stack, array_len(stack) - 1) end
+    if (tag == "td" || tag == "th") && (top_tag == "td" || top_tag == "th") is
+        return truncate_stack(stack, array_len(stack) - 1)
+    end
+    if tag == "tr" is
+        let idx: int = stack_index_of(stack, dom, "tr")
+        if idx > 0 is return truncate_stack(stack, idx) end
+    end
+    if (tag == "dt" || tag == "dd") && (top_tag == "dt" || top_tag == "dd") is
+        return truncate_stack(stack, array_len(stack) - 1)
+    end
+    if is_block_start(tag) && top_tag == "p" is
+        return truncate_stack(stack, array_len(stack) - 1)
+    end
+    return stack
+end
+
+;; Wynik czytania atrybutu: "nazwa\u0001wartość\u0001nowa_pozycja\u0001flaga"
+;; (flaga "1" = atrybut miał wartość). Krotka jako string — H# nie ma
+;; wielokrotnych zwrotów.
+fn parse_attr(html: string, pos: int) -> string is
     let n: int = string_len(html)
     let mut p: int = pos
-    let mut d: Dom = dom
+    let start: int = p
+    while p < n is
+        let c: string = string_at(html, p)
+        if c == "=" || is_space(c) || c == ">" || c == "/" is break end
+        p += 1
+    end
+    let name: string = string_lower(string_slice(html, start, p))
+    if name == "" is return "\u0001\u0001" + to_string(p + 1) + "\u00010" end
+    while p < n && is_space(string_at(html, p)) is p += 1 end
+    if p >= n || string_at(html, p) != "=" is
+        return name + "\u0001\u0001" + to_string(p) + "\u00010"
+    end
+    p += 1
+    while p < n && is_space(string_at(html, p)) is p += 1 end
+    if p >= n is return name + "\u0001\u0001" + to_string(p) + "\u00011" end
+    let q: string = string_at(html, p)
+    if q == "\"" || q == "'" is
+        p += 1
+        let vstart: int = p
+        let close: int = find_from(html, q, p)
+        if close < 0 is
+            return name + "\u0001" + decode_entities(string_slice(html, vstart, n)) + "\u0001" + to_string(n) + "\u00011"
+        end
+        return name + "\u0001" + decode_entities(string_slice(html, vstart, close)) + "\u0001" + to_string(close + 1) + "\u00011"
+    end
+    let vstart: int = p
+    while p < n is
+        let c: string = string_at(html, p)
+        if is_space(c) || c == ">" is break end
+        p += 1
+    end
+    return name + "\u0001" + decode_entities(string_slice(html, vstart, p)) + "\u0001" + to_string(p) + "\u00011"
+end
+
+pub fn parse(html: string) -> Dom is
+    let mut dom: Dom = empty()
+    dom = new_node(dom, -1, "root")
+    let n: int = string_len(html)
+    let mut stack: [int] = [0]
+    let mut p: int = 0
+    let mut gap_ws: bool = true
+    let mut in_pre: bool = false
 
     while p < n is
-        p = skip_spaces(html, p)
-        if p >= n is return d end
-
-        if string_at(html, p) == "<" is
-            if p + 1 < n && string_at(html, p + 1) == "/" is
-                return d   ;; </tag> — kończymy dzieci tego rodzica
+        let top: int = stack[array_len(stack) - 1]
+        let c: string = string_at(html, p)
+        if c == "<" is
+            let next: string = if p + 1 < n then string_at(html, p + 1) else ""
+            if string_slice(html, p, p + 4) == "<!--" is
+                let e: int = find_from(html, "-->", p + 4)
+                p = if e < 0 then n else e + 3
+                continue
             end
+            if next == "!" || next == "?" is
+                let e: int = find_from(html, ">", p)
+                p = if e < 0 then n else e + 1
+                continue
+            end
+            if next == "/" is
+                let e: int = find_from(html, ">", p)
+                let name_end: int = if e < 0 then n else e
+                let tag: string = string_lower(string_trim(string_slice(html, p + 2, name_end)))
+                let idx: int = stack_index_of(stack, dom, tag)
+                if idx > 0 is
+                    stack = truncate_stack(stack, idx)
+                    if tag == "pre" is in_pre = false end
+                end
+                gap_ws = false
+                p = if e < 0 then n else e + 1
+                continue
+            end
+            let is_letter: bool = (next >= "a" && next <= "z") || (next >= "A" && next <= "Z")
+            if !is_letter is
+                ;; samotny '<' w tekście
+                dom = new_node(dom, top, "text")
+                dom.nodes[array_len(dom.nodes) - 1].text = "<"
+                p += 1
+                continue
+            end
+
             let mut q: int = p + 1
-            let tag_start: int = q
-            while q < n && !is_space(string_at(html, q)) &&
-                  string_at(html, q) != ">" && string_at(html, q) != "/" is
-                q += 1
-            end
-            let tag: string = string_slice(html, tag_start, q)
-
-            d = new_node(d, parent, tag)
-            let node_id: int = array_len(d.nodes) - 1
+            while q < n && is_name_char(string_at(html, q)) is q += 1 end
+            let tag: string = string_lower(string_slice(html, p + 1, q))
+            stack = implied_close(stack, dom, tag)
+            let parent: int = stack[array_len(stack) - 1]
+            let had_prev: bool = array_len(dom.nodes[parent].children) > 0
+            dom = new_node(dom, parent, tag)
+            let node_id: int = array_len(dom.nodes) - 1
+            dom.nodes[node_id].glue = had_prev && !gap_ws
 
             let mut ap: int = q
             let mut self_close: bool = false
             while ap < n is
-                ap = skip_spaces(html, ap)
-                if ap >= n is return d end
-                let c: string = string_at(html, ap)
-                if c == "/" is
+                while ap < n && is_space(string_at(html, ap)) is ap += 1 end
+                if ap >= n is break end
+                let ch: string = string_at(html, ap)
+                if ch == "/" is
                     self_close = true
                     ap += 1
-                elsif c == ">" is
+                elsif ch == ">" is
                     ap += 1
                     break
                 else is
-                    let res: string = parse_attr(html, ap)
-                    let parts: [string] = string_split(res, "\u0001")
-                    let aname: string = parts[0]
-                    let aval: string  = parts[1]
-                    let newp: int = str_to_int(parts[2])
+                    let res: [string] = string_split(parse_attr(html, ap), "\u0001")
+                    let aname: string = res[0]
                     if aname != "" is
-                        d = apply_attr(d, node_id, aname, aval)
+                        let has_val: bool = array_len(res) > 3 && res[3] == "1"
+                        let aval: string = if array_len(res) > 1 then res[1] else ""
+                        let node: DomNode = dom.nodes[node_id]
+                        if aname == "disabled" || aname == "checked" || aname == "readonly" is
+                            if !has_val || aval != "false" is dom.nodes[node_id] = set_attr_node(node, aname, "") end
+                        else is
+                            dom.nodes[node_id] = set_attr_node(node, aname, aval)
+                        end
                     end
-                    ap = newp
+                    ap = str_to_int(res[2])
+                end
+            end
+            p = ap
+
+            if is_raw_tag(tag) && !self_close is
+                let close_marker: string = "</" + tag
+                let lower_rest: string = string_lower(string_slice(html, p, n))
+                let rel: int = string_find(lower_rest, close_marker)
+                let raw_end: int = if rel < 0 then n else p + rel
+                let raw: string = string_slice(html, p, raw_end)
+                if tag == "style" is
+                    dom.inline_css = dom.inline_css + raw + "\n"
+                elsif tag == "script" is
+                    let src: string = dom.nodes[node_id].attr_src
+                    if src != "" is
+                        dom.scripts = array_push(dom.scripts, src)
+                    else is
+                        dom.inline_js = dom.inline_js + raw + "\n"
+                    end
+                elsif tag == "title" is
+                    dom.title = string_trim(decode_entities(raw))
+                else is
+                    ;; textarea: surowy tekst = wartość początkowa
+                    dom.nodes[node_id].attr_value = decode_entities(raw)
+                end
+                let gt: int = find_from(html, ">", raw_end)
+                p = if gt < 0 then n else gt + 1
+                gap_ws = false
+                continue
+            end
+
+            if tag == "link" is
+                let rel_attr: string = string_lower(get_attr(dom.nodes[node_id], "rel"))
+                if rel_attr == "stylesheet" && dom.nodes[node_id].attr_href != "" is
+                    dom.stylesheets = array_push(dom.stylesheets, dom.nodes[node_id].attr_href)
                 end
             end
 
-            if self_close is
-                p = ap
-            else is
-                d = parse_children(html, ap, node_id, d)
-                let close_idx: int = find_from(html, "</" + tag, ap)
-                if close_idx < 0 is
-                    p = n
-                else is
-                    let gt: int = find_from(html, ">", close_idx)
-                    p = if gt < 0 then n else gt + 1
-                end
+            if !self_close && !is_void_tag(tag) is
+                stack = array_push(stack, node_id)
+                if tag == "pre" is in_pre = true end
             end
+            gap_ws = false
         else is
-            let text_start: int = p
-            let mut tp: int = p
-            while tp < n && string_at(html, tp) != "<" is
-                tp += 1
+            let lt: int = find_from(html, "<", p)
+            let text_end: int = if lt < 0 then n else lt
+            let raw: string = string_slice(html, p, text_end)
+            p = text_end
+            let starts_ws: bool = is_space(string_slice(raw, 0, 1))
+            let ends_ws: bool = string_len(raw) > 0 && is_space(string_slice(raw, string_len(raw) - 1, string_len(raw)))
+            let decoded: string = decode_entities(raw)
+            let txt: string = if in_pre then decoded else string_trim(collapse_ws(decoded))
+            if starts_ws is gap_ws = true end
+            if txt != "" is
+                let parent: int = stack[array_len(stack) - 1]
+                let had_prev: bool = array_len(dom.nodes[parent].children) > 0
+                dom = new_node(dom, parent, "text")
+                let tid: int = array_len(dom.nodes) - 1
+                dom.nodes[tid].text = txt
+                dom.nodes[tid].glue = had_prev && !gap_ws
+                gap_ws = ends_ws
+            elsif raw != "" is
+                gap_ws = true
             end
-            let trimmed: string = string_trim(string_slice(html, text_start, tp))
-            if trimmed != "" is
-                d = new_node(d, parent, "text")
-                d.nodes[array_len(d.nodes) - 1].text = trimmed
-            end
-            p = tp
         end
+    end
+    return dom
+end
+
+;; ---------- zapytania ----------
+pub fn is_element(n: DomNode) -> bool is
+    return n.tag != "text" && n.tag != "root"
+end
+
+pub fn find_by_id(dom: Dom, attr_id: string) -> int is
+    if attr_id == "" is return -1 end
+    let count: int = array_len(dom.nodes)
+    let mut i: int = 0
+    while i < count is
+        let n: DomNode = dom.nodes[i]
+        if !n.removed && n.attr_id == attr_id is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn has_class(node: DomNode, cls: string) -> bool is
+    if node.attr_class == "" is return false end
+    let parts: [string] = string_split(node.attr_class, " ")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] == cls is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn text_content(dom: Dom, node_id: int) -> string is
+    let n: DomNode = dom.nodes[node_id]
+    if n.tag == "text" is return n.text end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let child: int = n.children[i]
+        i += 1
+        if dom.nodes[child].removed is continue end
+        let t: string = text_content(dom, child)
+        if t == "" is continue end
+        if out != "" && !dom.nodes[child].glue is out = out + " " end
+        out = out + t
+    end
+    return out
+end
+
+;; ---------- mutacje ----------
+pub fn add_class(dom: Dom, node_id: int, cls: string) -> Dom is
+    if node_id < 0 || node_id >= array_len(dom.nodes) || cls == "" is return dom end
+    if has_class(dom.nodes[node_id], cls) is return dom end
+    let mut d: Dom = dom
+    let cur: string = d.nodes[node_id].attr_class
+    d.nodes[node_id].attr_class = if cur == "" then cls else cur + " " + cls
+    return d
+end
+
+pub fn remove_class(dom: Dom, node_id: int, cls: string) -> Dom is
+    if node_id < 0 || node_id >= array_len(dom.nodes) is return dom end
+    let parts: [string] = string_split(dom.nodes[node_id].attr_class, " ")
+    let mut keep: string = ""
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" && parts[i] != cls is
+            if keep == "" is
+                keep = parts[i]
+            else is
+                keep = keep + " " + parts[i]
+            end
+        end
+        i += 1
+    end
+    let mut d: Dom = dom
+    d.nodes[node_id].attr_class = keep
+    return d
+end
+
+pub fn toggle_class(dom: Dom, node_id: int, cls: string) -> Dom is
+    if node_id < 0 || node_id >= array_len(dom.nodes) is return dom end
+    if has_class(dom.nodes[node_id], cls) is return remove_class(dom, node_id, cls) end
+    return add_class(dom, node_id, cls)
+end
+
+;; Odłącza węzeł i cały jego poddrzewo (id pozostają zajęte).
+pub fn remove_node(dom: Dom, node_id: int) -> Dom is
+    if node_id <= 0 || node_id >= array_len(dom.nodes) is return dom end
+    let mut d: Dom = dom
+    let parent: int = d.nodes[node_id].parent
+    if parent >= 0 is
+        let mut keep: [int] = []
+        let mut i: int = 0
+        while i < array_len(d.nodes[parent].children) is
+            if d.nodes[parent].children[i] != node_id is keep = array_push(keep, d.nodes[parent].children[i]) end
+            i += 1
+        end
+        d.nodes[parent].children = keep
+    end
+    d.nodes[node_id].parent = -1
+    d = mark_removed(d, node_id)
+    return d
+end
+
+fn mark_removed(dom: Dom, node_id: int) -> Dom is
+    let mut d: Dom = dom
+    d.nodes[node_id].removed = true
+    let kids: [int] = d.nodes[node_id].children
+    let mut i: int = 0
+    while i < array_len(kids) is
+        d = mark_removed(d, kids[i])
+        i += 1
     end
     return d
 end
 
-pub fn parse(html: string) -> Dom is
-    let mut dom: Dom = Dom { nodes: [] }
-    dom = new_node(dom, -1, "root")
-    dom = parse_children(html, 0, 0, dom)
-    return dom
+;; Podpina `child` pod `parent` przed `before` (-1 = na koniec).
+pub fn append_child(dom: Dom, parent: int, child: int, before: int) -> Dom is
+    if parent < 0 || parent >= array_len(dom.nodes) || child <= 0 || child >= array_len(dom.nodes) is return dom end
+    if child == parent is return dom end
+    let mut d: Dom = remove_detached(dom, child)
+    let mut kids: [int] = []
+    let mut placed: bool = false
+    let mut i: int = 0
+    while i < array_len(d.nodes[parent].children) is
+        let k: int = d.nodes[parent].children[i]
+        if k == before && !placed is
+            kids = array_push(kids, child)
+            placed = true
+        end
+        kids = array_push(kids, k)
+        i += 1
+    end
+    if !placed is kids = array_push(kids, child) end
+    d.nodes[parent].children = kids
+    d.nodes[child].parent = parent
+    d = unmark_removed(d, child)
+    return d
+end
+
+;; Odpina `child` od obecnego rodzica bez oznaczania go jako usuniętego.
+fn remove_detached(dom: Dom, child: int) -> Dom is
+    let mut d: Dom = dom
+    let old: int = d.nodes[child].parent
+    if old >= 0 is
+        let mut keep: [int] = []
+        let mut i: int = 0
+        while i < array_len(d.nodes[old].children) is
+            if d.nodes[old].children[i] != child is keep = array_push(keep, d.nodes[old].children[i]) end
+            i += 1
+        end
+        d.nodes[old].children = keep
+    end
+    return d
+end
+
+fn unmark_removed(dom: Dom, node_id: int) -> Dom is
+    let mut d: Dom = dom
+    d.nodes[node_id].removed = false
+    let kids: [int] = d.nodes[node_id].children
+    let mut i: int = 0
+    while i < array_len(kids) is
+        d = unmark_removed(d, kids[i])
+        i += 1
+    end
+    return d
+end
+
+;; Tworzy odłączony element (parent = -1); jego id = array_len(nodes) sprzed wywołania.
+pub fn create_element(dom: Dom, tag: string) -> Dom is
+    let node: DomNode = blank_node(array_len(dom.nodes), -1, string_lower(tag))
+    let mut d: Dom = dom
+    d.nodes = array_push(d.nodes, node)
+    d.nodes[node.id].removed = true
+    return d
+end
+
+pub fn create_text(dom: Dom, text: string) -> Dom is
+    let mut d: Dom = create_element(dom, "text")
+    d.nodes[array_len(d.nodes) - 1].text = text
+    return d
+end
+
+;; Zastępuje dzieci jednym węzłem tekstowym (textContent = …).
+pub fn set_text(dom: Dom, node_id: int, text: string) -> Dom is
+    if node_id < 0 || node_id >= array_len(dom.nodes) is return dom end
+    let mut d: Dom = dom
+    if d.nodes[node_id].tag == "text" is
+        d.nodes[node_id].text = text
+        return d
+    end
+    let kids: [int] = d.nodes[node_id].children
+    let mut i: int = 0
+    while i < array_len(kids) is
+        d = remove_node(d, kids[i])
+        i += 1
+    end
+    if text != "" is
+        d = new_node(d, node_id, "text")
+        d.nodes[array_len(d.nodes) - 1].text = text
+    end
+    return d
+end
+
+;; Wstawia sparsowany fragment HTML jako dzieci `parent` (przed `before`).
+pub fn insert_html(dom: Dom, parent: int, html: string, before: int) -> Dom is
+    let frag: Dom = parse(html)
+    let base: int = array_len(dom.nodes)
+    let mut d: Dom = dom
+    ;; przenieś węzły fragmentu (z przesunięciem id), pomijając jego root
+    let mut i: int = 1
+    while i < array_len(frag.nodes) is
+        let mut nn: DomNode = frag.nodes[i]
+        nn.id = base + i - 1
+        nn.parent = if nn.parent == 0 then parent else base + nn.parent - 1
+        let mut kids: [int] = []
+        let mut k: int = 0
+        while k < array_len(nn.children) is
+            kids = array_push(kids, base + nn.children[k] - 1)
+            k += 1
+        end
+        nn.children = kids
+        d.nodes = array_push(d.nodes, nn)
+        i += 1
+    end
+    ;; podłącz top-levelowe węzły fragmentu
+    let top: [int] = frag.nodes[0].children
+    let mut t: int = 0
+    while t < array_len(top) is
+        let nid: int = base + top[t] - 1
+        d.nodes[nid].parent = -1
+        d = append_child(d, parent, nid, before)
+        t += 1
+    end
+    d.inline_css = d.inline_css + frag.inline_css
+    return d
+end
+
+pub fn set_inner_html(dom: Dom, node_id: int, html: string) -> Dom is
+    if node_id < 0 || node_id >= array_len(dom.nodes) is return dom end
+    let mut d: Dom = dom
+    let kids: [int] = d.nodes[node_id].children
+    let mut i: int = 0
+    while i < array_len(kids) is
+        d = remove_node(d, kids[i])
+        i += 1
+    end
+    return insert_html(d, node_id, html, -1)
+end
+
+;; Serializacja dzieci z powrotem do HTML (innerHTML).
+pub fn inner_html(dom: Dom, node_id: int) -> string is
+    let n: DomNode = dom.nodes[node_id]
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        out = out + outer_html(dom, n.children[i])
+        i += 1
+    end
+    return out
+end
+
+fn escape_html(s: string) -> string is
+    return string_replace(string_replace(string_replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")
+end
+
+pub fn outer_html(dom: Dom, node_id: int) -> string is
+    let n: DomNode = dom.nodes[node_id]
+    if n.removed is return "" end
+    if n.tag == "text" is return escape_html(n.text) end
+    let mut out: string = "<" + n.tag
+    if n.attr_id != "" is out = out + " id=\"" + n.attr_id + "\"" end
+    if n.attr_class != "" is out = out + " class=\"" + n.attr_class + "\"" end
+    if n.attr_type != "" is out = out + " type=\"" + n.attr_type + "\"" end
+    if n.attr_value != "" && n.tag != "textarea" is out = out + " value=\"" + n.attr_value + "\"" end
+    if n.attr_src != "" is out = out + " src=\"" + n.attr_src + "\"" end
+    if n.attr_href != "" is out = out + " href=\"" + n.attr_href + "\"" end
+    if n.attr_style != "" is out = out + " style=\"" + n.attr_style + "\"" end
+    if n.attr_name != "" is out = out + " name=\"" + n.attr_name + "\"" end
+    if n.attr_placeholder != "" is out = out + " placeholder=\"" + n.attr_placeholder + "\"" end
+    if n.attr_title != "" is out = out + " title=\"" + n.attr_title + "\"" end
+    if n.on_click != "" is out = out + " on-click=\"" + n.on_click + "\"" end
+    if n.on_input != "" is out = out + " on-input=\"" + n.on_input + "\"" end
+    if n.on_change != "" is out = out + " on-change=\"" + n.on_change + "\"" end
+    if n.on_submit != "" is out = out + " on-submit=\"" + n.on_submit + "\"" end
+    if n.on_keydown != "" is out = out + " on-keydown=\"" + n.on_keydown + "\"" end
+    if n.on_hover != "" is out = out + " on-hover=\"" + n.on_hover + "\"" end
+    if n.disabled is out = out + " disabled" end
+    if n.checked is out = out + " checked" end
+    if n.readonly is out = out + " readonly" end
+    let names: [string] = extra_attr_names(n)
+    let mut a: int = 0
+    while a < array_len(names) is
+        out = out + " " + names[a] + "=\"" + attrs_get(n.attrs, names[a]) + "\""
+        a += 1
+    end
+    if is_void_tag(n.tag) is return out + ">" end
+    out = out + ">" + inner_html(dom, node_id) + "</" + n.tag + ">"
+    return out
+end
+
+;; Wszystkie żywe węzły elementów w kolejności dokumentu (DFS).
+pub fn document_order(dom: Dom) -> [int] is
+    let mut out: [int] = []
+    if array_len(dom.nodes) == 0 is return out end
+    let mut stack: [int] = [0]
+    while array_len(stack) > 0 is
+        let top: int = stack[array_len(stack) - 1]
+        stack = truncate_stack(stack, array_len(stack) - 1)
+        out = array_push(out, top)
+        let kids: [int] = dom.nodes[top].children
+        let mut i: int = array_len(kids) - 1
+        while i >= 0 is
+            stack = array_push(stack, kids[i])
+            i -= 1
+        end
+    end
+    return out
+end
+
+;; Wartość data-* jako JSON obiektu {"klucz":"wartość"} (dla argumentów komend).
+pub fn dataset_json(node: DomNode) -> string is
+    let names: [string] = extra_attr_names(node)
+    let mut out: string = "{"
+    let mut first: bool = true
+    let mut i: int = 0
+    while i < array_len(names) is
+        if string_starts_with(names[i], "data-") is
+            let key: string = string_slice(names[i], 5, string_len(names[i]))
+            let val: string = string_replace(string_replace(attrs_get(node.attrs, names[i]), "\\", "\\\\"), "\"", "\\\"")
+            out = out + (if first then "" else ",") + "\"" + key + "\":\"" + val + "\""
+            first = false
+        end
+        i += 1
+    end
+    return out + "}"
 end
