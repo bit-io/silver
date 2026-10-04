@@ -1,5 +1,19 @@
+mod dom
+mod css
+mod cssval
+mod layout
+mod paint
+mod style
+mod template
+mod jsonval
+mod jsonlite
 mod engine
+mod edit
+mod ipc
+mod ui
+mod window
 use "std -> test" from "test"
+
 
 ;; ---------- dom::parse ----------
 
@@ -192,8 +206,8 @@ fn test_margin_auto_shorthand_both_sides() is
     let sheet: css::Stylesheet = css::parse("div { margin: 0 auto; }")
     let st: style::ComputedStyle = style::resolve(sheet, "div", "", [], style::root_style())
     ;; sentinel -1 dopóki layout.h# nie zna avail_w/box_w, żeby rozdzielić przestrzeń
-    assert_eq(st.mar_left, -1)
-    assert_eq(st.mar_right, -1)
+    assert_eq(st.mar_left, style::auto_val())
+    assert_eq(st.mar_right, style::auto_val())
     assert_eq(st.mar_top, 0)
 end
 
@@ -201,7 +215,7 @@ end
 fn test_margin_auto_left_only() is
     let sheet: css::Stylesheet = css::parse("div { margin-left: auto; margin-right: 10px; }")
     let st: style::ComputedStyle = style::resolve(sheet, "div", "", [], style::root_style())
-    assert_eq(st.mar_left, -1)
+    assert_eq(st.mar_left, style::auto_val())
     assert_eq(st.mar_right, 10)
 end
 
@@ -261,8 +275,8 @@ fn test_margin_auto_still_works_alongside_em() is
     parent.font_size = 16
     let st: style::ComputedStyle = style::resolve(sheet, "div", "", [], parent)
     assert_eq(st.mar_top, 16)
-    assert_eq(st.mar_left, -1)
-    assert_eq(st.mar_right, -1)
+    assert_eq(st.mar_left, style::auto_val())
+    assert_eq(st.mar_right, style::auto_val())
 end
 
 ;; ---------- layout::layout — rozbudowa: margin: auto centruje blok ----------
@@ -329,7 +343,7 @@ fn test_layout_i_hover_changes_background() is
     assert_true(!bg_no_hover)
 
     let with_hover: [layout::LayoutBox] = layout::layout_i(
-        dom, sheet, 400, -1, css::InteractionState { hovered_id: btn_id, focused_id: "", active_id: -1 })
+        dom, sheet, 400, -1, css::ix_legacy(btn_id, "", -1))
     let mut bg_hover: bool = false
     i = 0
     while i < array_len(with_hover) is
@@ -528,7 +542,7 @@ fn test_css_hover_matches_only_hovered_node() is
 
     let hovered: style::ComputedStyle = style::resolve_ctx(
         sheet, dom, btn_id, style::root_style(),
-        css::InteractionState { hovered_id: btn_id, focused_id: "", active_id: -1 })
+        css::ix_legacy(btn_id, "", -1))
     assert_eq(hovered.color.r, 255)
 end
 
@@ -543,7 +557,7 @@ fn test_css_focus_matches_by_attr_id() is
 
     let focused: style::ComputedStyle = style::resolve_ctx(
         sheet, dom, input_id, style::root_style(),
-        css::InteractionState { hovered_id: -1, focused_id: "name", active_id: -1 })
+        css::ix_legacy(-1, "name", -1))
     assert_eq(focused.border_color.r, 255)
 end
 
@@ -556,7 +570,7 @@ fn test_css_unknown_pseudo_never_matches() is
     let btn_id: int = 1
     let st: style::ComputedStyle = style::resolve_ctx(
         sheet, dom, btn_id, style::root_style(),
-        css::InteractionState { hovered_id: btn_id, focused_id: "", active_id: btn_id })
+        css::ix_legacy(btn_id, "", btn_id))
     assert_true(st.color.r != 255)
 end
 
@@ -574,7 +588,7 @@ fn test_css_active_matches_only_pressed_node() is
 
     let pressed: style::ComputedStyle = style::resolve_ctx(
         sheet, dom, btn_id, style::root_style(),
-        css::InteractionState { hovered_id: -1, focused_id: "", active_id: btn_id })
+        css::ix_legacy(-1, "", btn_id))
     assert_true(pressed.has_bg)
     assert_eq(pressed.background.r, 255)
 end
@@ -588,7 +602,7 @@ fn test_css_active_independent_from_hover() is
     let btn_id: int = 1
     let hovered_not_active: style::ComputedStyle = style::resolve_ctx(
         sheet, dom, btn_id, style::root_style(),
-        css::InteractionState { hovered_id: btn_id, focused_id: "", active_id: -1 })
+        css::ix_legacy(btn_id, "", -1))
     assert_true(hovered_not_active.color.r != 255)
 end
 
@@ -829,9 +843,7 @@ fn test_hover_propagates_from_child_to_ancestor() is
     assert_true(btn_id >= 0 && span_id >= 0 && text_id >= 0)
 
     ;; "trafiony" (hovered_id) to najgłębszy węzeł — tekst wewnątrz span
-    let interaction: css::InteractionState = css::InteractionState {
-        hovered_id: text_id, focused_id: "", active_id: -1
-    }
+    let interaction: css::InteractionState = css::ix_legacy(text_id, "", -1)
     let btn_style: style::ComputedStyle = style::resolve_ctx(sheet, dom, btn_id, style::root_style(), interaction)
     assert_true(btn_style.has_bg)
 end
@@ -851,9 +863,7 @@ fn test_hover_does_not_propagate_to_unrelated_sibling() is
         i += 1
     end
     ;; hover jest w gałęzi .a, nie .b -> .b:hover NIE powinno dopasować
-    let interaction: css::InteractionState = css::InteractionState {
-        hovered_id: span_text_id, focused_id: "", active_id: -1
-    }
+    let interaction: css::InteractionState = css::ix_legacy(span_text_id, "", -1)
     let b_style: style::ComputedStyle = style::resolve_ctx(sheet, dom, b_id, style::root_style(), interaction)
     assert_true(!b_style.has_bg)
 end
@@ -871,9 +881,7 @@ fn test_focus_does_not_propagate_to_ancestor() is
         if dom.nodes[i].attr_class == "wrap" is wrap_id = i end
         i += 1
     end
-    let interaction: css::InteractionState = css::InteractionState {
-        hovered_id: -1, focused_id: "name", active_id: -1
-    }
+    let interaction: css::InteractionState = css::ix_legacy(-1, "name", -1)
     let wrap_style: style::ComputedStyle = style::resolve_ctx(sheet, dom, wrap_id, style::root_style(), interaction)
     assert_true(!wrap_style.has_bg)
 end
@@ -894,9 +902,7 @@ fn test_focus_within_matches_ancestor_of_focused_input() is
         if dom.nodes[i].attr_class == "wrap" is wrap_id = i end
         i += 1
     end
-    let interaction: css::InteractionState = css::InteractionState {
-        hovered_id: -1, focused_id: "name", active_id: -1
-    }
+    let interaction: css::InteractionState = css::ix_legacy(-1, "name", -1)
     let wrap_style: style::ComputedStyle = style::resolve_ctx(sheet, dom, wrap_id, style::root_style(), interaction)
     assert_true(wrap_style.has_bg)
 end
@@ -931,9 +937,7 @@ fn test_focus_within_no_match_for_unrelated_branch() is
         if dom.nodes[i].attr_class == "b" is b_id = i end
         i += 1
     end
-    let interaction: css::InteractionState = css::InteractionState {
-        hovered_id: -1, focused_id: "x", active_id: -1
-    }
+    let interaction: css::InteractionState = css::ix_legacy(-1, "x", -1)
     let a_style: style::ComputedStyle = style::resolve_ctx(sheet, dom, a_id, style::root_style(), interaction)
     let b_style: style::ComputedStyle = style::resolve_ctx(sheet, dom, b_id, style::root_style(), interaction)
     assert_true(!a_style.has_bg)   ;; reguła jest na .b, nie .a — .a nie powinno dostać tła niezależnie
@@ -1017,4 +1021,699 @@ fn test_scaled_alpha_preserves_base_alpha_ratio() is
     ;; kolor już częściowo przezroczysty (np. z przyszłego rgba()) razy
     ;; opacity elementu — obie przezroczystości się mnożą, nie zastępują.
     assert_eq(paint::scaled_alpha(128, 50), 64)
+end
+
+;; ---------- cssval (v0.2) ----------
+#[test]
+fn t_color() is
+    assert_eq(cssval::parse_color("#f00").r, 255)
+    assert_eq(cssval::parse_color("#ff000080").a, 128)
+    assert_eq(cssval::parse_color("red").g, 0)
+    assert_eq(cssval::parse_color("rebeccapurple").b, 153)
+    assert_eq(cssval::parse_color("rgb(10, 20, 30)").g, 20)
+    assert_eq(cssval::parse_color("rgba(10, 20, 30, 0.5)").a, 128)
+    assert_eq(cssval::parse_color("hsl(120, 100%, 50%)").g, 255)
+    assert_true(cssval::is_color("tomato"))
+    assert_true(!cssval::is_color("solid"))
+end
+
+#[test]
+fn t_len() is
+    let env: cssval::LenEnv = cssval::LenEnv { em: 10, rem: 16, vw: 1000, vh: 500 }
+    assert_eq(cssval::parse_len("12px", env).px, 12)
+    assert_eq(cssval::parse_len("2em", env).px, 20)
+    assert_eq(cssval::parse_len("1.5rem", env).px, 24)
+    assert_eq(cssval::parse_len("50%", env).pct, 5000)
+    assert_eq(cssval::parse_len("10vw", env).px, 100)
+    assert_true(cssval::parse_len("auto", env).auto)
+    let c: cssval::Len = cssval::parse_len("calc(100% - 20px)", env)
+    assert_eq(c.pct, 10000)
+    assert_eq(c.px, -20)
+    assert_eq(cssval::px_of(c, 300), 280)
+    assert_eq(cssval::parse_len("calc((10px + 5px) * 2)", env).px, 30)
+    assert_eq(cssval::parse_len("max(10px, 30px)", env).px, 30)
+    assert_eq(cssval::split_top("1px solid rgb(0, 0, 0)")[2], "rgb(0, 0, 0)")
+end
+
+;; ---------- dom2 (v0.2) ----------
+#[test]
+fn t_attrs() is
+    let d: dom::Dom = dom::parse("<div id='a' class=\"x y\" data-k=v on-click=go disabled>hi</div>")
+    assert_eq(d.nodes[1].attr_id, "a")
+    assert_eq(d.nodes[1].attr_class, "x y")
+    assert_eq(d.nodes[1].on_click, "go")
+    assert_true(d.nodes[1].disabled)
+    assert_eq(dom::get_attr(d.nodes[1], "data-k"), "v")
+    assert_eq(d.nodes[2].text, "hi")
+end
+
+#[test]
+fn t_void_and_comments() is
+    let d: dom::Dom = dom::parse("<!DOCTYPE html><!-- c --><div><img src=\"a.png\"><br><input value=x><p>t</p></div>")
+    assert_eq(array_len(d.nodes[1].children), 4)
+    assert_eq(d.nodes[2].tag, "img")
+    assert_eq(d.nodes[4].tag, "input")
+    assert_eq(d.nodes[5].tag, "p")
+end
+
+#[test]
+fn t_entities() is
+    let d: dom::Dom = dom::parse("<p>a &amp; b &lt;c&gt; &#233; &nbsp;x</p>")
+    assert_eq(d.nodes[2].text, "a & b <c> " + char_code_to_str(233) + " " + char_code_to_str(160) + "x")
+end
+
+#[test]
+fn t_style_script_title() is
+    let d: dom::Dom = dom::parse("<html><head><title>T</title><style>p{color:red}</style><link rel=\"stylesheet\" href=\"s.css\"><script src=\"a.js\"></script><script>var x=1;</script></head><body><p>x</p></body></html>")
+    assert_eq(d.title, "T")
+    assert_true(string_find(d.inline_css, "color:red") >= 0)
+    assert_eq(d.stylesheets[0], "s.css")
+    assert_eq(d.scripts[0], "a.js")
+    assert_true(string_find(d.inline_js, "var x=1") >= 0)
+end
+
+#[test]
+fn t_implied_close() is
+    let d: dom::Dom = dom::parse("<ul><li>a<li>b</ul><p>x<div>y</div>")
+    assert_eq(array_len(d.nodes[1].children), 2)
+    assert_eq(array_len(d.nodes[0].children), 3)
+end
+
+#[test]
+fn t_glue() is
+    let d: dom::Dom = dom::parse("<p>a<b>b</b>, <i>c</i></p>")
+    let kids: [int] = d.nodes[1].children
+    assert_true(d.nodes[kids[1]].glue)
+    assert_true(d.nodes[kids[2]].glue)
+    assert_true(d.nodes[kids[3]].glue == false)
+end
+
+#[test]
+fn t_mutation() is
+    let mut d: dom::Dom = dom::parse("<div id=\"a\"><span>x</span></div>")
+    d = dom::set_text(d, 1, "new")
+    assert_eq(dom::text_content(d, 1), "new")
+    d = dom::add_class(d, 1, "k")
+    d = dom::add_class(d, 1, "m")
+    d = dom::remove_class(d, 1, "k")
+    assert_eq(d.nodes[1].attr_class, "m")
+    d = dom::set_inner_html(d, 1, "<b>q</b><i>r</i>")
+    assert_eq(array_len(d.nodes[1].children), 2)
+    assert_eq(dom::text_content(d, 1), "qr")
+    assert_eq(dom::inner_html(d, 1), "<b>q</b><i>r</i>")
+    d = dom::set_attr(d, 1, "data-x", "5")
+    assert_eq(dom::get_attr(d.nodes[1], "data-x"), "5")
+    assert_eq(dom::dataset_json(d.nodes[1]), "{\"x\":\"5\"}")
+    d = dom::remove_node(d, d.nodes[1].children[0])
+    assert_eq(array_len(d.nodes[1].children), 1)
+end
+
+#[test]
+fn t_textarea_pre() is
+    let d: dom::Dom = dom::parse("<textarea id=\"t\">a\nb</textarea><pre>x  y\nz</pre>")
+    assert_eq(d.nodes[1].attr_value, "a\nb")
+    assert_eq(d.nodes[3].text, "x  y\nz")
+end
+
+;; ---------- css2 (v0.2) ----------
+#[test]
+fn t_parse_media_important() is
+    let sheet: css::Stylesheet = css::parse("p { color: red !important; } @media (max-width: 500px) { p { color: blue; } } @import 'x.css'; .a, .b { margin: 1px; }")
+    assert_eq(array_len(sheet.rules), 4)
+    assert_true(sheet.rules[0].decls[0].important)
+    assert_eq(sheet.rules[1].media, "(max-width: 500px)")
+    let mut ix: css::InteractionState = css::no_interaction()
+    ix.viewport_w = 400
+    assert_true(css::media_matches(sheet.rules[1].media, ix))
+    ix.viewport_w = 600
+    assert_true(!css::media_matches(sheet.rules[1].media, ix))
+    ix.dark = true
+    assert_true(css::media_matches("(prefers-color-scheme: dark)", ix))
+end
+
+#[test]
+fn t_specificity() is
+    assert_true(css::specificity("#a") > css::specificity(".a.b.c.d"))
+    assert_true(css::specificity(".a.b") > css::specificity(".a"))
+    assert_true(css::specificity("div p") > css::specificity("p"))
+end
+
+#[test]
+fn t_cascade_order() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"x\" style=\"color: green\">t</div>")
+    let sheet: css::Stylesheet = css::parse(".x { color: red; width: 5px } #a { width: 9px } .x { width: 7px }")
+    let decls: [css::CssDecl] = css::matching_decls_ctx(sheet, d, 1, css::no_interaction())
+    let last: css::CssDecl = decls[array_len(decls) - 1]
+    assert_eq(last.val, "green")
+    let mut w: string = ""
+    let mut i: int = 0
+    while i < array_len(decls) is
+        if decls[i].prop == "width" is w = decls[i].val end
+        i += 1
+    end
+    assert_eq(w, "9px")
+end
+
+#[test]
+fn t_attr_selectors() is
+    let d: dom::Dom = dom::parse("<a href=\"http://x\" data-k=\"v1\">l</a><a href=\"/y\">m</a>")
+    assert_eq(array_len(css::query_all(d, "a[href^=\"http\"]")), 1)
+    assert_eq(array_len(css::query_all(d, "[data-k]")), 1)
+    assert_eq(array_len(css::query_all(d, "a:not([data-k])")), 1)
+    assert_eq(array_len(css::query_all(d, "a")), 2)
+end
+
+#[test]
+fn t_combinators_backtrack() is
+    let d: dom::Dom = dom::parse("<div class=\"a\"><div class=\"b\"><p class=\"c\">x</p></div></div>")
+    assert_eq(array_len(css::query_all(d, ".a .b > .c")), 1)
+    assert_eq(array_len(css::query_all(d, ".a > .c")), 0)
+    assert_eq(array_len(css::query_all(d, "div div p")), 1)
+end
+
+#[test]
+fn t_nth_and_siblings() is
+    let d: dom::Dom = dom::parse("<ul><li>1</li><li>2</li><li>3</li><li>4</li></ul>")
+    assert_eq(array_len(css::query_all(d, "li:nth-child(odd)")), 2)
+    assert_eq(array_len(css::query_all(d, "li:nth-last-child(1)")), 1)
+    assert_eq(array_len(css::query_all(d, "li + li")), 3)
+    assert_eq(array_len(css::query_all(d, "li ~ li")), 3)
+    assert_eq(array_len(css::query_all(d, "li:first-child")), 1)
+    assert_eq(array_len(css::query_all(d, "li:last-of-type")), 1)
+end
+
+#[test]
+fn t_pseudo_elements() is
+    let sheet: css::Stylesheet = css::parse("p::before { content: 'x' } p { color: red }")
+    assert_true(css::has_pseudo_elements(sheet))
+end
+
+;; ---------- style2 (v0.2) ----------
+fn st_for(html: string, css_text: string, idx: int) -> style::ComputedStyle is
+    let d: dom::Dom = dom::parse(html)
+    let sheet: css::Stylesheet = css::parse(css_text)
+    return style::resolve_ctx(sheet, d, idx, style::root_style(), css::no_interaction())
+end
+
+#[test]
+fn t_basic_props() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { width: 50%; padding: 4px 8px; margin: 0 auto; border: 2px solid red; border-radius: 6px; font-weight: bold; line-height: 1.5; opacity: 0.5; }", 1)
+    assert_eq(st.width_mode, "pct")
+    assert_eq(st.width_pct, 5000)
+    assert_eq(st.pad_top, 4)
+    assert_eq(st.pad_left, 8)
+    assert_eq(st.mar_left, style::auto_val())
+    assert_eq(st.bt, 2)
+    assert_eq(st.bcl.r, 255)
+    assert_eq(st.rad_tl, 6)
+    assert_true(st.bold)
+    assert_eq(st.line_height, 24)
+    assert_eq(st.opacity, 50)
+end
+
+#[test]
+fn t_vars_and_important() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\" id=\"b\">x</div>", ":root { --c: #00ff00; } div { --w: 40px; } .a { color: var(--c); width: var(--w); height: var(--nope, 7px); } #b { color: red; } .a { width: 99px !important; }", 1)
+    assert_eq(st.height, 7)
+    assert_eq(st.width, 99)
+end
+
+#[test]
+fn t_inherit_and_ua() is
+    let d: dom::Dom = dom::parse("<div class=\"p\"><span>t</span><h1>h</h1><a href=\"x\">l</a></div>")
+    let sheet: css::Stylesheet = css::parse(".p { color: blue; font-size: 20px; text-align: center; }")
+    let p: style::ComputedStyle = style::resolve_ctx(sheet, d, 1, style::root_style(), css::no_interaction())
+    let sp: style::ComputedStyle = style::resolve_ctx(sheet, d, 2, p, css::no_interaction())
+    assert_eq(sp.color.b, 255)
+    assert_eq(sp.font_size, 20)
+    assert_eq(sp.display, "inline")
+    let h1: style::ComputedStyle = style::resolve_ctx(sheet, d, 4, p, css::no_interaction())
+    assert_eq(h1.font_size, 32)
+    assert_true(h1.bold)
+    assert_eq(style::resolve_ctx(sheet, d, 6, p, css::no_interaction()).display, "inline")
+end
+
+#[test]
+fn t_flex_and_shadow_gradient() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { display: flex; flex: 2 1 100px; flex-wrap: wrap; gap: 4px 8px; box-shadow: 1px 2px 3px rgba(0,0,0,0.3); background: linear-gradient(to right, #ff0000, #0000ff); }", 1)
+    assert_eq(st.flex_grow, 2000)
+    assert_eq(st.flex_basis, 100)
+    assert_true(st.flex_wrap)
+    assert_eq(st.row_gap, 4)
+    assert_eq(st.gap, 8)
+    assert_true(st.has_shadow)
+    assert_eq(st.sh_blur, 3)
+    assert_true(st.has_grad)
+    assert_true(!st.grad_vertical)
+    assert_eq(st.grad_to.b, 255)
+end
+
+#[test]
+fn t_hover_media() is
+    let d: dom::Dom = dom::parse("<button class=\"b\">x</button>")
+    let sheet: css::Stylesheet = css::parse(".b { color: red; } .b:hover { color: green; } @media (max-width: 300px) { .b { color: blue; } }")
+    let mut ix: css::InteractionState = css::no_interaction()
+    assert_eq(style::resolve_ctx(sheet, d, 1, style::root_style(), ix).color.r, 255)
+    ix.hovered_id = 1
+    assert_eq(style::resolve_ctx(sheet, d, 1, style::root_style(), ix).color.g, 128)
+    ix.hovered_id = -1
+    ix.viewport_w = 250
+    assert_eq(style::resolve_ctx(sheet, d, 1, style::root_style(), ix).color.b, 255)
+end
+
+;; ---------- layout2 (v0.2) ----------
+fn lay(html: string, css_text: string, vw: int) -> [layout::LayoutBox] is
+    return layout::layout(dom::parse(html), css::parse(css_text), vw, -1)
+end
+
+fn find_box(boxes: [layout::LayoutBox], id: int, kind: string) -> layout::LayoutBox is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == kind is return boxes[i] end
+        i += 1
+    end
+    return boxes[0]
+end
+
+#[test]
+fn t_margin_auto_center() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">x</div>", ".a { width: 200px; margin: 0 auto; }", 400)
+    let b: layout::LayoutBox = find_box(boxes, 1, "box")
+    assert_eq(b.x, 100)
+    assert_eq(b.w, 200)
+end
+
+#[test]
+fn t_percent_and_calc() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">x</div>", ".a { width: calc(50% - 10px); }", 400)
+    assert_eq(find_box(boxes, 1, "box").w, 190)
+    let b2: [layout::LayoutBox] = lay("<div class=\"a\">x</div>", ".a { width: 25%; min-width: 150px; }", 400)
+    assert_eq(find_box(b2, 1, "box").w, 150)
+end
+
+#[test]
+fn t_text_wraps() is
+    let long: string = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp"
+    let boxes: [layout::LayoutBox] = lay("<p class=\"p\">" + long + "</p>", ".p { width: 200px; margin: 0; }", 400)
+    let mut text_boxes: int = 0
+    let mut max_right: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is
+            text_boxes += 1
+            if boxes[i].x + boxes[i].w > max_right is max_right = boxes[i].x + boxes[i].w end
+        end
+        i += 1
+    end
+    assert_true(text_boxes >= 3)
+    assert_true(max_right <= 200)
+    assert_true(find_box(boxes, 1, "box").h > 40)
+end
+
+#[test]
+fn t_long_word_breaks() is
+    let boxes: [layout::LayoutBox] = lay("<p class=\"p\">abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz</p>", ".p { width: 100px; margin: 0; }", 400)
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is
+            n += 1
+            assert_true(boxes[i].w <= 100)
+        end
+        i += 1
+    end
+    assert_true(n >= 2)
+end
+
+#[test]
+fn t_margin_collapse() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">x</div><div class=\"b\">y</div>", ".a { margin-bottom: 20px; height: 10px; } .b { margin-top: 30px; height: 10px; }", 400)
+    let a: layout::LayoutBox = find_box(boxes, 1, "box")
+    let b: layout::LayoutBox = find_box(boxes, 3, "box")
+    assert_eq(b.y - (a.y + a.h), 30)
+end
+
+#[test]
+fn t_text_align_center_and_inline_bg() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\"><span class=\"s\">hi</span></div>", ".a { width: 400px; text-align: center; } .s { background: red; padding: 0 10px; }", 400)
+    let bg: layout::LayoutBox = find_box(boxes, 2, "inlinebg")
+    assert_true(bg.x > 100)
+    assert_true(bg.w > 20)
+end
+
+#[test]
+fn t_flex_row_grow_gap() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"f\"><div class=\"i\">a</div><div class=\"i\">b</div><div class=\"j\">c</div></div>", ".f { display: flex; gap: 10px; } .i { width: 100px; } .j { flex: 1; }", 400)
+    let a: layout::LayoutBox = find_box(boxes, 2, "box")
+    let b: layout::LayoutBox = find_box(boxes, 4, "box")
+    let c: layout::LayoutBox = find_box(boxes, 6, "box")
+    assert_eq(a.x, 0)
+    assert_eq(b.x, 110)
+    assert_eq(c.x, 220)
+    assert_eq(c.w, 180)
+end
+
+#[test]
+fn t_flex_justify_align() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"f\"><div class=\"i\">a</div></div>", ".f { display: flex; justify-content: center; align-items: center; height: 100px; } .i { width: 40px; height: 20px; }", 400)
+    let a: layout::LayoutBox = find_box(boxes, 2, "box")
+    assert_eq(a.x, 180)
+    assert_eq(a.y, 40)
+end
+
+#[test]
+fn t_flex_wrap() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"f\"><div class=\"i\">a</div><div class=\"i\">b</div><div class=\"i\">c</div></div>", ".f { display: flex; flex-wrap: wrap; } .i { width: 150px; height: 10px; }", 400)
+    let c: layout::LayoutBox = find_box(boxes, 6, "box")
+    assert_eq(c.x, 0)
+    assert_eq(c.y, 10)
+end
+
+#[test]
+fn t_flex_margin_auto() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"f\"><div class=\"i\">a</div><div class=\"i r\">b</div></div>", ".f { display: flex; } .i { width: 50px; } .r { margin-left: auto; }", 400)
+    assert_eq(find_box(boxes, 4, "box").x, 350)
+end
+
+#[test]
+fn t_flex_column() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"f\"><div class=\"i\">a</div><div class=\"i\">b</div></div>", ".f { display: flex; flex-direction: column; gap: 5px; } .i { height: 20px; }", 400)
+    assert_eq(find_box(boxes, 2, "box").y, 0)
+    assert_eq(find_box(boxes, 4, "box").y, 25)
+    assert_eq(find_box(boxes, 2, "box").w, 400)
+end
+
+#[test]
+fn t_grid() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"g\"><div>a</div><div>b</div><div>c</div></div>", ".g { display: grid; grid-template-columns: 100px 1fr; gap: 10px; } .g div { height: 20px; }", 400)
+    assert_eq(find_box(boxes, 2, "box").x, 0)
+    assert_eq(find_box(boxes, 4, "box").x, 110)
+    assert_eq(find_box(boxes, 4, "box").w, 290)
+    assert_eq(find_box(boxes, 6, "box").y, 30)
+end
+
+#[test]
+fn t_grid_repeat() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"g\"><div>a</div><div>b</div><div>c</div><div>d</div></div>", ".g { display: grid; grid-template-columns: repeat(2, 1fr); } .g div { height: 10px; }", 400)
+    assert_eq(find_box(boxes, 4, "box").x, 200)
+    assert_eq(find_box(boxes, 6, "box").y, 10)
+end
+
+#[test]
+fn t_absolute_and_relative() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"p\"><div class=\"a\">x</div></div>", ".p { position: relative; margin: 20px; height: 100px; } .a { position: absolute; right: 5px; bottom: 5px; width: 30px; height: 10px; }", 400)
+    let a: layout::LayoutBox = find_box(boxes, 2, "box")
+    assert_eq(a.x, 20 + 360 - 5 - 30)
+    assert_eq(a.y, 20 + 100 - 5 - 10)
+    let b2: [layout::LayoutBox] = lay("<div class=\"r\">x</div>", ".r { position: relative; left: 7px; top: 3px; width: 10px; height: 10px; }", 400)
+    assert_eq(find_box(b2, 1, "box").x, 7)
+    assert_eq(find_box(b2, 1, "box").y, 3)
+end
+
+#[test]
+fn t_fixed_flag() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">x</div>", ".a { position: fixed; top: 0; left: 0; width: 10px; height: 10px; }", 400)
+    assert_true(find_box(boxes, 1, "box").fixed)
+end
+
+#[test]
+fn t_overflow_clip_and_scroll() is
+    let html: string = "<div class=\"s\"><div class=\"c\">x</div></div>"
+    let css_text: string = ".s { height: 50px; overflow: auto; width: 100px; } .c { height: 200px; }"
+    let d: dom::Dom = dom::parse(html)
+    let sheet: css::Stylesheet = css::parse(css_text)
+    let r0: layout::LayoutResult = layout::layout_full(d, sheet, 400, 300, -1, css::no_interaction(), [])
+    let c0: layout::LayoutBox = find_box(r0.boxes, 2, "box")
+    assert_true(c0.has_clip)
+    assert_eq(c0.ch, 50)
+    assert_eq(find_box(r0.boxes, 1, "box").content_h, 200)
+    let sc: [int] = [1, 80]
+    let r1: layout::LayoutResult = layout::layout_full(d, sheet, 400, 300, -1, css::no_interaction(), sc)
+    assert_eq(find_box(r1.boxes, 2, "box").y, -80)
+    assert_eq(find_box(r1.boxes, 1, "box").scroll_y, 80)
+end
+
+#[test]
+fn t_list_markers() is
+    let boxes: [layout::LayoutBox] = lay("<ol><li>a</li><li>b</li></ol><ul><li>c</li></ul>", "", 400)
+    let mut texts: [string] = []
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "marker" is texts = array_push(texts, boxes[i].text) end
+        i += 1
+    end
+    assert_eq(texts[0], "1.")
+    assert_eq(texts[1], "2.")
+    assert_eq(array_len(texts), 3)
+end
+
+#[test]
+fn t_inline_block_button_in_line() is
+    let boxes: [layout::LayoutBox] = lay("<p>go <button>OK</button> now</p>", "p { margin: 0; }", 400)
+    let b: layout::LayoutBox = find_box(boxes, 3, "box")
+    assert_true(b.x > 10)
+    assert_true(b.h > 20)
+end
+
+#[test]
+fn t_box_sizing() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">x</div>", ".a { width: 200px; padding: 10px; border: 2px solid red; box-sizing: border-box; }", 400)
+    assert_eq(find_box(boxes, 1, "box").w, 200)
+    let b2: [layout::LayoutBox] = lay("<div class=\"a\">x</div>", ".a { width: 200px; padding: 10px; border: 2px solid red; }", 400)
+    assert_eq(find_box(b2, 1, "box").w, 224)
+end
+
+#[test]
+fn t_display_none_and_hidden() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">x</div><div class=\"b\">y</div>", ".a { display: none; } .b { height: 10px; }", 400)
+    assert_eq(find_box(boxes, 3, "box").y, 0)
+end
+
+;; ---------- tpl (v0.2) ----------
+#[test]
+fn t_subst_text_attr_inplace() is
+    let mut d: dom::Dom = dom::parse("<p title=\"Hi {{{{name}}}}\">Hello {{{{name}}}}!</p>")
+    let mut st: string = jsonlite::object()
+    st = jsonlite::set_str(st, "name", "Ala")
+    d = template::apply_state(d, st)
+    assert_eq(d.nodes[2].text, "Hello Ala!")
+    assert_eq(d.nodes[1].attr_title, "Hi Ala")
+    st = jsonlite::set_str(st, "name", "Ola")
+    d = template::apply_state(d, st)
+    assert_eq(d.nodes[2].text, "Hello Ola!")
+    assert_eq(d.nodes[1].attr_title, "Hi Ola")
+end
+
+#[test]
+fn t_if() is
+    let mut st: string = jsonlite::object()
+    st = jsonlite::set_bool(st, "on", true)
+    let d: dom::Dom = template::expand(dom::parse("<div><b if=\"on\">yes</b><i if=\"off\">no</i><u if-not=\"off\">neg</u></div>"), st)
+    assert_eq(dom::text_content(d, 1), "yesneg")
+end
+
+#[test]
+fn t_each_strings() is
+    let mut st: string = jsonlite::object()
+    st = jsonlite::set_str_array(st, "names", ["a", "b", "c"])
+    let d: dom::Dom = template::expand(dom::parse("<ul><li each=\"names\" as=\"n\">{{{{index}}}}:{{{{n}}}}</li></ul>"), st)
+    assert_eq(dom::text_content(d, 1), "0:a 1:b 2:c")
+end
+
+#[test]
+fn t_split_array() is
+    let parts: [string] = template::split_json_array("[{\"a\":1,\"b\":[1,2]},\"x,y\",3]")
+    assert_eq(array_len(parts), 3)
+    assert_eq(parts[1], "\"x,y\"")
+end
+
+#[test]
+fn t_jsonlite() is
+    let mut o: string = jsonlite::object()
+    o = jsonlite::set_str(o, "a", "x \"q\" \n")
+    o = jsonlite::set_int(o, "n", 5)
+    o = jsonlite::set_bool(o, "b", true)
+    o = jsonlite::set_raw(o, "o", "{\"k\":[1,2]}")
+    assert_eq(jsonlite::get_str(o, "a"), "x \"q\" \n")
+    assert_eq(jsonlite::get_int(o, "n"), 5)
+    assert_true(jsonlite::get_bool(o, "b"))
+    assert_eq(jsonlite::get_raw(o, "o"), "{\"k\":[1,2]}")
+    assert_eq(jsonlite::get_raw(jsonlite::get_raw(o, "o"), "k"), "[1,2]")
+    o = jsonlite::set_str(o, "a", "z")
+    assert_eq(jsonlite::get_str(o, "a"), "z")
+    assert_eq(array_len(jsonlite::keys(o)), 4)
+    o = jsonlite::remove_key(o, "n")
+    assert_true(!jsonlite::has_key(o, "n"))
+    assert_eq(jsonlite::get_str("{\"u\":\"\\u0105\"}", "u"), char_code_to_str(261))
+end
+
+#[test]
+fn t_each_objects_and_nested() is
+    let user: string = jsonlite::set_str(jsonlite::object(), "first", "Z")
+    let r1: string = jsonlite::set_int(jsonlite::set_str(jsonlite::object(), "name", "A"), "n", 1)
+    let r2: string = jsonlite::set_int(jsonlite::set_str(jsonlite::object(), "name", "B"), "n", 2)
+    let mut store: string = jsonlite::set_raw(jsonlite::object(), "rows", "[" + r1 + "," + r2 + "]")
+    store = jsonlite::set_raw(store, "user", user)
+    let d: dom::Dom = template::expand(dom::parse("<ul><li each=\"rows\" as=\"r\" title=\"{{{{r.name}}}}\">{{{{r.name}}}}={{{{r.n}}}} {{{{user.first}}}}</li></ul>"), store)
+    assert_eq(dom::text_content(d, 1), "A=1 Z B=2 Z")
+end
+
+;; ---------- edit (v0.2) ----------
+#[test]
+fn t_insert_backspace_utf8() is
+    let mut e: edit::Edit = edit::make("", 0, 0)
+    e = edit::insert(e, "Cześć")
+    assert_eq(e.value, "Cześć")
+    e = edit::backspace(e, false)
+    assert_eq(e.value, "Cześ")
+    e = edit::backspace(e, false)
+    assert_eq(e.value, "Cze")
+    e = edit::insert(e, "ł")
+    assert_eq(e.value, "Czeł")
+end
+
+#[test]
+fn t_selection_replace() is
+    let mut e: edit::Edit = edit::make("hello world", 11, 0)
+    assert_eq(edit::selected_text(e), "hello world")
+    e = edit::insert(e, "x")
+    assert_eq(e.value, "x")
+    assert_eq(e.cursor, 1)
+    assert_true(!edit::has_selection(e))
+end
+
+#[test]
+fn t_word_moves() is
+    assert_eq(edit::word_left_pos("foo bar baz", 11), 8)
+    assert_eq(edit::word_left_pos("foo bar baz", 8), 4)
+    assert_eq(edit::word_right_pos("foo bar baz", 0), 3)
+    assert_eq(edit::word_right_pos("foo bar baz", 3), 7)
+    let e: edit::Edit = edit::backspace(edit::make("foo bar", 7, 7), true)
+    assert_eq(e.value, "foo ")
+    let d: edit::Edit = edit::delete_forward(edit::make("foo bar", 0, 0), true)
+    assert_eq(d.value, " bar")
+end
+
+#[test]
+fn t_arrows_shift() is
+    let mut e: edit::Edit = edit::make("abcd", 2, 2)
+    e = edit::move_left(e, false, true)
+    assert_eq(e.cursor, 1)
+    assert_eq(e.anchor, 2)
+    assert_eq(edit::selected_text(e), "b")
+    e = edit::move_right(e, false, false)
+    assert_eq(e.cursor, 2)
+    assert_true(!edit::has_selection(e))
+    e = edit::move_home(e, false, false)
+    assert_eq(e.cursor, 0)
+    e = edit::move_end(e, true, false)
+    assert_eq(e.cursor, 4)
+    assert_eq(e.anchor, 0)
+end
+
+#[test]
+fn t_delete_and_bounds() is
+    assert_eq(edit::backspace(edit::make("a", 0, 0), false).value, "a")
+    assert_eq(edit::delete_forward(edit::make("a", 1, 1), false).value, "a")
+    assert_eq(edit::delete_forward(edit::make("ąb", 0, 0), false).value, "b")
+end
+
+#[test]
+fn t_vertical_and_lines() is
+    let e: edit::Edit = edit::make("abc\nde\nfghij", 2, 2)
+    let down: edit::Edit = edit::move_vertical(e, 1, false)
+    assert_eq(down.cursor, 6)
+    let down2: edit::Edit = edit::move_vertical(down, 1, false)
+    assert_eq(down2.cursor, 9)
+    let up: edit::Edit = edit::move_vertical(down2, -2, false)
+    assert_eq(up.cursor, 2)
+    assert_eq(edit::line_start_pos("abc\nde", 5), 4)
+    assert_eq(edit::line_end_pos("abc\nde", 1), 3)
+end
+
+#[test]
+fn t_maxlength_and_word_select() is
+    let e: edit::Edit = edit::make("abc", 3, 3)
+    assert_eq(edit::clamp_insert(e, "defg", 5), "de")
+    assert_eq(edit::clamp_insert(e, "x", 0), "x")
+    let w: edit::Edit = edit::select_word_at(edit::make("foo bar", 5, 5), 5)
+    assert_eq(edit::selected_text(w), "bar")
+end
+
+;; ---------- ipc / ui (v0.2) ----------
+fn h_echo(args: string) -> string is
+    return jsonlite::set_str(jsonlite::object(), "echo", jsonlite::get_str(args, "v"))
+end
+
+fn h_ui(args: string) -> string is
+    return ui::with(jsonlite::object(), ui::set_text("status", "ok"))
+end
+
+#[test]
+fn test_ipc_binary_search_and_override() is
+    let mut r: ipc::Router = ipc::new_router()
+    r = ipc::register(r, "zeta", h_echo)
+    r = ipc::register(r, "alpha", h_echo)
+    r = ipc::register(r, "mid", h_echo)
+    r = ipc::register(r, "alpha", h_ui)
+    assert_eq(array_len(r.commands), 3)
+    assert_eq(r.commands[0].name, "alpha")
+    assert_eq(ipc::find_index(r, "zeta"), 2)
+    assert_eq(ipc::find_index(r, "nope"), -1)
+end
+
+;; Uwaga: trzy testy ipc poniżej (origin/capability/required) wołają handlery przez pole
+;; `fn` i dopasowują enum z innego modułu — wymagają skompilowanego H# (`h# test`).
+#[test]
+fn test_ipc_origin_and_capability() is
+    let mut r: ipc::Router = ipc::new_router()
+    r = ipc::register_scoped(r, "html_only", h_echo, ipc::Origin::HtmlOnly)
+    r = ipc::register_cap(r, "fs_read", h_echo, ipc::Origin::Both, "fs")
+    assert_true(ipc::is_error(ipc::dispatch_from(r, "html_only", "{{}}", "js")))
+    assert_true(!ipc::is_error(ipc::dispatch_from(r, "html_only", "{{}}", "html")))
+    assert_eq(jsonlite::get_str(ipc::dispatch_from(r, "fs_read", "{{}}", "js"), "code"), "forbidden")
+    assert_true(!ipc::is_error(ipc::dispatch_from(r, "fs_read", "{{}}", "html")))
+    r = ipc::grant(r, "js", "fs")
+    assert_true(!ipc::is_error(ipc::dispatch_from(r, "fs_read", "{{}}", "js")))
+    r = ipc::revoke(r, "js", "fs")
+    assert_true(ipc::is_error(ipc::dispatch_from(r, "fs_read", "{{}}", "js")))
+    assert_eq(jsonlite::get_str(ipc::dispatch(r, "missing", "{{}}"), "code"), "not_found")
+end
+
+#[test]
+fn test_ipc_required_args() is
+    let mut r: ipc::Router = ipc::new_router()
+    r = ipc::register_full(r, "need_v", h_echo, ipc::Origin::Both, "", ["v"])
+    assert_eq(jsonlite::get_str(ipc::dispatch(r, "need_v", "{{}}"), "code"), "invalid_args")
+    assert_eq(jsonlite::get_str(ipc::dispatch(r, "need_v", "{{\"v\":\"x\"}}"), "echo"), "x")
+end
+
+#[test]
+fn test_ui_directives_roundtrip() is
+    let res: string = ui::with(ui::with(jsonlite::object(), ui::set_text("a", "1")), ui::add_class("b", "on"))
+    let dirs: [string] = ui::directives(res)
+    assert_eq(array_len(dirs), 2)
+    assert_eq(jsonlite::get_str(dirs[0], "op"), "set_text")
+    assert_eq(jsonlite::get_str(dirs[1], "cls"), "on")
+    assert_true(!jsonlite::has_key(ui::strip(res), "__ui"))
+end
+
+#[test]
+fn test_window_decode_events() is
+    let d: window::InputEvent = window::decode(2, "10|20|1|2|3")
+    assert_eq(d.kind, "mouse_down")
+    assert_eq(d.x, 10)
+    assert_eq(d.clicks, 2)
+    assert_eq(d.mods, 3)
+    let k: window::InputEvent = window::decode(5, "2|1|1073741904|80")
+    assert_eq(k.kind, "key_down")
+    assert_true(k.repeat)
+    assert_eq(k.code, window::key_left())
+    let t: window::InputEvent = window::decode(7, "0|0|za|żó")
+    assert_eq(t.text, "za|żó")
+    let w: window::InputEvent = window::decode(8, "0|-24|0|5|6")
+    assert_eq(w.kind, "scroll")
+    assert_eq(w.y, -24)
+    assert_eq(window::decode(12, "0|0|/tmp/a b.png").text, "/tmp/a b.png")
+    assert_eq(window::decode(6, "640|480|200").code, 200)
 end
