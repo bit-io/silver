@@ -1,9 +1,18 @@
-.page { background: #f2f2f5; padding: 24px; }
-.card { background: white; padding: 20px; border: 1px; border-color: #dddddd; }
-h1 { color: #202020; font-size: 26px; }
-p  { color: #555555; font-size: 14px; }
-
-.button { padding: 12px; margin: 6px; }
-.plus  { background: #2f9e50; }
-.minus { background: #c94141; }
-.button span { color: white; font-size: 16px; }
+.page { background: #f2f2f5; padding: 24px; min-height: 100vh; }
+.card { background: white; padding: 20px; border: 1px solid #dddddd; border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.12); max-width: 360px; margin: 0 auto; text-align: center; }
+h1 { color: #202020; font-size: 24px; margin: 0 0 8px 0; }
+.count { font-size: 56px; font-weight: bold; color: #3a5edc; margin: 8px 0 16px 0; }
+.row { display: flex; gap: 8px; justify-content: center; }
+.btn { padding: 8px 16px; transition: 150ms; }
+.btn:hover { background: #e2e6f8; }
+.btn.primary { background: #3a5edc; color: white; border-color: #3a5edc; }
+.btn.primary:hover { background: #2f4ec0; }
+.btn.ghost { background: transparent; }
+.hint { color: #888888; font-size: 13px; margin-top: 16px; }
+@media (prefers-color-scheme: dark) {
+    .page { background: #1d1e22; }
+    .card { background: #2a2c33; border-color: #444; }
+    h1 { color: #f0f0f0; }
+    .btn { background: #3a3d46; color: #eeeeee; border-color: #555; }
+}
