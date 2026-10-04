@@ -1,417 +1,2352 @@
 mod window
 mod ffi_shim
+mod ffi_dialogs
 mod ipc
+mod ui
 mod js
+mod edit
 mod engine
-use "std -> fs"                          from "fs"
-use "std -> log"                          from "log"
-use "std -> json"                          from "json"
+use "std -> fs"    from "fs"
+use "std -> log"   from "log"
+use "std -> time"  from "time"
+use "std -> http"  from "http"
+use "std -> async" from "async_"
 
-;; kod klawisza Backspace w SDL (SDLK_BACKSPACE) — potrzebny do edycji
-;; <input>, patrz native/silver_shim.c (event KEY_DOWN przekazuje
-;; e.key.keysym.sym wprost).
-fn key_backspace() -> int is return 8 end
+pub struct Anim is
+    pub node:     int
+    pub start:    int
+    pub dur:      int
+    pub from_bg:  style::Color
+    pub from_fg:  style::Color
+    pub from_op:  int
+end
+
+pub struct Task is
+    pub id:      string
+    pub handle:  string
+    pub command: string      ;; komenda routera wołana po zakończeniu ("" = tylko zdarzenie)
+end
 
 pub struct App is
-    pub win:      window::Window
-    pub dom:      dom::Dom
-    pub sheet:    css::Stylesheet
-    pub router:   ipc::Router
+    pub win:       window::Window
+    pub dom:       dom::Dom
+    pub sheet:     css::Stylesheet
+    pub router:    ipc::Router
     pub font_path: string
     pub font_size: int
-    pub store:    string    ;; płaski JSON stanu, patrz engine/template.h# ({{klucz}})
-    pub js_handle: int       ;; -1 = brak JS (tylko on-click w HTML), >=0 = kontekst QuickJS
+    pub store:     string          ;; płaski JSON stanu ({{klucz}})
+    pub js_handle: int             ;; -1 = brak JS
+    pub theme:     string          ;; "auto" | "light" | "dark"
+    pub dark:      bool
+    pub bg:        style::Color
 
-    pub scroll_y:      int              ;; offset przewijania strony w px
-    pub input_values:  jsonval::JsonValue   ;; { attr_id: aktualna wartość <input> }
-    pub focused_input: string              ;; attr_id focusowanego <input>, "" = brak
-    pub hovered_node:  int                  ;; rozbudowa v0.2: node_id pod kursorem
-                                              ;; (dla CSS `:hover`), -1 = mysz poza treścią
-    pub active_node:   int                    ;; rozbudowa v0.2: node_id z wciśniętym
-                                                ;; przyciskiem myszy (dla CSS `:active`),
-                                                ;; -1 = nic nie jest wciśnięte
+    pub html_src:  string
+    pub html_path: string
+    pub css_files: [string]
+    pub css_texts: [string]
+    pub js_files:  [string]
+    pub has_structural: bool       ;; w HTML są each= / if= → pełne odświeżenie przy zmianie stanu
+    pub state_css:  bool           ;; arkusz ma :hover/:active/:focus (zmiana interakcji = nowy układ)
 
-    pub html_path: string   ;; zapamiętane ścieżki (do hot reload) — "" jeśli load_html_str użyty
-    pub css_path:  string
-    pub dev_mode:  bool
-    pub last_html_mtime: int
-    pub last_css_mtime:  int
+    pub scroll_y:    int
+    pub elem_scroll: [int]         ;; pary [id, offset]
+    pub doc_h:       int
+    pub viewport_w:  int
+    pub viewport_h:  int
+    pub boxes:       [layout::LayoutBox]
+    pub dirty_layout: bool
+    pub dirty_paint:  bool
 
-    ;; Wołane raz na klatkę, przed przemalowaniem, zaraz po obsłużeniu
-    ;; ewentualnego zdarzenia. Miejsce, gdzie synchronizujesz zewnętrzny
-    ;; stan (np. licznik w std -> sync atomic) przez app::set_state.
+    pub hovered_node: int
+    pub active_node:  int
+    pub focused_node: int
+    pub focus_value:  string       ;; wartość pola w chwili fokusu (do on-change)
+    pub cursor_pos:   int          ;; bajty
+    pub anchor_pos:   int
+    pub ime:          string
+    pub caret_t0:     int
+    pub caret_phase:  bool
+    pub dragging:     bool
+    pub mouse_x:      int
+    pub mouse_y:      int
+    pub cur_cursor:   string
+    pub has_focus:    bool
+    pub text_input_on: bool
+
+    pub prev_bg: [style::Color]
+    pub prev_fg: [style::Color]
+    pub prev_op: [int]
+    pub anims:   [Anim]
+
+    pub dev_mode:     bool
+    pub mtimes:       [int]
+    pub last_dev:     int
+    pub tick_ms:      int
+    pub last_tick:    int
+    pub last_theme:   int
+    pub running:      bool
+    pub title_set:    bool
+    pub js_map:       [int]
+    pub js_loaded:    int          ;; ile z js_files już załadowano
+    pub js_inline_done: bool
+    pub js_pending:   int          ;; liczba niedokończonych operacji DOM z JS
+    pub tasks:        [Task]
+
     pub on_tick:  fn(App) -> App
+    pub on_event: fn(App, string, string) -> App
 end
 
 fn identity_tick(a: App) -> App is
     return a
 end
 
-;; Wynik jednego przejścia layout+paint — żeby nie liczyć layoutu
-;; osobno do hit-testu i osobno do malowania (naprawiony błąd z v0.1/v0.2).
-struct RenderPass is
-    pub rendered_dom: dom::Dom
-    pub boxes:         [layout::LayoutBox]
+fn identity_event(a: App, name: string, payload: string) -> App is
+    return a
+end
+
+pub fn version() -> string is
+    return "0.2.0"
 end
 
 pub fn new(title: string, width: int, height: int) -> App is
     let win: window::Window = window::create(title, width, height)
+    if win.open is
+        window::load_font(win, "", 16)
+    end
     return App {
-        win: win,
-        dom: dom::Dom { nodes: [] },
-        sheet: css::Stylesheet { rules: [] },
-        router: ipc::new_router(),
-        font_path: "",
-        font_size: 16,
-        store: json::object(),
-        js_handle: -1,
-        scroll_y: 0,
-        input_values: jsonval::obj(),
-        focused_input: "",
-        hovered_node: -1,
-        active_node: -1,
-        html_path: "", css_path: "", dev_mode: false,
-        last_html_mtime: 0, last_css_mtime: 0,
-        on_tick: identity_tick
+        win: win, dom: dom::empty(), sheet: css::empty_sheet(), router: ipc::new_router(),
+        font_path: "", font_size: 16, store: "{}", js_handle: -1, theme: "auto", dark: false,
+        bg: style::Color { r: 255, g: 255, b: 255, a: 255 },
+        html_src: "", html_path: "", css_files: [], css_texts: [], js_files: [], has_structural: false, state_css: false,
+        scroll_y: 0, elem_scroll: [], doc_h: 0, viewport_w: width, viewport_h: height,
+        boxes: [], dirty_layout: true, dirty_paint: true,
+        hovered_node: -1, active_node: -1, focused_node: -1, focus_value: "", cursor_pos: 0, anchor_pos: 0,
+        ime: "", caret_t0: 0, caret_phase: true, dragging: false, mouse_x: -1, mouse_y: -1,
+        cur_cursor: "default", has_focus: true, text_input_on: false,
+        prev_bg: [], prev_fg: [], prev_op: [], anims: [],
+        dev_mode: false, mtimes: [], last_dev: 0, tick_ms: 100, last_tick: 0, last_theme: 0,
+        running: false, title_set: false, js_map: [], js_loaded: 0, js_inline_done: false, js_pending: 0, tasks: [],
+        on_tick: identity_tick, on_event: identity_event
     }
 end
 
+;; ---------- konfiguracja ----------
 pub fn on_tick(app: App, hook: fn(App) -> App) -> App is
     let mut a: App = app
     a.on_tick = hook
     return a
 end
 
-;; Ustawia jeden klucz w płaskim stanie aplikacji — dowolny tekst w
-;; HTML zawierający `{{klucz}}` pokaże tę wartość od następnej klatki.
-pub fn set_state(app: App, key: string, val: string) -> App is
+;; Co ile ms wołać on_tick (domyślnie 100). 0 = tylko przy zdarzeniach.
+pub fn set_tick_interval(app: App, ms: int) -> App is
     let mut a: App = app
-    a.store = json::set_str(a.store, key, val)
+    a.tick_ms = ms
     return a
 end
 
-pub fn state(app: App, key: string) -> string is
-    return json::get_str(app.store, key)
-end
-
-;; Aktualna wartość edytowalnego <input id="...">. Zwraca "" jeśli
-;; użytkownik jeszcze nic nie wpisał (patrz value="..." w HTML dla
-;; wartości początkowej — ta funkcja pokazuje tylko to, co user
-;; NAPISAŁ od uruchomienia; wartość początkowa jest w dom po stronie
-;; paint.h# jako fallback wyświetlania, nie tutaj).
-pub fn input_value(app: App, input_id: string) -> string is
-    return jsonval::get_str(app.input_values, input_id)
+;; Hook na zdarzenia (np. "key", "drop", "resize", "focus", "blur"); payload to JSON.
+pub fn on_event(app: App, hook: fn(App, string, string) -> App) -> App is
+    let mut a: App = app
+    a.on_event = hook
+    return a
 end
 
 pub fn with_font(app: App, ttf_path: string, size: int) -> App is
     let mut a: App = app
     a.font_path = ttf_path
     a.font_size = size
-    window::load_font(a.win, ttf_path, size)
+    if a.win.open is
+        window::load_font(a.win, ttf_path, size)
+    end
+    a.dirty_layout = true
     return a
 end
 
-pub fn load_html(app: App, path: string) -> App is
+;; "auto" (domyślnie, wg systemu) | "light" | "dark"
+pub fn set_theme(app: App, theme: string) -> App is
     let mut a: App = app
-    a.dom = dom::parse(fs::read(path))
-    a.html_path = path
-    a.last_html_mtime = fs::modified_time(path)
+    a.theme = theme
+    a.last_theme = 0
+    a.dirty_layout = true
     return a
 end
 
-pub fn load_html_str(app: App, html: string) -> App is
-    let mut a: App = app
-    a.dom = dom::parse(html)
-    a.html_path = ""
-    return a
-end
-
-pub fn load_css(app: App, path: string) -> App is
-    let mut a: App = app
-    a.sheet = css::parse(fs::read(path))
-    a.css_path = path
-    a.last_css_mtime = fs::modified_time(path)
-    return a
-end
-
-pub fn load_css_str(app: App, css_text: string) -> App is
-    let mut a: App = app
-    a.sheet = css::parse(css_text)
-    a.css_path = ""
-    return a
-end
-
-;; Włącza hot reload: gdy `html_path`/`css_path` (z app::load_html/
-;; load_css — trzeba więc użyć wariantu ścieżkowego, nie *_str) zmienią
-;; się na dysku, `run()` przeładuje je automatycznie w ciągu ~0.5s, bez
-;; restartu aplikacji. Tylko frontend (HTML/CSS) — zmiana w kodzie H#
-;; nadal wymaga ponownego `bytes run`.
 pub fn enable_hot_reload(app: App) -> App is
     let mut a: App = app
     a.dev_mode = true
     return a
 end
 
-;; Rejestruje komendę wołaną z `on-click="nazwa"` w HTML LUB z
-;; `silver.invoke("nazwa", args)` w JS.
+pub fn quit(app: App) -> App is
+    let mut a: App = app
+    a.running = false
+    return a
+end
+
+;; ---------- komendy ----------
 pub fn command(app: App, name: string, handler: fn(string) -> string) -> App is
     let mut a: App = app
     a.router = ipc::register(a.router, name, handler)
     return a
 end
 
-;; Jak `command`, ale komenda odrzuci wywołania z JS — dla logiki
-;; wołanej tylko z zaufanego on-click w HTML aplikacji.
 pub fn command_html_only(app: App, name: string, handler: fn(string) -> string) -> App is
     let mut a: App = app
     a.router = ipc::register_scoped(a.router, name, handler, ipc::Origin::HtmlOnly)
     return a
 end
 
-;; Jak `command`, ale odrzuci wywołania z on-click w HTML — dla logiki,
-;; którą powinien wywoływać tylko frontend JS.
 pub fn command_js_only(app: App, name: string, handler: fn(string) -> string) -> App is
     let mut a: App = app
     a.router = ipc::register_scoped(a.router, name, handler, ipc::Origin::JsOnly)
     return a
 end
 
-pub fn load_js(app: App, files: [string]) -> App is
+;; Komenda wymagająca uprawnienia (JS dostaje je przez `allow_js`).
+pub fn command_cap(app: App, name: string, capability: string, handler: fn(string) -> string) -> App is
     let mut a: App = app
-    a.js_handle = js_bridge::js_init(a.win.handle)
-    if a.js_handle < 0 is
-        log::warn("Silver: nie udało się zainicjować QuickJS (libsilverjs.a wlinkowany statycznie? patrz native/README.md) — silver.invoke() z JS nie zadziała")
+    a.router = ipc::register_cap(a.router, name, handler, ipc::Origin::Both, capability)
+    return a
+end
+
+;; Nadaje kodowi JS uprawnienie ("*" = wszystkie).
+pub fn allow_js(app: App, capability: string) -> App is
+    let mut a: App = app
+    a.router = ipc::grant(a.router, "js", capability)
+    return a
+end
+
+;; ---------- stan szablonów ----------
+fn sanitize_dom_after_load(app: App) -> App is
+    let mut a: App = app
+    a.dom = template::apply_state(a.dom, a.store)
+    a.dirty_layout = true
+    a.prev_bg = []
+    a.prev_fg = []
+    a.prev_op = []
+    return a
+end
+
+fn input_values_snapshot(d: dom::Dom) -> [string] is
+    ;; pary id,wartość pól z attr_id (zachowanie wartości przy odświeżeniu)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(d.nodes) is
+        let n: dom::DomNode = d.nodes[i]
+        i += 1
+        if n.removed || n.attr_id == "" is continue end
+        if n.tag == "input" || n.tag == "textarea" || n.tag == "select" is
+            out = array_push(out, n.attr_id)
+            out = array_push(out, if n.checked then "\u0001c" + n.attr_value else n.attr_value)
+        end
+    end
+    return out
+end
+
+fn restore_input_values(d0: dom::Dom, snap: [string]) -> dom::Dom is
+    let mut d: dom::Dom = d0
+    let mut i: int = 0
+    while i + 1 < array_len(snap) is
+        let id: int = dom::find_by_id(d, snap[i])
+        if id >= 0 is
+            let v: string = snap[i + 1]
+            if string_starts_with(v, "\u0001c") is
+                d.nodes[id].checked = true
+                d.nodes[id].attr_value = string_slice(v, 2, string_len(v))
+            else is
+                d.nodes[id].attr_value = v
+                if d.nodes[id].tag == "input" && string_lower(d.nodes[id].attr_type) == "checkbox" is d.nodes[id].checked = false end
+            end
+        end
+        i += 2
+    end
+    return d
+end
+
+;; Ponownie buduje DOM z html_src (pętle/warunki wg aktualnego stanu), zachowując pola.
+pub fn rerender(app: App) -> App is
+    let mut a: App = app
+    if a.html_src == "" is return a end
+    let snap: [string] = input_values_snapshot(a.dom)
+    let parsed: dom::Dom = dom::parse(a.html_src)
+    a.dom = template::expand(parsed, a.store)
+    a.dom = template::apply_state(a.dom, a.store)
+    a.dom = restore_input_values(a.dom, snap)
+    a.dirty_layout = true
+    if a.focused_node >= array_len(a.dom.nodes) is a.focused_node = -1 end
+    return a
+end
+
+fn structural_in(html: string) -> bool is
+    return string_find(html, " each=") >= 0 || string_find(html, " if=") >= 0 || string_find(html, " if-not=") >= 0
+end
+
+pub fn set_state(app: App, key: string, val: string) -> App is
+    let mut a: App = app
+    if jsonlite::has_key(a.store, key) && jsonlite::get_str(a.store, key) == val is return a end
+    a.store = jsonlite::set_str(a.store, key, val)
+    if a.has_structural is
+        return rerender(a)
+    end
+    a.dom = template::apply_state(a.dom, a.store)
+    a.dirty_layout = true
+    return a
+end
+
+;; Ustawia klucz na surowy JSON (tablice/obiekty dla each=).
+pub fn set_state_json(app: App, key: string, raw_json: string) -> App is
+    let mut a: App = app
+    a.store = jsonlite::set_raw(a.store, key, raw_json)
+    if a.has_structural is
+        return rerender(a)
+    end
+    a.dom = template::apply_state(a.dom, a.store)
+    a.dirty_layout = true
+    return a
+end
+
+pub fn state(app: App, key: string) -> string is
+    return jsonlite::get_str(app.store, key)
+end
+
+;; ---------- ładowanie HTML / CSS / JS ----------
+fn dir_of(path: string) -> string is
+    let n: int = string_len(path)
+    let mut i: int = n - 1
+    while i >= 0 is
+        if string_slice(path, i, i + 1) == "/" is return string_slice(path, 0, i + 1) end
+        i -= 1
+    end
+    return ""
+end
+
+fn read_file_or_empty(path: string) -> string is
+    if !fs::exists(path) is
+        log::warn("silver: brak pliku " + path)
+        return ""
+    end
+    return fs::read(path)
+end
+
+fn mtime_or_zero(path: string) -> int is
+    if path == "" || !fs::exists(path) is return 0 end
+    return fs::modified_time(path)
+end
+
+;; Składa arkusz: <link rel=stylesheet>, <style> z HTML, potem pliki i teksty aplikacji.
+fn rebuild_sheet(app: App) -> App is
+    let mut a: App = app
+    let mut sheet: css::Stylesheet = css::empty_sheet()
+    let base: string = dir_of(a.html_path)
+    let mut i: int = 0
+    while i < array_len(a.dom.stylesheets) is
+        let href: string = a.dom.stylesheets[i]
+        let path: string = if string_starts_with(href, "/") || base == "" then href else base + href
+        sheet = css::concat(sheet, css::parse(read_file_or_empty(path)))
+        i += 1
+    end
+    if a.dom.inline_css != "" is sheet = css::concat(sheet, css::parse(a.dom.inline_css)) end
+    i = 0
+    while i < array_len(a.css_files) is
+        sheet = css::concat(sheet, css::parse(read_file_or_empty(a.css_files[i])))
+        i += 1
+    end
+    i = 0
+    while i < array_len(a.css_texts) is
+        sheet = css::concat(sheet, css::parse(a.css_texts[i]))
+        i += 1
+    end
+    a.sheet = sheet
+    a.state_css = sheet_uses_state(sheet)
+    a.dirty_layout = true
+    return a
+end
+
+fn sheet_uses_state(sheet: css::Stylesheet) -> bool is
+    let mut i: int = 0
+    while i < array_len(sheet.rules) is
+        let sel: string = sheet.rules[i].selector
+        if string_find(sel, ":hover") >= 0 || string_find(sel, ":active") >= 0 || string_find(sel, ":focus") >= 0 is return true end
+        i += 1
+    end
+    return false
+end
+
+fn collect_mtimes(app: App) -> [int] is
+    let mut out: [int] = [mtime_or_zero(app.html_path)]
+    let mut i: int = 0
+    while i < array_len(app.css_files) is
+        out = array_push(out, mtime_or_zero(app.css_files[i]))
+        i += 1
+    end
+    i = 0
+    while i < array_len(app.js_files) is
+        out = array_push(out, mtime_or_zero(app.js_files[i]))
+        i += 1
+    end
+    return out
+end
+
+pub fn load_html_str(app: App, html: string) -> App is
+    let mut a: App = app
+    a.html_src = html
+    a.has_structural = structural_in(html)
+    let parsed: dom::Dom = dom::parse(html)
+    a.dom = template::expand(parsed, a.store)
+    a = rebuild_sheet(a)
+    a = sanitize_dom_after_load(a)
+    if a.dom.title != "" && a.win.open is
+        window::set_title(a.win, a.dom.title)
+    end
+    a.focused_node = -1
+    a.hovered_node = -1
+    a.active_node = -1
+    return a
+end
+
+pub fn load_html(app: App, path: string) -> App is
+    let mut a: App = app
+    a.html_path = path
+    a = load_html_str(a, read_file_or_empty(path))
+    a.mtimes = collect_mtimes(a)
+    return a
+end
+
+pub fn load_css_str(app: App, css_text: string) -> App is
+    let mut a: App = app
+    a.css_texts = array_push(a.css_texts, css_text)
+    return rebuild_sheet(a)
+end
+
+pub fn load_css(app: App, path: string) -> App is
+    let mut a: App = app
+    a.css_files = array_push(a.css_files, path)
+    a.mtimes = collect_mtimes(a)
+    return rebuild_sheet(a)
+end
+
+;; ---------- zapytania i mutacje DOM z H# ----------
+;; id węzła po attr_id ("" / brak → -1)
+pub fn node_by_id(app: App, attr_id: string) -> int is
+    return dom::find_by_id(app.dom, attr_id)
+end
+
+pub fn query(app: App, selector: string) -> int is
+    return css::query_first(app.dom, selector)
+end
+
+pub fn query_all(app: App, selector: string) -> [int] is
+    return css::query_all(app.dom, selector)
+end
+
+fn touch(app: App) -> App is
+    let mut a: App = app
+    a.dirty_layout = true
+    return a
+end
+
+pub fn get_text(app: App, attr_id: string) -> string is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return "" end
+    return dom::text_content(app.dom, id)
+end
+
+pub fn set_text(app: App, attr_id: string, text: string) -> App is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::set_text(a.dom, id, text)
+    return touch(a)
+end
+
+pub fn set_html(app: App, attr_id: string, html: string) -> App is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::set_inner_html(a.dom, id, template::substitute(html, a.store))
+    return touch(a)
+end
+
+pub fn set_attr(app: App, attr_id: string, name: string, value: string) -> App is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::set_attr(a.dom, id, name, value)
+    return touch(a)
+end
+
+pub fn remove_attr(app: App, attr_id: string, name: string) -> App is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::remove_attr(a.dom, id, name)
+    return touch(a)
+end
+
+pub fn add_class(app: App, attr_id: string, cls: string) -> App is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::add_class(a.dom, id, cls)
+    return touch(a)
+end
+
+pub fn remove_class(app: App, attr_id: string, cls: string) -> App is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::remove_class(a.dom, id, cls)
+    return touch(a)
+end
+
+pub fn toggle_class(app: App, attr_id: string, cls: string) -> App is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::toggle_class(a.dom, id, cls)
+    return touch(a)
+end
+
+pub fn remove_element(app: App, attr_id: string) -> App is
+    let id: int = node_by_id(app, attr_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::remove_node(a.dom, id)
+    return touch(a)
+end
+
+;; Wartość pola (input / textarea / select) po attr_id
+pub fn input_value(app: App, input_id: string) -> string is
+    let id: int = node_by_id(app, input_id)
+    if id < 0 is return "" end
+    return app.dom.nodes[id].attr_value
+end
+
+pub fn set_input_value(app: App, input_id: string, value: string) -> App is
+    let id: int = node_by_id(app, input_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom = dom::set_attr(a.dom, id, "value", value)
+    if a.focused_node == id is
+        a.cursor_pos = string_len(value)
+        a.anchor_pos = a.cursor_pos
+    end
+    return touch(a)
+end
+
+pub fn is_checked(app: App, input_id: string) -> bool is
+    let id: int = node_by_id(app, input_id)
+    if id < 0 is return false end
+    return app.dom.nodes[id].checked
+end
+
+pub fn set_checked(app: App, input_id: string, checked: bool) -> App is
+    let id: int = node_by_id(app, input_id)
+    if id < 0 is return app end
+    let mut a: App = app
+    a.dom.nodes[id].checked = checked
+    return touch(a)
+end
+
+;; ---------- JSON zdarzeń ----------
+fn node_attr_id_or_empty(d: dom::Dom, id: int) -> string is
+    if id < 0 || id >= array_len(d.nodes) is return "" end
+    return d.nodes[id].attr_id
+end
+
+;; Argumenty JSON dla komendy wywołanej ze zdarzenia węzła.
+fn event_args(a: App, node: int, extra_key: string, extra_val: string) -> string is
+    let mut j: string = jsonlite::object()
+    if node >= 0 && node < array_len(a.dom.nodes) is
+        let n: dom::DomNode = a.dom.nodes[node]
+        j = jsonlite::set_str(j, "id", n.attr_id)
+        j = jsonlite::set_int(j, "node", node)
+        j = jsonlite::set_str(j, "tag", n.tag)
+        j = jsonlite::set_str(j, "value", n.attr_value)
+        j = jsonlite::set_bool(j, "checked", n.checked)
+        j = jsonlite::set_str(j, "name", n.attr_name)
+        j = jsonlite::set_raw(j, "data", dom::dataset_json(n))
+    end
+    if extra_key != "" is
+        j = jsonlite::set_str(j, extra_key, extra_val)
+    end
+    return j
+end
+
+pub fn key_name(code: int) -> string is
+    if code == 13 || code == 1073741912 is return "Enter" end
+    if code == 27 is return "Escape" end
+    if code == 8 is return "Backspace" end
+    if code == 9 is return "Tab" end
+    if code == 127 is return "Delete" end
+    if code == 32 is return " " end
+    if code == 1073741903 is return "ArrowRight" end
+    if code == 1073741904 is return "ArrowLeft" end
+    if code == 1073741905 is return "ArrowDown" end
+    if code == 1073741906 is return "ArrowUp" end
+    if code == 1073741898 is return "Home" end
+    if code == 1073741901 is return "End" end
+    if code == 1073741899 is return "PageUp" end
+    if code == 1073741902 is return "PageDown" end
+    if code >= 1073741882 && code <= 1073741893 is return "F" + to_string(code - 1073741881) end
+    if code > 32 && code < 127 is return char_code_to_str(code) end
+    return "Unidentified"
+end
+
+;; ---------- zdarzenia → JS (document.addEventListener) ----------
+pub fn emit(app: App, event_name: string, payload_json: string) -> bool is
+    if app.js_handle < 0 is return false end
+    return js::js_emit(app.js_handle, event_name, payload_json)
+end
+
+fn dom_event(a: App, kind: string, node: int, extra: string) -> bool is
+    if a.js_handle < 0 is return false end
+    let mut j: string = if extra == "" then jsonlite::object() else extra
+    j = jsonlite::set_str(j, "type", kind)
+    j = jsonlite::set_int(j, "n", node)
+    return js::js_emit(a.js_handle, "__dom_event", j)
+end
+
+fn mods_json(mods: int) -> string is
+    let mut j: string = jsonlite::object()
+    j = jsonlite::set_bool(j, "shift", mods % 2 == 1)
+    j = jsonlite::set_bool(j, "ctrl", (mods / 2) % 2 == 1)
+    j = jsonlite::set_bool(j, "alt", (mods / 4) % 2 == 1)
+    j = jsonlite::set_bool(j, "meta", (mods / 8) % 2 == 1)
+    return j
+end
+
+;; Zdarzenie do hooka H# (on_event) — zawsze po stronie H#.
+fn fire_hook(app: App, name: string, payload: string) -> App is
+    return app.on_event(app, name, payload)
+end
+
+;; ---------- fokus / pola (deklaracje wyprzedzające są niepotrzebne w H#) ----------
+struct CmdRes is
+    pub app:    App
+    pub result: string
+end
+
+;; Wykonuje komendę i dyrektywy UI z jej wyniku.
+fn exec_command(a0: App, cmd: string, args: string, caller: string) -> CmdRes is
+    let raw: string = ipc::dispatch_from(a0.router, cmd, args, caller)
+    let mut a: App = a0
+    let dirs: [string] = ui::directives(raw)
+    let mut i: int = 0
+    while i < array_len(dirs) is
+        a = apply_directive(a, dirs[i])
+        i += 1
+    end
+    return CmdRes { app: a, result: ui::strip(raw) }
+end
+
+;; Komenda wywołana ze zdarzenia HTML (wynik ignorowany).
+fn invoke_html(a0: App, cmd: string, args: string) -> App is
+    if cmd == "" is return a0 end
+    if !ipc::has(a0.router, cmd) is
+        log::warn("silver: nieznana komenda '" + cmd + "' (on-* w HTML)")
+        return a0
+    end
+    return exec_command(a0, cmd, args, "html").app
+end
+
+fn apply_directive(a0: App, dir: string) -> App is
+    let op: string = jsonlite::get_str(dir, "op")
+    let id: string = jsonlite::get_str(dir, "id")
+    let mut a: App = a0
+    if op == "set_text" is return set_text(a, id, jsonlite::get_str(dir, "text")) end
+    if op == "set_value" is return set_input_value(a, id, jsonlite::get_str(dir, "value")) end
+    if op == "set_html" is return set_html(a, id, jsonlite::get_str(dir, "html")) end
+    if op == "set_attr" is return set_attr(a, id, jsonlite::get_str(dir, "name"), jsonlite::get_str(dir, "value")) end
+    if op == "add_class" is return add_class(a, id, jsonlite::get_str(dir, "cls")) end
+    if op == "remove_class" is return remove_class(a, id, jsonlite::get_str(dir, "cls")) end
+    if op == "set_checked" is return set_checked(a, id, jsonlite::get_bool(dir, "checked")) end
+    if op == "set_state" is return set_state(a, jsonlite::get_str(dir, "key"), jsonlite::get_str(dir, "value")) end
+    if op == "title" is
+        window::set_title(a.win, jsonlite::get_str(dir, "title"))
         return a
     end
-    let count: int = array_len(files)
+    if op == "focus" is return focus_node(a, node_by_id(a, id)) end
+    if op == "scroll" is
+        a.scroll_y = jsonlite::get_int(dir, "y")
+        a.dirty_paint = true
+        return a
+    end
+    if op == "notify" is
+        window::notify(jsonlite::get_str(dir, "title"), jsonlite::get_str(dir, "body"))
+        return a
+    end
+    if op == "reload" is return rerender(a) end
+    if op == "close" is
+        a.running = false
+        return a
+    end
+    return a
+end
+
+;; Publiczne: wykonaj komendę z kodu H# (zwraca wynik JSON; stan UI aktualizuje).
+pub fn call(app: App, cmd: string, args_json: string) -> App is
+    return exec_command(app, cmd, args_json, "html").app
+end
+
+;; ---------- fokus ----------
+fn is_text_field(n: dom::DomNode) -> bool is
+    if n.tag == "textarea" is return true end
+    if n.tag != "input" is return false end
+    let t: string = string_lower(n.attr_type)
+    return t != "checkbox" && t != "radio" && t != "button" && t != "submit" && t != "reset" && t != "hidden" && t != "file"
+end
+
+fn is_focusable(n: dom::DomNode) -> bool is
+    if n.removed || n.disabled is return false end
+    if n.tag == "input" is return string_lower(n.attr_type) != "hidden" end
+    if n.tag == "textarea" || n.tag == "select" || n.tag == "button" is return true end
+    if n.tag == "a" is return n.attr_href != "" || n.on_click != "" end
+    return dom::has_attr(n, "tabindex") && dom::get_attr(n, "tabindex") != "-1"
+end
+
+fn set_text_input(a0: App, on: bool) -> App is
+    let mut a: App = a0
+    if on && !a.text_input_on is
+        window::start_text_input(a.win)
+        a.text_input_on = true
+    end
+    if !on && a.text_input_on is
+        window::stop_text_input(a.win)
+        a.text_input_on = false
+    end
+    return a
+end
+
+fn reset_caret(a0: App) -> App is
+    let mut a: App = a0
+    a.caret_t0 = ffi_shim::silver_ticks()
+    a.caret_phase = true
+    a.dirty_paint = true
+    return a
+end
+
+;; Zdejmuje fokus (z on-change, jeśli wartość się zmieniła).
+fn blur_current(a0: App) -> App is
+    let mut a: App = a0
+    let old: int = a.focused_node
+    if old < 0 is return a end
+    let n: dom::DomNode = a.dom.nodes[old]
+    a.focused_node = -1
+    a.ime = ""
+    a = set_text_input(a, false)
+    if is_text_field(n) && n.attr_value != a.focus_value is
+        a = invoke_html(a, n.on_change, event_args(a, old, "", ""))
+        dom_event(a, "change", old, "")
+    end
+    dom_event(a, "blur", old, "")
+    a.dirty_layout = true
+    return a
+end
+
+pub fn focus_node(a0: App, node: int) -> App is
+    let mut a: App = a0
+    if node == a.focused_node is return a end
+    if node >= 0 && (node >= array_len(a.dom.nodes) || !is_focusable(a.dom.nodes[node])) is return a end
+    a = blur_current(a)
+    if node < 0 is return a end
+    let n: dom::DomNode = a.dom.nodes[node]
+    a.focused_node = node
+    a.focus_value = n.attr_value
+    a.cursor_pos = string_len(n.attr_value)
+    a.anchor_pos = a.cursor_pos
+    a.ime = ""
+    a = set_text_input(a, is_text_field(n))
+    a = reset_caret(a)
+    a.dirty_layout = true
+    dom_event(a, "focus", node, "")
+    return a
+end
+
+pub fn focus(app: App, attr_id: string) -> App is
+    return focus_node(app, node_by_id(app, attr_id))
+end
+
+pub fn blur(app: App) -> App is
+    return focus_node(app, -1)
+end
+
+;; kolejny/poprzedni element do fokusu w kolejności dokumentu
+fn next_focus(a: App, forward: bool) -> int is
+    let order: [int] = dom::document_order(a.dom)
+    let mut cands: [int] = []
     let mut i: int = 0
-    while i < count is
-        let ok: bool = js_bridge::js_load_file(a.js_handle, files[i])
-        if !ok is
-            log::warn("Silver: błąd ładowania " + files[i] + " (patrz stderr shimu QuickJS)")
+    while i < array_len(order) is
+        let id: int = order[i]
+        i += 1
+        if id > 0 && is_focusable(a.dom.nodes[id]) && !hidden_by_style(a, id) is cands = array_push(cands, id) end
+    end
+    if array_len(cands) == 0 is return -1 end
+    let mut pos: int = -1
+    i = 0
+    while i < array_len(cands) is
+        if cands[i] == a.focused_node is pos = i end
+        i += 1
+    end
+    if forward is
+        return cands[(pos + 1) % array_len(cands)]
+    end
+    if pos <= 0 is return cands[array_len(cands) - 1] end
+    return cands[pos - 1]
+end
+
+fn hidden_by_style(a: App, id: int) -> bool is
+    ;; element bez boxa w układzie (display:none u siebie lub przodka) nie bierze udziału w Tab
+    let mut i: int = 0
+    while i < array_len(a.boxes) is
+        if a.boxes[i].node_id == id && a.boxes[i].kind == "box" is return false end
+        i += 1
+    end
+    return array_len(a.boxes) > 0
+end
+
+;; ---------- JS: start, snapshot DOM, polecenia ----------
+fn attr_json_pair(name: string, val: string) -> string is
+    return jsonlite::quote(name) + ":" + jsonlite::quote(val)
+end
+
+;; Atrybuty węzła jako obiekt JSON (wszystkie, także data-*).
+fn attrs_json(n: dom::DomNode) -> string is
+    let mut parts: [string] = []
+    if n.attr_id != "" is parts = array_push(parts, attr_json_pair("id", n.attr_id)) end
+    if n.attr_class != "" is parts = array_push(parts, attr_json_pair("class", n.attr_class)) end
+    if n.attr_type != "" is parts = array_push(parts, attr_json_pair("type", n.attr_type)) end
+    if n.attr_name != "" is parts = array_push(parts, attr_json_pair("name", n.attr_name)) end
+    if n.attr_href != "" is parts = array_push(parts, attr_json_pair("href", n.attr_href)) end
+    if n.attr_src != "" is parts = array_push(parts, attr_json_pair("src", n.attr_src)) end
+    if n.attr_title != "" is parts = array_push(parts, attr_json_pair("title", n.attr_title)) end
+    if n.attr_placeholder != "" is parts = array_push(parts, attr_json_pair("placeholder", n.attr_placeholder)) end
+    if n.attr_style != "" is parts = array_push(parts, attr_json_pair("style", n.attr_style)) end
+    if n.attr_value != "" is parts = array_push(parts, attr_json_pair("value", n.attr_value)) end
+    if n.on_click != "" is parts = array_push(parts, attr_json_pair("on-click", n.on_click)) end
+    if n.disabled is parts = array_push(parts, attr_json_pair("disabled", "")) end
+    if n.checked is parts = array_push(parts, attr_json_pair("checked", "")) end
+    if n.readonly is parts = array_push(parts, attr_json_pair("readonly", "")) end
+    let names: [string] = dom::extra_attr_names(n)
+    let mut i: int = 0
+    while i < array_len(names) is
+        parts = array_push(parts, attr_json_pair(names[i], dom::get_attr(n, names[i])))
+        i += 1
+    end
+    let mut out: string = "{"
+    i = 0
+    while i < array_len(parts) is
+        out = if i == 0 then out + parts[i] else out + "," + parts[i]
+        i += 1
+    end
+    return out + "}"
+end
+
+fn node_json(d: dom::Dom, id: int) -> string is
+    let n: dom::DomNode = d.nodes[id]
+    let mut kids: string = "["
+    let mut live: int = 0
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let c: int = n.children[i]
+        i += 1
+        if d.nodes[c].removed is continue end
+        kids = if live == 0 then kids + to_string(c) else kids + "," + to_string(c)
+        live += 1
+    end
+    kids = kids + "]"
+    let text_part: string = if n.tag == "text" then ",\"x\":" + jsonlite::quote(n.text) else ""
+    return "{\"i\":" + to_string(id) + ",\"p\":" + to_string(n.parent) + ",\"t\":" + jsonlite::quote(n.tag) +
+           text_part + ",\"k\":" + kids + ",\"a\":" + attrs_json(n) + "}"
+end
+
+fn snapshot_json(d: dom::Dom) -> string is
+    let mut out: string = "["
+    let mut first: bool = true
+    let mut i: int = 0
+    while i < array_len(d.nodes) is
+        let id: int = i
+        i += 1
+        if d.nodes[id].removed is continue end
+        out = if first then out + node_json(d, id) else out + "," + node_json(d, id)
+        first = false
+    end
+    return out + "]"
+end
+
+;; Poddrzewo (węzeł + potomkowie) do __dom_subtree.
+fn subtree_json(d: dom::Dom, root: int) -> string is
+    let mut out: string = "["
+    let mut stack: [int] = [root]
+    let mut first: bool = true
+    while array_len(stack) > 0 is
+        let id: int = stack[array_len(stack) - 1]
+        let mut rest: [int] = []
+        let mut k: int = 0
+        while k < array_len(stack) - 1 is
+            rest = array_push(rest, stack[k])
+            k += 1
+        end
+        stack = rest
+        if d.nodes[id].removed is continue end
+        out = if first then out + node_json(d, id) else out + "," + node_json(d, id)
+        first = false
+        let kids: [int] = d.nodes[id].children
+        let mut c: int = 0
+        while c < array_len(kids) is
+            stack = array_push(stack, kids[c])
+            c += 1
+        end
+    end
+    return out + "]"
+end
+
+fn send_snapshot(a: App) -> bool is
+    if a.js_handle < 0 is return false end
+    return js::js_emit(a.js_handle, "__dom_snapshot", snapshot_json(a.dom))
+end
+
+fn script_path(a: App, src: string) -> string is
+    let base: string = dir_of(a.html_path)
+    if string_starts_with(src, "/") || base == "" is return src end
+    return base + src
+end
+
+;; Tworzy kontekst JS (API jest wbudowane w shim), wysyła snapshot DOM i ładuje skrypty.
+fn ensure_js(a0: App) -> App is
+    let mut a: App = a0
+    if a.js_handle < 0 is
+        a.js_handle = js::js_init(a.win.handle)
+        if a.js_handle < 0 is
+            log::error("silver: nie można utworzyć kontekstu JS")
+            return a
+        end
+        a.js_loaded = 0
+        a.js_inline_done = false
+        send_snapshot(a)
+        let mut v: string = jsonlite::object()
+        v = jsonlite::set_int(v, "w", a.viewport_w)
+        v = jsonlite::set_int(v, "h", a.viewport_h)
+        v = jsonlite::set_int(v, "scale", window::scale_percent(a.win))
+        v = jsonlite::set_bool(v, "dark", a.dark)
+        js::js_emit(a.js_handle, "__window_info", v)
+    end
+    let mut i: int = 0
+    ;; <script src> z HTML, potem <script> inline, potem pliki z load_js
+    if !a.js_inline_done is
+        a.js_inline_done = true
+        while i < array_len(a.dom.scripts) is
+            let p: string = script_path(a, a.dom.scripts[i])
+            if !js::js_load_file(a.js_handle, p) is
+                log::error("silver: błąd JS w " + p + ": " + js::js_last_error(a.js_handle))
+            end
+            i += 1
+        end
+        if a.dom.inline_js != "" is
+            if !js::js_eval(a.js_handle, a.dom.inline_js, "inline.js") is
+                log::error("silver: błąd JS w <script>: " + js::js_last_error(a.js_handle))
+            end
+        end
+    end
+    while a.js_loaded < array_len(a.js_files) is
+        let p: string = a.js_files[a.js_loaded]
+        a.js_loaded += 1
+        if !js::js_load_file(a.js_handle, p) is
+            log::error("silver: błąd JS w " + p + ": " + js::js_last_error(a.js_handle))
+        end
+    end
+    return a
+end
+
+;; Ładuje pliki JS (kolejność ma znaczenie). Wywołaj PO load_html.
+pub fn load_js(app: App, files: [string]) -> App is
+    let mut a: App = app
+    let mut i: int = 0
+    while i < array_len(files) is
+        a.js_files = array_push(a.js_files, files[i])
+        i += 1
+    end
+    a.mtimes = collect_mtimes(a)
+    return ensure_js(a)
+end
+
+;; Uruchamia skrypty z HTML (<script>) nawet bez load_js.
+fn start_js_if_needed(a0: App) -> App is
+    let mut a: App = a0
+    if a.js_handle >= 0 is return a end
+    if array_len(a.dom.scripts) > 0 || a.dom.inline_js != "" || array_len(a.js_files) > 0 is
+        a = ensure_js(a)
+        if a.js_handle >= 0 is
+            dom_event(a, "DOMContentLoaded", 0, "")
+            dom_event(a, "load", 0, "")
+        end
+    end
+    return a
+end
+
+fn restart_js(a0: App) -> App is
+    let mut a: App = a0
+    if a.js_handle >= 0 is
+        js::js_shutdown(a.js_handle)
+        a.js_handle = -1
+    end
+    a.js_map = []
+    a = ensure_js(a)
+    if a.js_handle >= 0 is
+        dom_event(a, "DOMContentLoaded", 0, "")
+        dom_event(a, "load", 0, "")
+    end
+    return a
+end
+
+;; ---------- operacje DOM z JS ----------
+fn js_node(a: App, n: int) -> int is
+    if n >= 1000000 is
+        let idx: int = n - 1000000
+        if idx < array_len(a.js_map) is return a.js_map[idx] end
+        return -1
+    end
+    if n < 0 || n >= array_len(a.dom.nodes) is return -1 end
+    return n
+end
+
+struct DomOpsRes is
+    pub app:     App
+    pub remap:   string      ;; "[[prov,real],…]" nowych węzłów
+    pub subtrees: [int]      ;; węzły z nowym innerHTML
+end
+
+fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
+    let mut a: App = a0
+    let ops: [string] = jsonlite::array_items(ops_raw)
+    let mut remap: string = ""
+    let mut subtrees: [int] = []
+    let mut i: int = 0
+    while i < array_len(ops) is
+        let op: string = ops[i]
+        i += 1
+        let kind: string = jsonlite::get_str(op, "o")
+        let n: int = js_node(a, jsonlite::get_int(op, "n"))
+        if kind == "create" is
+            a.dom = dom::create_element(a.dom, jsonlite::get_str(op, "t"))
+            let real: int = array_len(a.dom.nodes) - 1
+            let prov: int = jsonlite::get_int(op, "p")
+            if prov >= 1000000 is
+                let idx: int = prov - 1000000
+                while array_len(a.js_map) <= idx is a.js_map = array_push(a.js_map, -1) end
+                a.js_map[idx] = real
+                remap = if remap == "" then "[" + to_string(prov) + "," + to_string(real) + "]" else remap + ",[" + to_string(prov) + "," + to_string(real) + "]"
+            end
+            continue
+        end
+        if kind == "createtext" is
+            a.dom = dom::create_text(a.dom, jsonlite::get_str(op, "v"))
+            let real: int = array_len(a.dom.nodes) - 1
+            let prov: int = jsonlite::get_int(op, "p")
+            if prov >= 1000000 is
+                let idx: int = prov - 1000000
+                while array_len(a.js_map) <= idx is a.js_map = array_push(a.js_map, -1) end
+                a.js_map[idx] = real
+                remap = if remap == "" then "[" + to_string(prov) + "," + to_string(real) + "]" else remap + ",[" + to_string(prov) + "," + to_string(real) + "]"
+            end
+            continue
+        end
+        if kind == "append" is
+            let parent: int = n
+            let child: int = js_node(a, jsonlite::get_int(op, "c"))
+            let before: int = js_node(a, jsonlite::get_int(op, "b"))
+            if parent >= 0 && child >= 0 is a.dom = dom::append_child(a.dom, parent, child, before) end
+            continue
+        end
+        if n < 0 is continue end
+        if kind == "text" is
+            a.dom = dom::set_text(a.dom, n, jsonlite::get_str(op, "v"))
+        elsif kind == "html" is
+            a.dom = dom::set_inner_html(a.dom, n, template::substitute(jsonlite::get_str(op, "v"), a.store))
+            subtrees = array_push(subtrees, n)
+        elsif kind == "attr" is
+            let name: string = jsonlite::get_str(op, "k")
+            a.dom = dom::set_attr(a.dom, n, name, jsonlite::get_str(op, "v"))
+            if name == "disabled" || name == "checked" || name == "readonly" is
+                let on: bool = jsonlite::get_str(op, "v") != "false"
+                if !on is a.dom = dom::remove_attr(a.dom, n, name) end
+            end
+        elsif kind == "rattr" is
+            a.dom = dom::remove_attr(a.dom, n, jsonlite::get_str(op, "k"))
+        elsif kind == "value" is
+            a.dom = dom::set_attr(a.dom, n, "value", jsonlite::get_str(op, "v"))
+            if a.focused_node == n is
+                a.cursor_pos = string_len(jsonlite::get_str(op, "v"))
+                a.anchor_pos = a.cursor_pos
+            end
+        elsif kind == "remove" is
+            if a.focused_node == n is a = blur_current(a) end
+            a.dom = dom::remove_node(a.dom, n)
+        elsif kind == "focus" is
+            a = focus_node(a, n)
+        elsif kind == "blur" is
+            if a.focused_node == n is a = blur_current(a) end
+        elsif kind == "click" is
+            a = do_click(a, n, a.mouse_x, a.mouse_y)
+        elsif kind == "scroll" is
+            if n == 0 is
+                a.scroll_y = jsonlite::get_int(op, "v")
+            else is
+                a.elem_scroll = set_pair(a.elem_scroll, n, jsonlite::get_int(op, "v"))
+            end
+        end
+    end
+    a.dirty_layout = true
+    return DomOpsRes { app: a, remap: remap, subtrees: subtrees }
+end
+
+fn set_pair(pairs: [int], id: int, val: int) -> [int] is
+    let mut out: [int] = []
+    let mut found: bool = false
+    let mut i: int = 0
+    while i + 1 < array_len(pairs) is
+        if pairs[i] == id is
+            out = array_push(out, id)
+            out = array_push(out, val)
+            found = true
+        else is
+            out = array_push(out, pairs[i])
+            out = array_push(out, pairs[i + 1])
+        end
+        i += 2
+    end
+    if !found is
+        out = array_push(out, id)
+        out = array_push(out, val)
+    end
+    return out
+end
+
+fn get_pair(pairs: [int], id: int) -> int is
+    let mut i: int = 0
+    while i + 1 < array_len(pairs) is
+        if pairs[i] == id is return pairs[i + 1] end
+        i += 2
+    end
+    return 0
+end
+
+;; ---------- wbudowane komendy dla JS ----------
+fn builtin_fetch(args: string) -> string is
+    let url: string = jsonlite::get_str(args, "url")
+    let method: string = string_upper(jsonlite::get_str(args, "method"))
+    let body: string = jsonlite::get_str(args, "body")
+    let mut r: string = jsonlite::object()
+    if url == "" is
+        return ipc::error_json("invalid_args", "fetch: brak url")
+    end
+    if method == "" || method == "GET" is
+        let resp = http::get_full(url)
+        r = jsonlite::set_int(r, "status", resp.status)
+        r = jsonlite::set_bool(r, "ok", resp.status >= 200 && resp.status < 300)
+        r = jsonlite::set_str(r, "body", resp.body)
+        return r
+    end
+    if method == "POST" is
+        let resp = http::post_full(url, body)
+        r = jsonlite::set_int(r, "status", resp.status)
+        r = jsonlite::set_bool(r, "ok", resp.status >= 200 && resp.status < 300)
+        r = jsonlite::set_str(r, "body", resp.body)
+        return r
+    end
+    let text: string = if method == "PUT" then http::put(url, body) else http::delete(url)
+    r = jsonlite::set_int(r, "status", 200)
+    r = jsonlite::set_bool(r, "ok", true)
+    r = jsonlite::set_str(r, "body", text)
+    return r
+end
+
+fn builtin_window(a0: App, args: string) -> App is
+    let mut a: App = a0
+    let op: string = jsonlite::get_str(args, "op")
+    if op == "title" is
+        window::set_title(a.win, jsonlite::get_str(args, "title"))
+    elsif op == "fullscreen" is
+        window::set_fullscreen(a.win, jsonlite::get_bool(args, "on"))
+    elsif op == "size" is
+        window::set_size(a.win, jsonlite::get_int(args, "w"), jsonlite::get_int(args, "h"))
+    elsif op == "min_size" is
+        window::set_min_size(a.win, jsonlite::get_int(args, "w"), jsonlite::get_int(args, "h"))
+    elsif op == "position" is
+        window::set_position(a.win, jsonlite::get_int(args, "x"), jsonlite::get_int(args, "y"))
+    elsif op == "maximize" is
+        window::maximize(a.win)
+    elsif op == "minimize" is
+        window::minimize(a.win)
+    elsif op == "restore" is
+        window::restore(a.win)
+    elsif op == "close" is
+        a.running = false
+    elsif op == "icon" is
+        window::set_icon(a.win, jsonlite::get_str(args, "path"))
+    elsif op == "opacity" is
+        window::set_opacity(a.win, jsonlite::get_int(args, "pct"))
+    elsif op == "always_on_top" is
+        window::set_always_on_top(a.win, jsonlite::get_bool(args, "on"))
+    elsif op == "decorations" is
+        window::set_decorations(a.win, jsonlite::get_bool(args, "on"))
+    elsif op == "notify" is
+        window::notify(jsonlite::get_str(args, "title"), jsonlite::get_str(args, "body"))
+    end
+    return a
+end
+
+fn builtin_dialog(args: string) -> string is
+    let kind: string = jsonlite::get_str(args, "kind")
+    let title: string = jsonlite::get_str(args, "title")
+    let mut r: string = jsonlite::object()
+    if kind == "open" is
+        return jsonlite::set_str(r, "path", ffi_dialogs::silver_dialog_open_file_ex(title, jsonlite::get_str(args, "desc"),
+               jsonlite::get_str(args, "pattern"), jsonlite::get_str(args, "dir")))
+    end
+    if kind == "open_multi" is
+        return jsonlite::set_str(r, "paths", ffi_dialogs::silver_dialog_open_files(title, jsonlite::get_str(args, "desc"),
+               jsonlite::get_str(args, "pattern"), jsonlite::get_str(args, "dir")))
+    end
+    if kind == "save" is
+        return jsonlite::set_str(r, "path", ffi_dialogs::silver_dialog_save_file_ex(title, jsonlite::get_str(args, "name"),
+               jsonlite::get_str(args, "desc"), jsonlite::get_str(args, "pattern")))
+    end
+    if kind == "folder" is
+        return jsonlite::set_str(r, "path", ffi_dialogs::silver_dialog_open_folder_ex(title, jsonlite::get_str(args, "dir")))
+    end
+    if kind == "message" || kind == "confirm" is
+        let level: string = if kind == "confirm" then "question" else jsonlite::get_str(args, "level")
+        let ok: bool = ffi_dialogs::silver_dialog_message(title, jsonlite::get_str(args, "text"), if level == "" then "info" else level)
+        return jsonlite::set_bool(r, "ok", ok)
+    end
+    return ipc::error_json("invalid_args", "dialog: nieznany rodzaj " + kind)
+end
+
+;; Obsługa jednego wywołania silver.invoke() z JS.
+fn handle_js_invoke(a0: App, raw: string) -> App is
+    let parts: [string] = string_split(raw, "\u0001")
+    if array_len(parts) < 3 is return a0 end
+    let call_id: string = parts[0]
+    let cmd: string = parts[1]
+    let args: string = parts[2]
+    let mut a: App = a0
+    let h: int = a.js_handle
+    if cmd == "__dom" is
+        let res: DomOpsRes = apply_dom_ops(a, jsonlite::get_raw(args, "ops"))
+        a = res.app
+        if res.remap != "" is
+            js::js_emit(h, "__dom_remap", "{\"map\":[" + res.remap + "]}")
+        end
+        let mut i: int = 0
+        while i < array_len(res.subtrees) is
+            js::js_emit(h, "__dom_subtree", "{\"n\":" + to_string(res.subtrees[i]) + ",\"nodes\":" + subtree_json(a.dom, res.subtrees[i]) + "}")
+            i += 1
+        end
+        js::js_resolve(h, call_id, "{}")
+        return a
+    end
+    if cmd == "__fetch" is
+        js::js_resolve(h, call_id, builtin_fetch(args))
+        return a
+    end
+    if cmd == "__window" is
+        a = builtin_window(a, args)
+        js::js_resolve(h, call_id, "{}")
+        return a
+    end
+    if cmd == "__dialog" is
+        js::js_resolve(h, call_id, builtin_dialog(args))
+        return a
+    end
+    if cmd == "__clip" is
+        if jsonlite::get_str(args, "op") == "set" is
+            window::clipboard_set(jsonlite::get_str(args, "text"))
+            js::js_resolve(h, call_id, "{}")
+        else is
+            js::js_resolve(h, call_id, jsonlite::set_str(jsonlite::object(), "text", window::clipboard_get()))
+        end
+        return a
+    end
+    let res: CmdRes = exec_command(a, cmd, args, "js")
+    a = res.app
+    if ipc::is_error(res.result) is
+        js::js_reject(h, call_id, jsonlite::get_str(res.result, "error"))
+    else is
+        js::js_resolve(h, call_id, if res.result == "" then "null" else res.result)
+    end
+    return a
+end
+
+;; Jedna runda mostu JS: timery + Promise + wywołania z kolejki.
+fn pump_js(a0: App) -> App is
+    let mut a: App = a0
+    if a.js_handle < 0 is return a end
+    js::js_tick(a.js_handle)
+    let mut guard: int = 0
+    while guard < 128 is
+        guard += 1
+        let raw: string = js::js_poll_invoke(a.js_handle)
+        if raw == "" is break end
+        a = handle_js_invoke(a, raw)
+        js::js_tick(a.js_handle)
+    end
+    return a
+end
+
+;; ---------- edycja pól ----------
+fn field_edit(a: App) -> edit::Edit is
+    if a.focused_node < 0 is return edit::make("", 0, 0) end
+    return edit::make(a.dom.nodes[a.focused_node].attr_value, a.cursor_pos, a.anchor_pos)
+end
+
+fn maxlength_of(n: dom::DomNode) -> int is
+    let v: string = dom::get_attr(n, "maxlength")
+    if v == "" is return 0 end
+    return str_to_int(v)
+end
+
+;; Zapisuje wynik edycji do węzła + wywołuje on-input / zdarzenie JS.
+fn commit_edit(a0: App, e: edit::Edit) -> App is
+    let mut a: App = a0
+    let node: int = a.focused_node
+    if node < 0 is return a end
+    let changed: bool = a.dom.nodes[node].attr_value != e.value
+    a.dom.nodes[node].attr_value = e.value
+    a.cursor_pos = e.cursor
+    a.anchor_pos = e.anchor
+    a.ime = ""
+    a = reset_caret(a)
+    if changed is
+        a.dirty_layout = a.dirty_layout || a.dom.nodes[node].tag == "textarea" || a.state_css
+        a.dirty_paint = true
+        a = invoke_html(a, a.dom.nodes[node].on_input, event_args(a, node, "", ""))
+        dom_event(a, "input", node, jsonlite::set_str(jsonlite::object(), "value", e.value))
+    end
+    return a
+end
+
+fn allowed_char(n: dom::DomNode, text: string) -> bool is
+    if string_lower(n.attr_type) != "number" is return true end
+    let digits: string = "0123456789.-+eE"
+    let mut i: int = 0
+    while i < string_len(text) is
+        if string_find(digits, string_slice(text, i, i + 1)) < 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+fn clean_text(text: string, multiline: bool) -> string is
+    let mut t: string = string_replace(text, "\r\n", "\n")
+    t = string_replace(t, "\r", "\n")
+    if !multiline is t = string_replace(t, "\n", " ") end
+    return string_replace(t, "\t", "    ")
+end
+
+fn insert_text(a0: App, text: string) -> App is
+    let mut a: App = a0
+    let node: int = a.focused_node
+    if node < 0 is return a end
+    let n: dom::DomNode = a.dom.nodes[node]
+    if !is_text_field(n) || n.disabled || n.readonly is return a end
+    let t: string = clean_text(text, n.tag == "textarea")
+    if t == "" || !allowed_char(n, t) is return a end
+    let e: edit::Edit = field_edit(a)
+    let limited: string = edit::clamp_insert(e, t, maxlength_of(n))
+    if limited == "" is return a end
+    return commit_edit(a, edit::insert(e, limited))
+end
+
+;; ---------- układ pola → pozycja kursora ----------
+fn box_of(a: App, node: int) -> layout::LayoutBox is
+    let mut i: int = 0
+    while i < array_len(a.boxes) is
+        if a.boxes[i].node_id == node && a.boxes[i].kind == "box" is return a.boxes[i] end
+        i += 1
+    end
+    return layout::no_clip_box(node, 0, 0, 0, 0, style::root_style(), "box")
+end
+
+fn font_flags(st: style::ComputedStyle) -> int is
+    let mut f: int = 0
+    if st.bold is f += 1 end
+    if st.italic is f += 2 end
+    return f
+end
+
+;; Najbliższa granica znaku w `text` dla współrzędnej `local_x`.
+fn pos_in_text(a: App, text: string, st: style::ComputedStyle, local_x: int, password: bool) -> int is
+    if text == "" || local_x <= 0 is return 0 end
+    if password is
+        let bw: int = ffi_shim::silver_measure_text_ex(a.win.handle, "•", st.font_size, 0)
+        let chars: int = if bw > 0 then (local_x + bw / 2) / bw else 0
+        return ffi_shim::silver_utf8_offset(text, chars)
+    end
+    let flags: int = font_flags(st)
+    let cut: int = ffi_shim::silver_text_fit(a.win.handle, text, st.font_size, flags, local_x)
+    if cut >= string_len(text) is return string_len(text) end
+    let w0: int = ffi_shim::silver_measure_text_ex(a.win.handle, string_slice(text, 0, cut), st.font_size, flags)
+    let nxt: int = ffi_shim::silver_utf8_next(text, cut)
+    let w1: int = ffi_shim::silver_measure_text_ex(a.win.handle, string_slice(text, 0, nxt), st.font_size, flags)
+    if local_x - w0 > (w1 - w0) / 2 is return nxt end
+    return cut
+end
+
+fn caret_from_point(a: App, node: int, x: int, y: int) -> int is
+    let b: layout::LayoutBox = box_of(a, node)
+    let st: style::ComputedStyle = b.st
+    let n: dom::DomNode = a.dom.nodes[node]
+    let ix: int = b.x + st.bl + st.pad_left
+    let iw: int = b.w - st.bl - st.br - st.pad_left - st.pad_right
+    let doc_y: int = y + a.scroll_y
+    if n.tag == "textarea" is
+        let lh: int = layout::normal_line_height(st.font_size)
+        let t: paint::TaLines = paint::ta_lines(a.win.handle, n.attr_value, st, iw)
+        let mut li: int = (doc_y - (b.y + st.bt + st.pad_top)) / lh
+        if li < 0 is li = 0 end
+        if li >= array_len(t.lines) is li = array_len(t.lines) - 1 end
+        let line: string = t.lines[li]
+        let col: int = pos_in_text(a, line, st, x - ix, false)
+        let mut pos: int = t.starts[li] + col
+        if pos > string_len(n.attr_value) is pos = string_len(n.attr_value) end
+        return pos
+    end
+    let password: bool = string_lower(n.attr_type) == "password"
+    let mut scroll: int = 0
+    if node == a.focused_node is
+        let shown: string = string_slice(n.attr_value, 0, a.cursor_pos)
+        let cw: int = if password then ffi_shim::silver_utf8_len(shown) * ffi_shim::silver_measure_text_ex(a.win.handle, "•", st.font_size, 0)
+                      else ffi_shim::silver_measure_text_ex(a.win.handle, shown, st.font_size, font_flags(st))
+        if cw > iw - 2 is scroll = cw - iw + 2 end
+    end
+    return pos_in_text(a, n.attr_value, st, x - ix + scroll, password)
+end
+
+;; ---------- kliknięcia ----------
+fn form_of(a: App, node: int) -> int is
+    let mut cur: int = node
+    while cur >= 0 is
+        if a.dom.nodes[cur].tag == "form" is return cur end
+        cur = a.dom.nodes[cur].parent
+    end
+    return -1
+end
+
+fn submit_form(a0: App, node: int) -> App is
+    let mut a: App = a0
+    let form: int = form_of(a, node)
+    let mut handler: string = ""
+    if form >= 0 is handler = a.dom.nodes[form].on_submit end
+    if handler == "" && node >= 0 is handler = a.dom.nodes[node].on_submit end
+    a = invoke_html(a, handler, event_args(a, if form >= 0 then form else node, "", ""))
+    dom_event(a, "submit", if form >= 0 then form else node, "")
+    return a
+end
+
+fn uncheck_group(a0: App, node: int) -> App is
+    let mut a: App = a0
+    let name: string = a.dom.nodes[node].attr_name
+    if name == "" is return a end
+    let form: int = form_of(a, node)
+    let mut i: int = 0
+    while i < array_len(a.dom.nodes) is
+        let n: dom::DomNode = a.dom.nodes[i]
+        if i != node && !n.removed && n.tag == "input" && string_lower(n.attr_type) == "radio" && n.attr_name == name && form_of(a, i) == form is
+            a.dom.nodes[i].checked = false
         end
         i += 1
     end
     return a
 end
 
-;; Wysyła zdarzenie do wszystkich `silver.listen("nazwa", cb)` w JS.
-pub fn emit(app: App, event_name: string, payload_json: string) is
-    if app.js_handle < 0 is return end
-    js_bridge::js_emit(app.js_handle, event_name, payload_json)
+fn toggle_check(a0: App, node: int) -> App is
+    let mut a: App = a0
+    let n: dom::DomNode = a.dom.nodes[node]
+    let radio: bool = string_lower(n.attr_type) == "radio"
+    if radio && n.checked is return a end
+    a.dom.nodes[node].checked = !n.checked
+    if radio is a = uncheck_group(a, node) end
+    a.dirty_layout = true
+    a = invoke_html(a, n.on_change, event_args(a, node, "", ""))
+    dom_event(a, "change", node, jsonlite::set_bool(jsonlite::object(), "checked", a.dom.nodes[node].checked))
+    return a
 end
 
-struct DrainResult is
-    pub app:     App
-    pub handled: bool
+;; Wartość opcji (value= albo tekst)
+fn option_value(a: App, opt: int) -> string is
+    let o: dom::DomNode = a.dom.nodes[opt]
+    if o.attr_value != "" is return o.attr_value end
+    return dom::text_content(a.dom, opt)
 end
 
-fn drain_js_invokes(app: App) -> DrainResult is
-    let mut a: App = app
-    let mut handled: bool = false
-    if a.js_handle < 0 is return DrainResult { app: a, handled: false } end
-    let mut go: bool = true
-    while go is
-        let msg: string = js_bridge::js_poll_invoke(a.js_handle)
-        if msg == "" is
-            go = false
-        else is
-            let parts: [string] = string_split(msg, "\u0001")
-            if array_len(parts) >= 3 is
-                let call_id: string = parts[0]
-                let cmd: string = parts[1]
-                let args_json: string = parts[2]
-                let result: string = ipc::dispatch_from(a.router, cmd, args_json, "js")
-                js_bridge::js_resolve(a.js_handle, call_id, result)
-                log::debug("Silver(JS): komenda '" + cmd + "' -> " + result)
-                handled = true
+fn cycle_select(a0: App, node: int, step_dir: int) -> App is
+    let mut a: App = a0
+    let n: dom::DomNode = a.dom.nodes[node]
+    let mut opts: [int] = []
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let c: int = n.children[i]
+        i += 1
+        if a.dom.nodes[c].tag == "option" && !a.dom.nodes[c].removed && !a.dom.nodes[c].disabled is opts = array_push(opts, c) end
+    end
+    if array_len(opts) == 0 is return a end
+    let cur_label: string = paint::select_label(a.dom, node)
+    let mut idx: int = 0
+    i = 0
+    while i < array_len(opts) is
+        if dom::text_content(a.dom, opts[i]) == cur_label is idx = i end
+        i += 1
+    end
+    let next: int = (idx + step_dir + array_len(opts)) % array_len(opts)
+    a.dom.nodes[node].attr_value = option_value(a, opts[next])
+    a.dirty_paint = true
+    a = invoke_html(a, n.on_change, event_args(a, node, "", ""))
+    dom_event(a, "change", node, jsonlite::set_str(jsonlite::object(), "value", a.dom.nodes[node].attr_value))
+    return a
+end
+
+fn label_target(a: App, label: int) -> int is
+    let f: string = dom::get_attr(a.dom.nodes[label], "for")
+    if f != "" is return dom::find_by_id(a.dom, f) end
+    let mut stack: [int] = [label]
+    while array_len(stack) > 0 is
+        let id: int = stack[array_len(stack) - 1]
+        let mut rest: [int] = []
+        let mut k: int = 0
+        while k < array_len(stack) - 1 is
+            rest = array_push(rest, stack[k])
+            k += 1
+        end
+        stack = rest
+        if id != label && is_focusable(a.dom.nodes[id]) && a.dom.nodes[id].tag != "button" is return id end
+        let kids: [int] = a.dom.nodes[id].children
+        let mut c: int = array_len(kids) - 1
+        while c >= 0 is
+            stack = array_push(stack, kids[c])
+            c -= 1
+        end
+    end
+    return -1
+end
+
+;; Semantyka kliknięcia: widgety formularzy, etykiety, on-click, linki.
+fn do_click(a0: App, hit: int, x: int, y: int) -> App is
+    let mut a: App = a0
+    if hit < 0 || hit >= array_len(a.dom.nodes) is return a end
+    let mut pos: string = jsonlite::set_int(jsonlite::object(), "x", x)
+    pos = jsonlite::set_int(pos, "y", y)
+    dom_event(a, "click", hit, pos)
+    a = fire_hook(a, "click", jsonlite::set_int(pos, "node", hit))
+    let mut cur: int = hit
+    while cur >= 0 is
+        let n: dom::DomNode = a.dom.nodes[cur]
+        if n.disabled is return a end
+        let kind: string = string_lower(n.attr_type)
+        if n.tag == "input" && (kind == "checkbox" || kind == "radio") is
+            a = focus_node(a, cur)
+            a = toggle_check(a, cur)
+            return invoke_html(a, n.on_click, event_args(a, cur, "", ""))
+        end
+        if n.tag == "select" is
+            a = focus_node(a, cur)
+            return cycle_select(a, cur, 1)
+        end
+        if n.tag == "label" is
+            let t: int = label_target(a, cur)
+            if t >= 0 && t != hit is
+                let tn: dom::DomNode = a.dom.nodes[t]
+                if tn.tag == "input" && (string_lower(tn.attr_type) == "checkbox" || string_lower(tn.attr_type) == "radio") is
+                    a = focus_node(a, t)
+                    a = toggle_check(a, t)
+                elsif is_text_field(tn) is
+                    a = focus_node(a, t)
+                else is
+                    a = do_click(a, t, x, y)
+                end
             end
+            return invoke_html(a, n.on_click, event_args(a, cur, "", ""))
         end
-    end
-    return DrainResult { app: a, handled: handled }
-end
-
-fn compute(app: App) -> RenderPass is
-    let w: int = window::ffi_width(app.win)
-    let rendered_dom: dom::Dom = template::apply_state(app.dom, app.store)
-    ;; Rozbudowa v0.2: layout_i zamiast layout — niesie stan interakcji
-    ;; (hover/focus/active), żeby CSS `:hover`/`:focus`/`:active`
-    ;; faktycznie coś zmieniały.
-    let interaction: css::InteractionState = css::InteractionState {
-        hovered_id: app.hovered_node, focused_id: app.focused_input,
-        active_id: app.active_node
-    }
-    let boxes: [layout::LayoutBox] = layout::layout_i(rendered_dom, app.sheet, w, app.win.handle, interaction)
-    return RenderPass { rendered_dom: rendered_dom, boxes: boxes }
-end
-
-fn paint_pass(app: App, pass: RenderPass) is
-    paint::render(app.win.handle, pass.boxes, pass.rendered_dom,
-        app.scroll_y, app.input_values, app.focused_input)
-end
-
-;; Sprawdza mtime html/css (tylko gdy dev_mode i ścieżkowe load_*) i
-;; przeładowuje, jeśli plik zmienił się na dysku. Wołane co ~30 klatek
-;; w run() (nie co klatkę — fs::modified_time to syscall).
-fn check_hot_reload(app: App) -> App is
-    let mut a: App = app
-    if !a.dev_mode is return a end
-
-    if a.html_path != "" is
-        let m: int = fs::modified_time(a.html_path)
-        if m != a.last_html_mtime is
-            a.dom = dom::parse(fs::read(a.html_path))
-            a.last_html_mtime = m
-            log::info("Silver: przeładowano " + a.html_path)
+        if n.tag == "button" || (n.tag == "input" && (kind == "submit" || kind == "button")) is
+            a = focus_node(a, cur)
+            a = invoke_html(a, n.on_click, event_args(a, cur, "", ""))
+            if kind == "submit" || (n.tag == "button" && (dom::get_attr(n, "type") == "" || dom::get_attr(n, "type") == "submit")) is
+                if form_of(a, cur) >= 0 is a = submit_form(a, cur) end
+            end
+            return a
         end
-    end
-    if a.css_path != "" is
-        let m: int = fs::modified_time(a.css_path)
-        if m != a.last_css_mtime is
-            a.sheet = css::parse(fs::read(a.css_path))
-            a.last_css_mtime = m
-            log::info("Silver: przeładowano " + a.css_path)
+        if n.on_click != "" is
+            return invoke_html(a, n.on_click, event_args(a, cur, "", ""))
         end
+        if n.tag == "a" && n.attr_href != "" is
+            a = fire_hook(a, "link", jsonlite::set_str(jsonlite::object(), "href", n.attr_href))
+            emit(a, "silver://link", jsonlite::set_str(jsonlite::object(), "href", n.attr_href))
+            return a
+        end
+        cur = n.parent
     end
     return a
 end
 
-fn handle_click(app: App, pass: RenderPass, x: int, y: int) -> App is
-    let mut a: App = app
-    let content_y: int = y + a.scroll_y   ;; ekran -> współrzędne treści (patrz paint.h#)
+;; ---------- mysz ----------
+fn node_or_neg(a: App, id: int) -> int is
+    if id < 0 || id >= array_len(a.dom.nodes) is return -1 end
+    return id
+end
 
-    let input_id: string = paint::hit_test_input(pass.boxes, pass.rendered_dom, x, content_y)
-    if input_id != "" is
-        a.focused_input = input_id
-        window::start_text_input(a.win)
+fn on_mouse_down(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    a.mouse_x = ev.x
+    a.mouse_y = ev.y
+    let hit: int = node_or_neg(a, paint::hit_test_at(a.boxes, ev.x, ev.y, a.scroll_y))
+    a.active_node = hit
+    if ev.code == 1 is
+        let target: int = paint::find_handler_node(a.dom, hit, "input")
+        if target >= 0 && is_text_field(a.dom.nodes[target]) && !a.dom.nodes[target].disabled is
+            a = focus_node(a, target)
+            let pos: int = caret_from_point(a, target, ev.x, ev.y)
+            let v: string = a.dom.nodes[target].attr_value
+            let mut e: edit::Edit = edit::make(v, pos, pos)
+            if ev.clicks >= 3 is
+                e = edit::select_all(e)
+            elsif ev.clicks == 2 is
+                e = edit::select_word_at(e, pos)
+            elsif ev.mods % 2 == 1 is
+                e = edit::make(v, pos, a.anchor_pos)
+            end
+            a.cursor_pos = e.cursor
+            a.anchor_pos = e.anchor
+            a.dragging = true
+            a = reset_caret(a)
+        elsif target < 0 || !is_text_field(a.dom.nodes[target]) is
+            let focusable: int = find_focusable_ancestor(a, hit)
+            if focusable >= 0 is
+                a = focus_node(a, focusable)
+            else is
+                a = blur_current(a)
+            end
+        end
+    end
+    dom_event(a, "mousedown", hit, jsonlite::set_int(jsonlite::set_int(jsonlite::object(), "x", ev.x), "y", ev.y))
+    if a.state_css is a.dirty_layout = true end
+    a.dirty_paint = true
+    return a
+end
+
+fn find_focusable_ancestor(a: App, start: int) -> int is
+    let mut cur: int = start
+    while cur >= 0 is
+        if is_focusable(a.dom.nodes[cur]) is return cur end
+        cur = a.dom.nodes[cur].parent
+    end
+    return -1
+end
+
+fn on_mouse_up(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    a.mouse_x = ev.x
+    a.mouse_y = ev.y
+    a.dragging = false
+    let hit: int = node_or_neg(a, paint::hit_test_at(a.boxes, ev.x, ev.y, a.scroll_y))
+    let started: int = a.active_node
+    a.active_node = -1
+    dom_event(a, "mouseup", hit, "")
+    if ev.code == 1 && hit >= 0 && started >= 0 is
+        ;; kliknięcie = puszczenie nad tym samym „obszarem klikalnym” co wciśnięcie
+        let h_click: int = paint::find_handler_node(a.dom, hit, "click")
+        let s_click: int = paint::find_handler_node(a.dom, started, "click")
+        let same_area: bool = hit == started || (h_click >= 0 && h_click == s_click)
+        let text_field_press: bool = paint::find_handler_node(a.dom, started, "input") >= 0 && is_text_field(a.dom.nodes[paint::find_handler_node(a.dom, started, "input")])
+        if same_area && !text_field_press is
+            a = do_click(a, hit, ev.x, ev.y)
+        elsif same_area is
+            dom_event(a, "click", hit, "")
+        end
+        if ev.clicks == 2 is dom_event(a, "dblclick", hit, "") end
+    end
+    if ev.code == 3 is dom_event(a, "contextmenu", hit, "") end
+    if a.state_css is a.dirty_layout = true end
+    a.dirty_paint = true
+    return a
+end
+
+fn on_mouse_move(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    a.mouse_x = ev.x
+    a.mouse_y = ev.y
+    let hit: int = node_or_neg(a, paint::hit_test_at(a.boxes, ev.x, ev.y, a.scroll_y))
+    if a.dragging && a.focused_node >= 0 && ev.code % 2 == 1 is
+        let pos: int = caret_from_point(a, a.focused_node, ev.x, ev.y)
+        if pos != a.cursor_pos is
+            a.cursor_pos = pos
+            a.dirty_paint = true
+            a = reset_caret(a)
+        end
+    end
+    if hit != a.hovered_node is
+        let old: int = a.hovered_node
+        a.hovered_node = hit
+        if old >= 0 is dom_event(a, "mouseleave", old, "") end
+        if hit >= 0 is
+            dom_event(a, "mouseenter", hit, "")
+            let hn: int = paint::find_handler_node(a.dom, hit, "hover")
+            if hn >= 0 is
+                let prev_hn: int = if old >= 0 then paint::find_handler_node(a.dom, old, "hover") else -1
+                if hn != prev_hn is a = invoke_html(a, a.dom.nodes[hn].on_hover, event_args(a, hn, "", "")) end
+            end
+        end
+        if a.state_css is a.dirty_layout = true end
+        a.dirty_paint = true
+    end
+    let mut want: string = paint::cursor_at(a.boxes, ev.x, ev.y, a.scroll_y)
+    if hit >= 0 && paint::find_handler_node(a.dom, hit, "input") >= 0 && is_text_field(a.dom.nodes[paint::find_handler_node(a.dom, hit, "input")]) is want = "text" end
+    if want != a.cur_cursor is
+        a.cur_cursor = want
+        window::set_cursor(a.win, want)
+    end
+    return a
+end
+
+fn max_page_scroll(a: App) -> int is
+    let m: int = a.doc_h - a.viewport_h
+    if m < 0 is return 0 end
+    return m
+end
+
+fn scroll_page_to(a0: App, y: int) -> App is
+    let mut a: App = a0
+    let mut v: int = y
+    if v > max_page_scroll(a) is v = max_page_scroll(a) end
+    if v < 0 is v = 0 end
+    if v != a.scroll_y is
+        a.scroll_y = v
+        a.dirty_paint = true
+        dom_event(a, "scroll", 0, jsonlite::set_int(jsonlite::object(), "y", v))
+    end
+    return a
+end
+
+fn on_scroll(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    let dy: int = 0 - ev.y
+    if ev.mods % 2 == 1 && dy == 0 is return a end
+    let cont: int = paint::scroll_container_at(a.boxes, a.dom, ev.x, ev.y, a.scroll_y)
+    if cont >= 0 is
+        let cur: int = get_pair(a.elem_scroll, cont)
+        let mx: int = paint::max_scroll_of(a.boxes, cont)
+        let target: int = cur + dy
+        let clamped: int = if target < 0 then 0 elsif target > mx then mx else target
+        if clamped != cur is
+            a.elem_scroll = set_pair(a.elem_scroll, cont, clamped)
+            a.dirty_layout = true
+            dom_event(a, "scroll", cont, jsonlite::set_int(jsonlite::object(), "y", clamped))
+            return a
+        end
+    end
+    return scroll_page_to(a, a.scroll_y + dy)
+end
+
+;; ---------- klawiatura ----------
+fn key_payload(ev: window::InputEvent) -> string is
+    let mut j: string = mods_json(ev.mods)
+    j = jsonlite::set_str(j, "key", key_name(ev.code))
+    j = jsonlite::set_int(j, "code", ev.code)
+    j = jsonlite::set_bool(j, "repeat", ev.repeat)
+    return j
+end
+
+fn on_key_down(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    let node: int = a.focused_node
+    let payload: string = key_payload(ev)
+    dom_event(a, "keydown", if node >= 0 then node else 0, payload)
+    a = fire_hook(a, "keydown", payload)
+    ;; on-keydown na polu z fokusem lub jego przodkach
+    let mut cur: int = node
+    while cur >= 0 is
+        if a.dom.nodes[cur].on_keydown != "" is
+            a = invoke_html(a, a.dom.nodes[cur].on_keydown, event_args(a, cur, "key", key_name(ev.code)))
+            break
+        end
+        cur = a.dom.nodes[cur].parent
+    end
+    let cmd: bool = (ev.mods / 2) % 2 == 1 || (ev.mods / 8) % 2 == 1
+    let shift: bool = ev.mods % 2 == 1
+    let code: int = ev.code
+    if node >= 0 && is_text_field(a.dom.nodes[node]) is
+        return field_key(a, node, code, cmd, shift, ev)
+    end
+    if code == 9 is
+        return focus_node(a, next_focus(a, !shift))
+    end
+    if node >= 0 && (code == 13 || code == 32 || code == 1073741912) is
+        let n: dom::DomNode = a.dom.nodes[node]
+        if n.tag != "select" || code != 32 is return do_click(a, node, a.mouse_x, a.mouse_y) end
+        return cycle_select(a, node, 1)
+    end
+    if node >= 0 && a.dom.nodes[node].tag == "select" && (code == 1073741905 || code == 1073741903) is return cycle_select(a, node, 1) end
+    if node >= 0 && a.dom.nodes[node].tag == "select" && (code == 1073741906 || code == 1073741904) is return cycle_select(a, node, 0 - 1) end
+    if code == 27 is return blur_current(a) end
+    if code == 1073741906 is return scroll_page_to(a, a.scroll_y - 40) end
+    if code == 1073741905 is return scroll_page_to(a, a.scroll_y + 40) end
+    if code == 1073741899 is return scroll_page_to(a, a.scroll_y - a.viewport_h + 40) end
+    if code == 1073741902 || (code == 32 && !shift) is return scroll_page_to(a, a.scroll_y + a.viewport_h - 40) end
+    if code == 1073741898 && cmd is return scroll_page_to(a, 0) end
+    if code == 1073741901 && cmd is return scroll_page_to(a, max_page_scroll(a)) end
+    return a
+end
+
+fn apply_move(a0: App, e: edit::Edit) -> App is
+    let mut a: App = a0
+    a.cursor_pos = e.cursor
+    a.anchor_pos = e.anchor
+    return reset_caret(a)
+end
+
+fn field_key(a0: App, node: int, code: int, cmd: bool, shift: bool, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    let n: dom::DomNode = a.dom.nodes[node]
+    let multiline: bool = n.tag == "textarea"
+    let e: edit::Edit = field_edit(a)
+    let editable: bool = !n.disabled && !n.readonly
+    if code == 27 is return blur_current(a) end
+    if code == 9 is return focus_node(a, next_focus(a, !shift)) end
+    if cmd && code == 97 is return apply_move(a, edit::select_all(e)) end
+    if cmd && code == 99 is
+        if edit::has_selection(e) is window::clipboard_set(edit::selected_text(e)) end
         return a
     end
-    if a.focused_input != "" is
-        a.focused_input = ""
-        window::stop_text_input(a.win)
-    end
-
-    ;; Rozbudowa v0.2: `hit_test_any` (bez filtra on-click) dla
-    ;; `active_node` — CSS `:active` ma działać na KAŻDYM elemencie ze
-    ;; stylem, nie tylko klikalnym. Dispatch komendy niżej wciąż używa
-    ;; osobnego, filtrowanego `hit_test`.
-    a.active_node = paint::hit_test_any(pass.boxes, x, content_y)
-
-    let hit: int = paint::hit_test(pass.boxes, pass.rendered_dom, x, content_y)
-    if hit >= 0 is
-        let handler_name: string = pass.rendered_dom.nodes[hit].on_click
-        if ipc::has(a.router, handler_name) is
-            let result: string = ipc::dispatch_from(a.router, handler_name, "{}", "html")
-            log::debug("Silver: komenda '" + handler_name + "' -> " + result)
+    if cmd && code == 120 is
+        if edit::has_selection(e) && editable is
+            window::clipboard_set(edit::selected_text(e))
+            return commit_edit(a, edit::delete_selection(e))
         end
+        return a
+    end
+    if cmd && code == 118 is
+        if editable is return insert_text(a, window::clipboard_get()) end
+        return a
+    end
+    if code == 8 && editable is return commit_edit(a, edit::backspace(e, cmd)) end
+    if code == 127 && editable is return commit_edit(a, edit::delete_forward(e, cmd)) end
+    if code == 1073741904 is return apply_move(a, edit::move_left(e, cmd, shift)) end
+    if code == 1073741903 is return apply_move(a, edit::move_right(e, cmd, shift)) end
+    if code == 1073741898 is return apply_move(a, edit::move_home(e, shift, multiline && !cmd)) end
+    if code == 1073741901 is return apply_move(a, edit::move_end(e, shift, multiline && !cmd)) end
+    if multiline && code == 1073741906 is return apply_move(a, edit::move_vertical(e, 0 - 1, shift)) end
+    if multiline && code == 1073741905 is return apply_move(a, edit::move_vertical(e, 1, shift)) end
+    if code == 13 || code == 1073741912 is
+        if multiline && editable is return insert_text(a, "\n") end
+        return submit_form(a, node)
     end
     return a
 end
 
-;; Rozbudowa v0.2: zeruje `active_node` na puszczenie przycisku myszy —
-;; niezależnie OD TEGO, gdzie mysz jest w tym momencie (jak w prawdziwym
-;; CSS: `:active` trwa do `mouse_up`, nawet jeśli kursor zjechał z
-;; elementu w międzyczasie — to celowe uproszczenie względem pełnej
-;; specyfikacji, gdzie zjechanie kursorem może wcześniej ubić `:active`
-;; przez zmianę hover-chain; tu tego nie replikujemy).
-fn handle_mouse_up(app: App) -> App is
-    let mut a: App = app
-    a.active_node = -1
+fn on_text(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    if a.focused_node < 0 is return a end
+    return insert_text(a, ev.text)
+end
+
+fn on_text_edit(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    if a.focused_node < 0 is return a end
+    a.ime = ev.text
+    a.dirty_paint = true
     return a
 end
 
-;; Rozbudowa v0.2: hit-test pod kursorem myszy dla CSS `:hover`, teraz
-;; przez `hit_test_any` (bez filtra on-click) — działa na KAŻDYM
-;; elemencie ze stylem, nie tylko klikalnym. Zawsze aktualizuje
-;; `hovered_node` — to `run()` (wołający) decyduje, czy realna zmiana
-;; wymaga przemalowania (`dirty`), żeby nie odświeżać ekranu na każdy
-;; mikroruch myszy nad tym samym elementem.
-fn handle_mouse_move(app: App, pass: RenderPass, x: int, y: int) -> App is
-    let mut a: App = app
-    let content_y: int = y + a.scroll_y
-    a.hovered_node = paint::hit_test_any(pass.boxes, x, content_y)
-    return a
+fn on_drop(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    let mut j: string = jsonlite::set_str(jsonlite::object(), if ev.kind == "drop_file" then "path" else "text", ev.text)
+    j = jsonlite::set_int(jsonlite::set_int(j, "x", a.mouse_x), "y", a.mouse_y)
+    let hit: int = node_or_neg(a, paint::hit_test_at(a.boxes, a.mouse_x, a.mouse_y, a.scroll_y))
+    dom_event(a, "drop", if hit >= 0 then hit else 0, j)
+    emit(a, "silver://drop", j)
+    return fire_hook(a, ev.kind, j)
 end
 
-pub fn run(app: App) is
-    let mut a: App = app
-    log::info("Silver: uruchamianie " + a.win.title + " (" +
-        to_string(a.win.width) + "x" + to_string(a.win.height) + ")")
+fn on_resize(a0: App, ev: window::InputEvent) -> App is
+    let mut a: App = a0
+    a.viewport_w = ev.x
+    a.viewport_h = ev.y
+    a.dirty_layout = true
+    let mut j: string = jsonlite::set_int(jsonlite::object(), "w", ev.x)
+    j = jsonlite::set_int(j, "h", ev.y)
+    j = jsonlite::set_int(j, "scale", ev.code)
+    dom_event(a, "resize", 0, j)
+    return fire_hook(a, "resize", j)
+end
 
-    let mut frame_count: int = 0
-    let mut pass: RenderPass = compute(a)
-    paint_pass(a, pass)
-
-    while window::is_open(a.win) is
-        let ev: window::InputEvent = window::poll(a.win)
-        let mut dirty: bool = false
-
-        if ev.kind == "quit" is
-            break
-        elsif ev.kind == "mouse_down" is
-            a = handle_click(a, pass, ev.x, ev.y)
-            a = a.on_tick(a)
-            dirty = true
-        elsif ev.kind == "mouse_up" is
-            if a.active_node != -1 is
-                a = handle_mouse_up(a)
-                dirty = true
-            end
-        elsif ev.kind == "mouse_move" is
-            let before_hover: int = a.hovered_node
-            a = handle_mouse_move(a, pass, ev.x, ev.y)
-            if a.hovered_node != before_hover is dirty = true end
-        elsif ev.kind == "text" && a.focused_input != "" is
-            let cur: string = jsonval::get_str(a.input_values, a.focused_input)
-            a.input_values = jsonval::obj_set(a.input_values, a.focused_input, jsonval::str(cur + ev.text))
-            dirty = true
-        elsif ev.kind == "key_down" && a.focused_input != "" && ev.code == key_backspace() is
-            let cur: string = jsonval::get_str(a.input_values, a.focused_input)
-            if string_len(cur) > 0 is
-                let trimmed: string = string_slice(cur, 0, string_len(cur) - 1)
-                a.input_values = jsonval::obj_set(a.input_values, a.focused_input, jsonval::str(trimmed))
-                dirty = true
-            end
-        elsif ev.kind == "scroll" is
-            a.scroll_y = a.scroll_y - ev.y
-            if a.scroll_y < 0 is a.scroll_y = 0 end
-            dirty = true
-        elsif ev.kind == "resize" is
-            emit(a, "silver://resize", "{\"width\": \"" + to_string(ev.x) + "\", \"height\": \"" + to_string(ev.y) + "\"}")
-            dirty = true
-        elsif ev.kind == "focus_gained" is
-            emit(a, "silver://focus", "{}")
-        elsif ev.kind == "focus_lost" is
-            emit(a, "silver://blur", "{}")
+fn handle_event(a0: App, ev: window::InputEvent) -> App is
+    let k: string = ev.kind
+    if k == "mouse_move" is return on_mouse_move(a0, ev) end
+    if k == "mouse_down" is return on_mouse_down(a0, ev) end
+    if k == "mouse_up" is return on_mouse_up(a0, ev) end
+    if k == "key_down" is return on_key_down(a0, ev) end
+    if k == "text" is return on_text(a0, ev) end
+    if k == "text_edit" is return on_text_edit(a0, ev) end
+    if k == "scroll" is return on_scroll(a0, ev) end
+    if k == "resize" is return on_resize(a0, ev) end
+    if k == "drop_file" || k == "drop_text" is return on_drop(a0, ev) end
+    let mut a: App = a0
+    if k == "quit" is
+        a.running = false
+    elsif k == "key_up" is
+        dom_event(a, "keyup", if a.focused_node >= 0 then a.focused_node else 0, key_payload(ev))
+    elsif k == "focus_gained" is
+        a.has_focus = true
+        a = reset_caret(a)
+        a = fire_hook(a, "window_focus", "{}")
+        emit(a, "silver://focus", "{}")
+    elsif k == "focus_lost" is
+        a.has_focus = false
+        a.dirty_paint = true
+        a = fire_hook(a, "window_blur", "{}")
+        emit(a, "silver://blur", "{}")
+    elsif k == "mouse_leave" is
+        if a.hovered_node >= 0 is
+            dom_event(a, "mouseleave", a.hovered_node, "")
+            a.hovered_node = -1
+            if a.state_css is a.dirty_layout = true end
+            a.dirty_paint = true
         end
-
-        let dr: DrainResult = drain_js_invokes(a)
-        a = dr.app
-        if dr.handled is
-            a = a.on_tick(a)
-            dirty = true
-        end
-
-        frame_count += 1
-        if a.dev_mode && frame_count % 30 == 0 is
-            let before_html: int = a.last_html_mtime
-            let before_css: int = a.last_css_mtime
-            a = check_hot_reload(a)
-            if a.last_html_mtime != before_html || a.last_css_mtime != before_css is
-                dirty = true
-            end
-        end
-
-        if dirty is
-            pass = compute(a)
-            paint_pass(a, pass)
-        end
-
-        ffi_shim::silver_delay(16)
+    elsif k == "expose" is
+        a.dirty_paint = true
     end
+    return a
+end
 
+;; ---------- układ, przejścia, render ----------
+fn same_color(x: style::Color, y: style::Color) -> bool is
+    return x.r == y.r && x.g == y.g && x.b == y.b && x.a == y.a
+end
+
+fn lerp_color(x: style::Color, y: style::Color, t: int) -> style::Color is
+    return style::Color { r: x.r + (y.r - x.r) * t / 1000, g: x.g + (y.g - x.g) * t / 1000,
+                          b: x.b + (y.b - x.b) * t / 1000, a: x.a + (y.a - x.a) * t / 1000 }
+end
+
+fn find_anim(anims: [Anim], node: int) -> int is
+    let mut i: int = 0
+    while i < array_len(anims) is
+        if anims[i].node == node is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; wartości aktualnie WYŚWIETLANE dla węzła (z uwzględnieniem trwającej animacji)
+fn displayed_bg(a: App, node: int, target: style::Color, now: int) -> style::Color is
+    let k: int = find_anim(a.anims, node)
+    if k < 0 is return target end
+    let an: Anim = a.anims[k]
+    let t: int = if an.dur > 0 then (now - an.start) * 1000 / an.dur else 1000
+    if t >= 1000 is return target end
+    return lerp_color(an.from_bg, target, t)
+end
+
+;; Wykrywa zmiany bg/color/opacity elementów z `transition` i uruchamia animacje.
+fn detect_transitions(a0: App, now: int) -> App is
+    let mut a: App = a0
+    let n: int = array_len(a.dom.nodes)
+    let had_prev: bool = array_len(a.prev_bg) == n
+    let mut nbg: [style::Color] = []
+    let mut nfg: [style::Color] = []
+    let mut nop: [int] = []
+    let mut i: int = 0
+    while i < n is
+        nbg = array_push(nbg, style::transparent())
+        nfg = array_push(nfg, style::black())
+        nop = array_push(nop, 100)
+        i += 1
+    end
+    i = 0
+    while i < array_len(a.boxes) is
+        let b: layout::LayoutBox = a.boxes[i]
+        i += 1
+        if b.kind != "box" || b.node_id >= n is continue end
+        let st: style::ComputedStyle = b.st
+        let target_bg: style::Color = if st.has_bg then st.background else style::transparent()
+        nbg[b.node_id] = target_bg
+        nfg[b.node_id] = st.color
+        nop[b.node_id] = st.opacity
+        if had_prev && st.trans_ms > 0 is
+            let changed: bool = !same_color(a.prev_bg[b.node_id], target_bg) || !same_color(a.prev_fg[b.node_id], st.color) ||
+                                a.prev_op[b.node_id] != st.opacity
+            if changed is
+                let cur_bg: style::Color = displayed_bg(a, b.node_id, a.prev_bg[b.node_id], now)
+                let k: int = find_anim(a.anims, b.node_id)
+                let mut from_fg: style::Color = a.prev_fg[b.node_id]
+                let mut from_op: int = a.prev_op[b.node_id]
+                if k >= 0 is
+                    from_fg = a.anims[k].from_fg
+                    from_op = a.anims[k].from_op
+                end
+                let an: Anim = Anim { node: b.node_id, start: now, dur: st.trans_ms, from_bg: cur_bg, from_fg: from_fg, from_op: from_op }
+                if k >= 0 is
+                    a.anims[k] = an
+                else is
+                    a.anims = array_push(a.anims, an)
+                end
+            end
+        end
+    end
+    a.prev_bg = nbg
+    a.prev_fg = nfg
+    a.prev_op = nop
+    return a
+end
+
+;; Kopia boxów z nałożonymi trwającymi animacjami; usuwa zakończone.
+fn animated_boxes(a0: App, now: int) -> [layout::LayoutBox] is
+    let a: App = a0
+    if array_len(a.anims) == 0 is return a.boxes end
+    let mut out: [layout::LayoutBox] = a.boxes
+    let mut i: int = 0
+    while i < array_len(out) is
+        let k: int = find_anim(a.anims, out[i].node_id)
+        if k >= 0 is
+            let an: Anim = a.anims[k]
+            let t: int = if an.dur > 0 then (now - an.start) * 1000 / an.dur else 1000
+            if t < 1000 is
+                let st: style::ComputedStyle = out[i].st
+                let target_bg: style::Color = if st.has_bg then st.background else style::transparent()
+                out[i].st.background = lerp_color(an.from_bg, target_bg, t)
+                out[i].st.has_bg = out[i].st.background.a > 0
+                out[i].st.color = lerp_color(an.from_fg, st.color, t)
+                out[i].st.opacity = an.from_op + (st.opacity - an.from_op) * t / 1000
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+fn prune_anims(a0: App, now: int) -> App is
+    let mut a: App = a0
+    if array_len(a.anims) == 0 is return a end
+    let mut keep: [Anim] = []
+    let mut i: int = 0
+    while i < array_len(a.anims) is
+        let an: Anim = a.anims[i]
+        if now - an.start < an.dur is keep = array_push(keep, an) end
+        i += 1
+    end
+    a.anims = keep
+    return a
+end
+
+fn interaction_state(a: App) -> css::InteractionState is
+    let mut ix: css::InteractionState = css::interaction(a.hovered_node, a.focused_node, a.active_node)
+    ix.viewport_w = a.viewport_w
+    ix.viewport_h = a.viewport_h
+    ix.dark = a.dark
+    return ix
+end
+
+fn page_background(a: App) -> style::Color is
+    let mut i: int = 0
+    let mut found: bool = false
+    let mut col: style::Color = if a.dark then style::Color { r: 32, g: 33, b: 36, a: 255 } else a.bg
+    while i < array_len(a.boxes) is
+        let b: layout::LayoutBox = a.boxes[i]
+        i += 1
+        if b.kind != "box" || !b.st.has_bg is continue end
+        let tag: string = a.dom.nodes[b.node_id].tag
+        if tag == "html" || tag == "body" is
+            col = b.st.background
+            found = true
+        end
+    end
+    return col
+end
+
+fn relayout(a0: App, now: int) -> App is
+    let mut a: App = a0
+    a.viewport_w = window::ffi_width(a.win)
+    a.viewport_h = window::ffi_height(a.win)
+    let res: layout::LayoutResult = layout::layout_full(a.dom, a.sheet, a.viewport_w, a.viewport_h, a.win.handle,
+                                                        interaction_state(a), a.elem_scroll)
+    a.boxes = res.boxes
+    a.doc_h = res.height
+    let mx: int = max_page_scroll(a)
+    if a.scroll_y > mx is a.scroll_y = mx end
+    a.dirty_layout = false
+    a.dirty_paint = true
+    a = detect_transitions(a, now)
+    ;; IME: podpowiedz pozycję pola
+    if a.focused_node >= 0 && a.focused_node < array_len(a.dom.nodes) is
+        let b: layout::LayoutBox = box_of(a, a.focused_node)
+        window::set_ime_rect(a.win, b.x, b.y - a.scroll_y, b.w, b.h)
+    end
+    return a
+end
+
+fn render_frame(a0: App, now: int) -> App is
+    let mut a: App = a0
+    let phase: bool = ((now - a.caret_t0) / 530) % 2 == 0
+    let rs: paint::RenderState = paint::RenderState {
+        scroll_y: a.scroll_y, focused: a.focused_node, cursor: a.cursor_pos, anchor: a.anchor_pos,
+        caret_on: phase && a.has_focus, ime: a.ime, hovered: a.hovered_node, viewport_h: a.viewport_h
+    }
+    a.caret_phase = phase
+    let boxes: [layout::LayoutBox] = animated_boxes(a, now)
+    paint::render(a.win.handle, boxes, a.dom, rs, page_background(a))
+    window::present(a.win)
+    a.dirty_paint = false
+    return prune_anims(a, now)
+end
+
+;; ---------- motyw, hot reload, zadania ----------
+fn update_theme(a0: App, now: int) -> App is
+    let mut a: App = a0
+    if now - a.last_theme < 1500 && a.last_theme != 0 is return a end
+    a.last_theme = if now == 0 then 1 else now
+    let sys: string = if a.theme == "auto" then window::system_theme() else a.theme
+    let dark: bool = sys == "dark"
+    if dark != a.dark is
+        a.dark = dark
+        a.dirty_layout = true
+    end
+    return a
+end
+
+fn dev_reload(a0: App, now: int) -> App is
+    let mut a: App = a0
+    if !a.dev_mode || now - a.last_dev < 400 is return a end
+    a.last_dev = now
+    let cur: [int] = collect_mtimes(a)
+    if array_len(cur) != array_len(a.mtimes) is
+        a.mtimes = cur
+        return a
+    end
+    let mut html_changed: bool = false
+    let mut css_changed: bool = false
+    let mut js_changed: bool = false
+    let mut i: int = 0
+    while i < array_len(cur) is
+        if cur[i] != a.mtimes[i] is
+            if i == 0 is
+                html_changed = true
+            elsif i <= array_len(a.css_files) is
+                css_changed = true
+            else is
+                js_changed = true
+            end
+        end
+        i += 1
+    end
+    if !html_changed && !css_changed && !js_changed is return a end
+    log::info("silver: hot reload")
+    a.mtimes = cur
+    let focus_id: string = node_attr_id_or_empty(a.dom, a.focused_node)
+    if html_changed is
+        let saved_scroll: int = a.scroll_y
+        a = load_html(a, a.html_path)
+        a.scroll_y = saved_scroll
+    elsif css_changed is
+        a = rebuild_sheet(a)
+    end
+    if html_changed || js_changed is
+        if a.js_handle >= 0 || array_len(a.js_files) > 0 || array_len(a.dom.scripts) > 0 || a.dom.inline_js != "" is
+            a.js_inline_done = false
+            a = restart_js(a)
+        end
+    end
+    if focus_id != "" is a = focus_node(a, dom::find_by_id(a.dom, focus_id)) end
+    return a
+end
+
+;; Zadanie w tle: uruchamia polecenie powłoki; po zakończeniu emituje "silver://task"
+;; i (opcjonalnie) wywołuje komendę routera z {"id","output"}.
+pub fn spawn_task(app: App, id: string, shell_command: string, done_command: string) -> App is
+    let mut a: App = app
+    let handle: string = async_::spawn(shell_command)
+    a.tasks = array_push(a.tasks, Task { id: id, handle: handle, command: done_command })
+    return a
+end
+
+fn poll_tasks(a0: App) -> App is
+    let mut a: App = a0
+    if array_len(a.tasks) == 0 is return a end
+    let mut remaining: [Task] = []
+    let mut i: int = 0
+    while i < array_len(a.tasks) is
+        let t: Task = a.tasks[i]
+        i += 1
+        let r = async_::timeout(t.handle, 0)
+        if !r.ready is
+            remaining = array_push(remaining, t)
+            continue
+        end
+        let mut j: string = jsonlite::set_str(jsonlite::object(), "id", t.id)
+        j = jsonlite::set_str(j, "output", r.value)
+        emit(a, "silver://task", j)
+        a = fire_hook(a, "task", j)
+        a.tasks = remaining
+        if t.command != "" is a = invoke_html(a, t.command, j) end
+        remaining = a.tasks
+    end
+    a.tasks = remaining
+    return a
+end
+
+;; ---------- krok pętli ----------
+fn run_tick(a0: App, now: int) -> App is
+    let mut a: App = a0
+    if a.tick_ms <= 0 is return a end
+    if now - a.last_tick < a.tick_ms is return a end
+    a.last_tick = now
+    return a.on_tick(a)
+end
+
+;; Ile ms można maksymalnie czekać na zdarzenie.
+pub fn next_wait_ms(a: App, now: int) -> int is
+    let mut wait: int = 500
+    if a.tick_ms > 0 && a.tick_ms < wait is wait = a.tick_ms end
+    if array_len(a.anims) > 0 is wait = 8 end
+    if a.focused_node >= 0 && a.has_focus && wait > 60 is wait = 60 end
+    if a.dev_mode && wait > 200 is wait = 200 end
+    if array_len(a.tasks) > 0 && wait > 30 is wait = 30 end
     if a.js_handle >= 0 is
-        js_bridge::js_shutdown(a.js_handle)
+        let t: int = js::js_next_timer_ms(a.js_handle)
+        if t >= 0 && t < wait is
+            wait = t
+            if wait < 1 is wait = 1 end
+        end
+        if js::js_has_jobs(a.js_handle) is wait = 1 end
     end
-    window::close(a.win)
+    if a.dirty_layout || a.dirty_paint is wait = 1 end
+    return wait
 end
+
+pub fn step(a0: App, wait_ms: int) -> App is
+    let mut a: App = a0
+    if wait_ms > 0 is window::wait(wait_ms) end
+    let mut ev: window::InputEvent = window::poll(a.win)
+    let mut guard: int = 0
+    while ev.kind != "none" && guard < 400 is
+        a = handle_event(a, ev)
+        guard += 1
+        ev = window::poll(a.win)
+    end
+    let now: int = ffi_shim::silver_ticks()
+    a = pump_js(a)
+    a = poll_tasks(a)
+    a = run_tick(a, now)
+    a = update_theme(a, now)
+    a = dev_reload(a, now)
+    a = pump_js(a)
+    if a.dirty_layout is a = relayout(a, now) end
+    let blink_changed: bool = a.focused_node >= 0 && a.has_focus && (((now - a.caret_t0) / 530) % 2 == 0) != a.caret_phase
+    if a.dirty_paint || array_len(a.anims) > 0 || blink_changed is
+        a = render_frame(a, now)
+    end
+    if !window::is_open(a.win) is a.running = false end
+    return a
+end
+
+fn prepare(a0: App) -> App is
+    let mut a: App = a0
+    a.running = true
+    a.viewport_w = window::ffi_width(a.win)
+    a.viewport_h = window::ffi_height(a.win)
+    a.last_tick = ffi_shim::silver_ticks()
+    a.mtimes = collect_mtimes(a)
+    a = update_theme(a, ffi_shim::silver_ticks())
+    if array_len(a.boxes) == 0 is a = relayout(a, ffi_shim::silver_ticks()) end
+    a = start_js_if_needed(a)
+    a = fire_hook(a, "ready", "{}")
+    return a
+end
+
+fn finish(a0: App) -> App is
+    let mut a: App = a0
+    if a.js_handle >= 0 is
+        js::js_shutdown(a.js_handle)
+        a.js_handle = -1
+    end
+    if a.win.open is window::close(a.win) end
+    a.running = false
+    return a
+end
+
+;; Główna pętla jednego okna.
+pub fn run(app: App) -> App is
+    let mut a: App = prepare(app)
+    while a.running is
+        a = step(a, next_wait_ms(a, ffi_shim::silver_ticks()))
+    end
+    return finish(a)
+end
+
+;; Wiele okien: każde to osobny App (własny DOM, komendy, JS). Pętla działa,
+;; dopóki otwarte jest choć jedno okno.
+pub fn run_all(apps: [App]) -> [App] is
+    let mut list: [App] = []
+    let mut i: int = 0
+    while i < array_len(apps) is
+        list = array_push(list, prepare(apps[i]))
+        i += 1
+    end
+    let mut alive: bool = true
+    while alive is
+        alive = false
+        let mut wait: int = 500
+        i = 0
+        while i < array_len(list) is
+            if list[i].running is
+                let w: int = next_wait_ms(list[i], ffi_shim::silver_ticks())
+                if w < wait is wait = w end
+            end
+            i += 1
+        end
+        window::wait(wait)
+        i = 0
+        while i < array_len(list) is
+            if list[i].running is
+                list[i] = step(list[i], 0)
+                if list[i].running is
+                    alive = true
+                else is
+                    list[i] = finish(list[i])
+                end
+            end
+            i += 1
+        end
+    end
+    return list
+end
+
+;; ---------- API okna i systemu ----------
+pub fn set_title(app: App, title: string) -> App is
+    window::set_title(app.win, title)
+    return app
+end
+
+pub fn set_fullscreen(app: App, on: bool) -> App is
+    window::set_fullscreen(app.win, on)
+    return app
+end
+
+pub fn set_min_size(app: App, w: int, h: int) -> App is
+    window::set_min_size(app.win, w, h)
+    return app
+end
+
+pub fn set_icon(app: App, path: string) -> App is
+    window::set_icon(app.win, path)
+    return app
+end
+
+pub fn clipboard_get() -> string is return window::clipboard_get() end
+pub fn clipboard_set(text: string) -> bool is return window::clipboard_set(text) end
+pub fn notify(title: string, body: string) -> bool is return window::notify(title, body) end
+
+;; Przewija stronę do pozycji (z limitem).
+pub fn scroll_to(app: App, y: int) -> App is
+    return scroll_page_to(app, y)
+end
+
+pub fn is_dark(app: App) -> bool is return app.dark end
