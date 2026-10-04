@@ -1,0 +1,25 @@
+<div class="app">
+  <header>
+    <h1>Zadania</h1>
+    <span id="counter" class="pill">0</span>
+  </header>
+
+  <form id="add-form" class="add">
+    <input id="new-title" type="text" placeholder="Co jest do zrobienia?" maxlength="80">
+    <button type="submit">Dodaj</button>
+  </form>
+
+  <nav class="filters" id="filters">
+    <button data-filter="all" class="active">Wszystkie</button>
+    <button data-filter="open">Aktywne</button>
+    <button data-filter="done">Zrobione</button>
+  </nav>
+
+  <ul id="list"></ul>
+
+  <footer>
+    <button id="clear-done" class="ghost">Usuń zrobione</button>
+    <button id="export" class="ghost">Eksportuj…</button>
+    <span id="toast" class="toast"></span>
+  </footer>
+</div>
