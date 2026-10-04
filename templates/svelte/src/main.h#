@@ -1,0 +1,31 @@
+use "bit -> silver" from "silver"
+use "std -> fs"      from "fs"
+
+;; Backend w H#: komendy wołane z TypeScriptu przez silver.invoke().
+fn notes_path() -> string is
+    return "notes.json"
+end
+
+fn list_notes(args: string) -> string is
+    if !fs::exists(notes_path()) is
+        return "{{\"notes\": []}}"
+    end
+    return "{{\"notes\": " + fs::read(notes_path()) + "}}"
+end
+
+fn save_notes(args: string) -> string is
+    fs::write(notes_path(), data::get_raw(args, "notes"))
+    return "{{\"ok\": true}}"
+end
+
+fn main() is
+    let mut a = app::new("Notatki (Svelte)", 760, 640)
+    a = app::load_html(a, "frontend/index.html")
+    a = app::load_css(a, "frontend/style.css")
+    a = app::command(a, "list_notes", list_notes)
+    a = app::command(a, "save_notes", save_notes)
+    ;; zbudowany bundle (esbuild) — patrz frontend/package.json
+    a = app::load_js(a, ["frontend/dist/app.js"])
+    a = app::enable_hot_reload(a)
+    app::run(a)
+end
