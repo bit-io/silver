@@ -1,7 +1,9 @@
 mod dom
+mod cssval
 mod css
+mod style
 mod layout
 mod paint
-mod style
 mod template
+mod jsonlite
 mod jsonval
