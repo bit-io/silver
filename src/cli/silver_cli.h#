@@ -1,129 +1,375 @@
-use "std -> fs"  from "fs"
-use "std -> env" from "env"
-use "std -> cli" from "cli"
+mod templates_data
+use "std -> fs"      from "fs"
+use "std -> env"     from "env"
+use "std -> process" from "process"
 
-fn tpl_manifest(name: string) -> string is
-    return "! " + name + " — aplikacja Silver\n\n" +
-        "[package]\n" +
-        "-> name        => " + name + "\n" +
-        "-> version     => 0.2.0\n" +
-        "-> description => Aplikacja desktopowa zbudowana z Silver\n\n" +
-        "[build]\n" +
-        "-> lang   => h#\n" +
-        "-> entry  => src/main.h#\n" +
-        "-> output => build/" + name + "\n\n" +
-        "[deps]\n" +
-        "-> silver => git\n"
+fn version() -> string is
+    return "0.2.0"
 end
 
-fn tpl_main(name: string) -> string is
-    return "use \"bytes -> silver\" from \"app\"\n\n" +
-        "fn greet(args_json: string) -> string is\n" +
-        "    write(\"greet() wywołane z frontendu\")\n" +
-        "    return \"{\\\"message\\\": \\\"Cześć z H#!\\\"}\"\n" +
-        "end\n\n" +
-        "fn main() is\n" +
-        "    let mut a = app::new(\"" + name + "\", 800, 600)\n" +
-        "    a = app::with_font(a, \"frontend/fonts/DejaVuSans.ttf\", 16)\n" +
-        "    a = app::load_html(a, \"frontend/index.html\")\n" +
-        "    a = app::load_css(a, \"frontend/style.css\")\n" +
-        "    a = app::command(a, \"greet\", greet)\n" +
-        "    app::run(a)\n" +
-        "end\n"
+;; ---------- pomocnicze ----------
+;; Uruchamia polecenie powłoki, drukuje jego wyjście i zwraca true przy kodzie 0.
+fn sh(cmd: string) -> bool is
+    let out: string = process::shell("(" + cmd + ") 2>&1 && echo __SILVER_OK__ || echo __SILVER_FAIL__")
+    let ok: bool = string_find(out, "__SILVER_OK__") >= 0
+    let clean: string = string_replace(string_replace(out, "__SILVER_OK__", ""), "__SILVER_FAIL__", "")
+    if string_trim(clean) != "" is write(string_trim(clean)) end
+    return ok
 end
 
-fn tpl_index_html() -> string is
-    return "<div class=\"page\">\n" +
-        "    <div class=\"card\">\n" +
-        "        <h1>Witaj w Silver</h1>\n" +
-        "        <p>Frontend: HTML/CSS. Backend: H#. Bez WebView.</p>\n" +
-        "        <div class=\"button\" id=\"greet-btn\" on-click=\"greet\">\n" +
-        "            <span>Kliknij mnie</span>\n" +
-        "        </div>\n" +
-        "    </div>\n" +
-        "</div>\n"
+fn has_tool(name: string) -> bool is
+    return process::which(name) != ""
 end
 
-fn tpl_style_css() -> string is
-    return ".page {\n    background: #f2f2f5;\n    padding: 24px;\n}\n\n" +
-        ".card {\n    background: white;\n    padding: 20px;\n    border: 1px;\n    border-color: #dddddd;\n}\n\n" +
-        "h1 { color: #202020; font-size: 28px; }\n" +
-        "p  { color: #555555; font-size: 16px; }\n\n" +
-        ".button {\n    background: #3a5edc;\n    padding: 12px;\n}\n" +
-        ".button span { color: white; font-size: 16px; }\n"
+fn replace_all_name(text: string, name: string) -> string is
+    let title: string = name
+    return string_replace(string_replace(text, "__NAME__", name), "__TITLE__", title)
 end
 
-fn tpl_app_js() -> string is
-    return "// Prawdziwy JS jest dostępny przez native/silver_quickjs_shim.c\n" +
-        "// (od v0.2 linkowany statycznie, jak reszta shimów Silver),\n" +
-        "// ale trzeba go jawnie włączyć w src/main.h#:\n" +
-        "//\n" +
-        "//   a = app::load_js(a, [\"<ścieżka-do-pakietu-silver>/src/js/silver_api.js\",\n" +
-        "//                        \"frontend/app.js\"])\n" +
-        "//\n" +
-        "// (dokładna ścieżka do zależności zależy od tego, gdzie `bytes add silver`\n" +
-        "// zwendorował pakiet — patrz build/cache/ po `bytes add silver`).\n" +
-        "// Domyślnie ten szablon używa prostszego on-click=\"...\" w HTML, bez JS.\n" +
-        "//\n" +
-        "// Docelowe API (już gotowe w silver_api.js):\n" +
-        "//   const res = await silver.invoke(\"greet\", {});\n" +
-        "//   silver.listen(\"some-event\", (payload) => { ... });\n"
+fn parent_dir(path: string) -> string is
+    let n: int = string_len(path)
+    let mut i: int = n - 1
+    while i >= 0 is
+        if string_slice(path, i, i + 1) == "/" is return string_slice(path, 0, i) end
+        i -= 1
+    end
+    return ""
 end
 
-fn tpl_gitignore() -> string is
-    ;; v0.2: shimy Silver linkowane statycznie (.a), .so już nie
-    ;; jest domyślnym artefaktem — patrz native/README.md.
-    return "build/\n*.a\n*.o\n"
+fn mkdirs(path: string) is
+    if path == "" || fs::exists(path) is return end
+    mkdirs(parent_dir(path))
+    fs::mkdir(path)
 end
 
-pub fn cmd_new(name: string) -> int is
+fn is_safe_name(name: string) -> bool is
+    let n: int = string_len(name)
+    if n == 0 is return false end
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_slice(name, i, i + 1)
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "-" || c == "_"
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+;; Nazwa pakietu z Bit.hk w bieżącym katalogu ("" gdy brak).
+fn project_name() -> string is
+    if !fs::exists("Bit.hk") is return "" end
+    let lines: [string] = string_split(fs::read("Bit.hk"), "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let l: string = string_trim(lines[i])
+        i += 1
+        if string_starts_with(l, "-> name") is
+            let eq: int = string_find(l, "=>")
+            if eq > 0 is return string_trim(string_slice(l, eq + 2, string_len(l))) end
+        end
+    end
+    return ""
+end
+
+fn project_version() -> string is
+    if !fs::exists("Bit.hk") is return "0.2.0" end
+    let lines: [string] = string_split(fs::read("Bit.hk"), "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let l: string = string_trim(lines[i])
+        i += 1
+        if string_starts_with(l, "-> version") is
+            let eq: int = string_find(l, "=>")
+            if eq > 0 is return string_trim(string_slice(l, eq + 2, string_len(l))) end
+        end
+    end
+    return "0.2.0"
+end
+
+fn has_frontend_build() -> bool is
+    return fs::exists("frontend/package.json")
+end
+
+;; npm install (gdy brak node_modules) + npm run build
+fn build_frontend() -> bool is
+    if !has_frontend_build() is return true end
+    if !has_tool("npm") is
+        write("błąd: frontend ma package.json, ale nie znaleziono `npm` (zainstaluj Node.js)")
+        return false
+    end
+    write("[silver] frontend: npm install + build")
+    if !fs::exists("frontend/node_modules") is
+        if !sh("cd frontend && npm install --no-audit --no-fund") is return false end
+    end
+    return sh("cd frontend && npm run build")
+end
+
+;; ---------- silver new ----------
+fn write_files(root: string, files: [string], name: string) -> int is
+    let mut written: int = 0
+    let mut i: int = 0
+    while i + 1 < array_len(files) is
+        let path: string = root + "/" + files[i]
+        mkdirs(parent_dir(path))
+        fs::write(path, replace_all_name(files[i + 1], name))
+        written += 1
+        i += 2
+    end
+    return written
+end
+
+fn contains(list: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(list) is
+        if list[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn cmd_new(args: [string]) -> int is
+    let mut name: string = ""
+    let mut tpl: string = "vanilla"
+    let mut i: int = 0
+    while i < array_len(args) is
+        let a: string = args[i]
+        i += 1
+        if a == "--template" || a == "-t" is
+            if i < array_len(args) is
+                tpl = args[i]
+                i += 1
+            end
+        elsif a == "--ts" is
+            tpl = "ts_preact"
+        elsif a == "--svelte" is
+            tpl = "svelte"
+        elsif string_starts_with(a, "-") is
+            write("nieznana opcja: " + a)
+            return 1
+        elsif name == "" is
+            name = a
+        end
+    end
     if name == "" is
-        write("użycie: silver new <nazwa>")
+        write("użycie: silver new <nazwa> [--template <szablon>] [--ts] [--svelte]")
+        write("szablony: silver list")
+        return 1
+    end
+    if !is_safe_name(name) is
+        write("błąd: nazwa projektu może zawierać tylko litery, cyfry, '-' i '_'")
+        return 1
+    end
+    if !contains(templates_data::names(), tpl) is
+        write("błąd: nieznany szablon '" + tpl + "' (silver list)")
         return 1
     end
     if fs::exists(name) is
         write("błąd: katalog '" + name + "' już istnieje")
         return 1
     end
-
     fs::mkdir(name)
-    fs::mkdir(name + "/src")
-    fs::mkdir(name + "/frontend")
-    fs::mkdir(name + "/frontend/fonts")
-    fs::mkdir(name + "/build")
-
-    fs::write(name + "/Bytes.hk", tpl_manifest(name))
-    fs::write(name + "/src/main.h#", tpl_main(name))
-    fs::write(name + "/frontend/index.html", tpl_index_html())
-    fs::write(name + "/frontend/style.css", tpl_style_css())
-    fs::write(name + "/frontend/app.js", tpl_app_js())
-    fs::write(name + "/.gitignore", tpl_gitignore())
-
-    write("Utworzono: " + name)
-    write("")
-    write("Uwaga: dołącz font .ttf do frontend/fonts/ (np. DejaVu Sans)")
-    write("       oraz zbuduj native/silver_shim.c -> libsilvershim.a (statycznie)")
-    write("       (patrz native/README.md w repo Silver).")
+    let n1: int = write_files(name, templates_data::files(tpl), name)
+    let n2: int = write_files(name, templates_data::common(), name)
+    ;; domyślny .gitignore
+    if !fs::exists(name + "/.gitignore") is
+        fs::write(name + "/.gitignore", "cache/\nBit.lock.tmp\nnode_modules/\ndist/\n*.o\n*.a\n")
+    end
+    write("Utworzono '" + name + "' z szablonu '" + tpl + "' (" + to_string(n1 + n2) + " plików)")
     write("")
     write("Dalej:")
     write("  cd " + name)
-    write("  bytes add silver")
-    write("  bytes run")
+    write("  bit                 # zainstaluje zależności (silver), zbuduje i uruchomi")
+    if tpl == "ts_preact" || tpl == "svelte" is
+        write("  bit watch           # w drugim terminalu: przebudowa frontendu przy zapisie")
+    end
+    write("  silver doctor       # gdyby czegoś brakowało w systemie")
     return 0
+end
+
+fn cmd_list() -> int is
+    write("Szablony Silver 0.2:")
+    let names: [string] = templates_data::names()
+    let mut i: int = 0
+    while i < array_len(names) is
+        write("  " + names[i] + "  —  " + templates_data::description(names[i]))
+        i += 1
+    end
+    write("")
+    write("silver new <nazwa> --template <szablon>   (skróty: --ts, --svelte)")
+    return 0
+end
+
+;; ---------- dev / build / run ----------
+fn require_project() -> bool is
+    if !fs::exists("Bit.hk") is
+        write("błąd: brak Bit.hk — uruchom w katalogu projektu Silver (silver new …)")
+        return false
+    end
+    return true
+end
+
+fn cmd_build() -> int is
+    if !require_project() is return 1 end
+    if !build_frontend() is return 1 end
+    if !sh("bit build") is return 1 end
+    write("[silver] gotowe")
+    return 0
+end
+
+fn cmd_run() -> int is
+    if !require_project() is return 1 end
+    if !build_frontend() is return 1 end
+    if sh("bit run") is return 0 end
+    return 1
+end
+
+;; Tryb dev: watcher frontendu w tle + aplikacja z hot reload (app::enable_hot_reload).
+fn cmd_dev() -> int is
+    if !require_project() is return 1 end
+    let mut pid: int = -1
+    if has_frontend_build() is
+        if !build_frontend() is return 1 end
+        write("[silver] dev: uruchamiam `npm run watch` w tle")
+        pid = process::spawn("cd frontend && npm run watch")
+    end
+    let ok: bool = sh("bit run")
+    if pid >= 0 is process::kill(pid) end
+    if ok is return 0 end
+    return 1
+end
+
+;; ---------- bundle ----------
+fn binary_path(name: string) -> string is
+    let candidates: [string] = ["cache/build/release/" + name, "cache/build/release/" + name + ".exe", "build/" + name]
+    let mut i: int = 0
+    while i < array_len(candidates) is
+        if fs::exists(candidates[i]) is return candidates[i] end
+        i += 1
+    end
+    return ""
+end
+
+fn cmd_bundle(args: [string]) -> int is
+    if !require_project() is return 1 end
+    let target: string = if array_len(args) > 0 then args[0] else ""
+    if target == "" is
+        write("użycie: silver bundle <appimage | deb | macos | dmg | windows>")
+        return 1
+    end
+    let name: string = project_name()
+    if name == "" is
+        write("błąd: nie mogę odczytać nazwy pakietu z Bit.hk")
+        return 1
+    end
+    if !build_frontend() is return 1 end
+    write("[silver] bit build (release)")
+    if !sh("bit build") is return 1 end
+    let bin: string = binary_path(name)
+    if bin == "" is
+        write("błąd: nie znaleziono binarki (oczekiwano cache/build/release/" + name + ")")
+        return 1
+    end
+    let ver: string = project_version()
+    if target == "appimage" is
+        return if sh("sh packaging/linux/make-appimage.sh " + name + " " + bin + " " + ver) then 0 else 1
+    end
+    if target == "deb" is
+        return if sh("sh packaging/linux/make-deb.sh " + name + " " + bin + " " + ver) then 0 else 1
+    end
+    if target == "macos" is
+        return if sh("sh packaging/macos/make-app.sh " + name + " " + bin + " " + ver) then 0 else 1
+    end
+    if target == "dmg" is
+        return if sh("MAKE_DMG=1 sh packaging/macos/make-app.sh " + name + " " + bin + " " + ver) then 0 else 1
+    end
+    if target == "windows" is
+        return if sh("pwsh packaging/windows/make-installer.ps1 -Name " + name + " -Bin " + bin + " -Version " + ver) then 0 else 1
+    end
+    write("nieznany cel: " + target)
+    return 1
+end
+
+;; ---------- doctor ----------
+fn check(label: string, tool: string, hint: string) -> bool is
+    let p: string = process::which(tool)
+    if p != "" is
+        write("  ok      " + label + "  (" + p + ")")
+        return true
+    end
+    write("  BRAK    " + label + "  — " + hint)
+    return false
+end
+
+fn cmd_doctor() -> int is
+    write("silver doctor (v" + version() + ")")
+    let mut bad: int = 0
+    if !check("bit", "bit", "menedżer pakietów H# (https://github.com/bit-io/bit)") is bad += 1 end
+    if !check("h#", "h#", "kompilator H# (HackerOS)") is bad += 1 end
+    if !check("cc", "cc", "kompilator C potrzebny do native/build.sh (gcc/clang)") is bad += 1 end
+    if !check("sdl2-config", "sdl2-config", "SDL2 dev (apt: libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev)") is bad += 1 end
+    if !check("git", "git", "pobiera QuickJS i zależności bit") is bad += 1 end
+    let node: bool = has_tool("node")
+    if has_frontend_build() is
+        if !check("node", "node", "wymagany przez frontend/package.json") is bad += 1 end
+        if !check("npm", "npm", "wymagany przez frontend/package.json") is bad += 1 end
+    else is
+        write("  (info)  node/npm potrzebne tylko dla szablonów TypeScript/Svelte" + (if node then " — jest" else ""))
+    end
+    let has_dialog: bool = has_tool("zenity") || has_tool("kdialog") || has_tool("osascript")
+    if has_dialog is
+        write("  ok      dialogi natywne (zenity/kdialog/osascript)")
+    else is
+        write("  uwaga   brak zenity/kdialog — dialogi plików nie zadziałają (Linux)")
+    end
+    if fs::exists("Bit.hk") is
+        write("  ok      projekt: " + project_name() + " " + project_version())
+    end
+    if bad == 0 is
+        write("wszystko w porządku")
+        return 0
+    end
+    write("brakuje " + to_string(bad) + " narzędzi")
+    return 1
 end
 
 pub fn main() is
     let a: [string] = env::args()
     if array_len(a) < 2 is
-        write("silver — CLI dla projektów Silver")
+        write("silver " + version() + " — CLI dla projektów Silver")
         write("użycie:")
-        write("  silver new <nazwa>    utwórz nowy projekt z szablonu")
+        write("  silver new <nazwa> [--template <szablon>] [--ts] [--svelte]")
+        write("  silver list                szablony")
+        write("  silver dev                 frontend --watch + aplikacja z hot reload")
+        write("  silver build               frontend (npm) + bit build")
+        write("  silver run                 frontend (npm) + bit run")
+        write("  silver bundle <cel>        appimage | deb | macos | dmg | windows")
+        write("  silver doctor              diagnostyka środowiska")
+        write("  silver version")
         return
     end
     let sub: string = a[1]
+    let mut rest: [string] = []
+    let mut i: int = 2
+    while i < array_len(a) is
+        rest = array_push(rest, a[i])
+        i += 1
+    end
     if sub == "new" is
-        let name: string = if array_len(a) > 2 then a[2] else ""
-        cmd_new(name)
+        cmd_new(rest)
+    elsif sub == "list" is
+        cmd_list()
+    elsif sub == "dev" is
+        cmd_dev()
+    elsif sub == "build" is
+        cmd_build()
+    elsif sub == "run" is
+        cmd_run()
+    elsif sub == "bundle" is
+        cmd_bundle(rest)
+    elsif sub == "doctor" is
+        cmd_doctor()
+    elsif sub == "version" || sub == "--version" || sub == "-V" is
+        write("silver " + version())
     else is
         write("nieznana komenda: " + sub)
     end
