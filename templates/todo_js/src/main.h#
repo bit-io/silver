@@ -1,0 +1,31 @@
+use "bit -> silver" from "silver"
+use "std -> fs"     from "fs"
+
+;; Stan zadań trzymamy w pliku JSON — JS zapisuje i czyta przez komendy H#.
+fn data_path() -> string is
+    return "todos.json"
+end
+
+fn load_todos(args: string) -> string is
+    if !fs::exists(data_path()) is
+        return "{{\"todos\": []}}"
+    end
+    return "{{\"todos\": " + fs::read(data_path()) + "}}"
+end
+
+fn save_todos(args: string) -> string is
+    ;; args = {{"todos": [...]}} — zapisujemy samą tablicę
+    fs::write(data_path(), data::get_raw(args, "todos"))
+    return "{{\"saved\": true}}"
+end
+
+fn main() is
+    let mut a = app::new("Zadania (JS)", 560, 720)
+    a = app::load_html(a, "frontend/index.html")
+    a = app::load_css(a, "frontend/style.css")
+    a = app::command(a, "load_todos", load_todos)
+    a = app::command(a, "save_todos", save_todos)
+    a = app::load_js(a, ["frontend/app.js"])
+    a = app::enable_hot_reload(a)
+    app::run(a)
+end
