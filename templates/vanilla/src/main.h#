@@ -1,20 +1,16 @@
-use "silver -> app" from "app"
+use "bit -> silver" from "silver"
 
 fn greet(args_json: string) -> string is
-    write("greet() wywołane z przycisku w interfejsie")
-    return "{\"message\": \"Cześć z H#!\"}"
+    write("greet() wywołane z frontendu")
+    return "{{\"message\": \"Cześć z H#!\"}}"
 end
 
 fn main() is
-    let mut a = app::new("Moja Aplikacja Silver", 800, 600)
-
-    ;; Bez wskazanego fontu tekst się nie narysuje — dołącz jakiś .ttf
-    ;; do frontend/fonts/ (np. DejaVu Sans, wolna licencja).
-    a = app::with_font(a, "frontend/fonts/DejaVuSans.ttf", 16)
-
+    let mut a = app::new("Silver — vanilla", 800, 600)
     a = app::load_html(a, "frontend/index.html")
     a = app::load_css(a, "frontend/style.css")
     a = app::command(a, "greet", greet)
-
+    a = app::load_js(a, ["frontend/app.js"])
+    a = app::enable_hot_reload(a)
     app::run(a)
 end
