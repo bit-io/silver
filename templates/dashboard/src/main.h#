@@ -1,0 +1,38 @@
+use "bit -> silver" from "silver"
+use "std -> time"   from "time"
+
+;; Zadanie w tle: polecenie powłoki uruchomione asynchronicznie.
+;; Wynik wraca jako zdarzenie "silver://task" (JS) oraz do komendy `on_task_done`.
+fn on_task_done(args: string) -> string is
+    return ui::only(ui::set_text("task-out", data::get_str(args, "output")))
+end
+
+fn start_task(args: string) -> string is
+    ;; spawn_task wymaga App — dlatego ustawiamy flagę w stanie i robimy to w on_tick
+    return ui::only(ui::set_state("run_task", "1"))
+end
+
+fn on_tick(a: app::App) -> app::App is
+    let mut x: app::App = a
+    ;; zegar: odświeżany co sekundę
+    x = app::set_text(x, "clock", time::format(time::now_unix(), "%H:%M:%S"))
+    if app::state(x, "run_task") == "1" is
+        x = app::set_state(x, "run_task", "0")
+        x = app::spawn_task(x, "uname", "uname -a", "on_task_done")
+    end
+    return x
+end
+
+fn main() is
+    let mut a = app::new("Pulpit", 960, 640)
+    a = app::load_html(a, "frontend/index.html")
+    a = app::load_css(a, "frontend/style.css")
+    a = app::command(a, "start_task", start_task)
+    a = app::command(a, "on_task_done", on_task_done)
+    a = app::on_tick(a, on_tick)
+    a = app::set_tick_interval(a, 1000)
+    a = app::set_state(a, "run_task", "0")
+    a = app::load_js(a, ["frontend/app.js"])
+    a = app::enable_hot_reload(a)
+    app::run(a)
+end
