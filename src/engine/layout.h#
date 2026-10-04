@@ -2,6 +2,7 @@ mod ffi_shim
 mod dom
 mod css
 mod style
+mod cssval
 
 pub struct LayoutBox is
     pub node_id: int
@@ -10,387 +11,1583 @@ pub struct LayoutBox is
     pub w: int
     pub h: int
     pub st:      style::ComputedStyle
-    pub text:    string   ;; niepuste = rysuj tekst (liść inline)
-    pub img_src: string    ;; niepuste = rysuj obrazek (liść <img>)
+    pub text:    string   ;; niepuste = tekst do narysowania
+    pub img_src: string   ;; niepuste = obrazek
+    pub kind:    string   ;; "box" | "text" | "inlinebg" | "marker"
+    pub has_clip: bool
+    pub cx: int
+    pub cy: int
+    pub cw: int
+    pub ch: int
+    pub fixed:   bool     ;; position: fixed — nie przewija się z dokumentem
+    pub content_h: int    ;; pełna wysokość treści (dla pasków przewijania)
+    pub scroll_y:  int    ;; zastosowane przesunięcie przewijania kontenera
 end
 
 pub struct LayoutResult is
     pub boxes:  [LayoutBox]
+    pub height: int       ;; wysokość dokumentu
+end
+
+pub struct LayoutCtx is
+    pub dom:    dom::Dom
+    pub styles: [style::ComputedStyle]
+    pub win:    int
+    pub vw:     int
+    pub vh:     int
+    pub scrolls: [int]    ;; płaskie pary [id, offset, id, offset, …]
+end
+
+struct BlockRes is
+    pub boxes: [LayoutBox]
+    pub w:  int      ;; szerokość ramki (border-box)
+    pub h:  int      ;; wysokość ramki
+    pub mt: int
+    pub mb: int
+    pub ml: int
+    pub mr: int
+end
+
+struct Atom is
+    pub kind:  string   ;; word | box | br | open | close
+    pub text:  string
+    pub w:     int
+    pub h:     int
+    pub owner: int
+    pub deco:  int
+    pub sp:    bool
+    pub sw:    int      ;; szerokość spacji przed atomem
+    pub frag:  [LayoutBox]
+end
+
+struct InlineRes is
+    pub boxes:  [LayoutBox]
     pub height: int
+    pub used_w: int
 end
 
-;; ---------- pomiar tekstu ----------
+fn auto_v() -> int is return style::auto_val() end
 
-fn est_text_width(text: string, font_size: int) -> int is
-    return string_len(text) * font_size * 58 / 100
+pub fn no_clip_box(node_id: int, x: int, y: int, w: int, h: int, st: style::ComputedStyle, kind: string) -> LayoutBox is
+    return LayoutBox {
+        node_id: node_id, x: x, y: y, w: w, h: h, st: st, text: "", img_src: "", kind: kind,
+        has_clip: false, cx: 0, cy: 0, cw: 0, ch: 0, fixed: false, content_h: 0, scroll_y: 0
+    }
 end
 
-;; `win_handle >= 0` -> realny pomiar przez zainicjowany font w oknie.
-;; `win_handle == -1` -> szacowanie (np. testy jednostkowe bez SDL).
-fn measure_text(win_handle: int, text: string, font_size: int) -> int is
-    if win_handle < 0 is return est_text_width(text, font_size) end
-    let w: int = ffi_shim::silver_measure_text(win_handle, text)
-    if w <= 0 is return est_text_width(text, font_size) end
-    return w
-end
-
-;; Rozbudowa v0.2: `resolve_ctx` zamiast `resolve` — silnik layoutu ma
-;; pełne `dom::Dom`, więc dostaje za darmo wsparcie dla selektorów
-;; potomka/dziecka/rodzeństwa (".card p", ".a > .b", ".a + .b",
-;; ".a ~ .b") i pseudoklas `:hover`/`:focus` (przez `interaction`),
-;; których stary `resolve` (używany np. w testach bez pełnego drzewa)
-;; nie potrafi rozwiązać.
-fn node_style(dom: dom::Dom, sheet: css::Stylesheet, node_id: int, inherited: style::ComputedStyle, interaction: css::InteractionState) -> style::ComputedStyle is
-    return style::resolve_ctx(sheet, dom, node_id, inherited, interaction)
-end
-
-fn collect_text(dom: dom::Dom, node_id: int) -> string is
-    let n: dom::DomNode = dom.nodes[node_id]
-    if n.tag == "text" is return n.text end
-    let mut out: string = ""
-    let count: int = array_len(n.children)
+fn concat_boxes(a: [LayoutBox], b: [LayoutBox]) -> [LayoutBox] is
+    let mut out: [LayoutBox] = a
     let mut i: int = 0
-    while i < count is
-        let child_text: string = collect_text(dom, n.children[i])
+    while i < array_len(b) is
+        out = array_push(out, b[i])
         i += 1
-        if child_text == "" is continue end
-        if out != "" is out = out + " " end
-        out = out + child_text
     end
     return out
 end
 
-fn is_inline(dom: dom::Dom, sheet: css::Stylesheet, node_id: int, inherited: style::ComputedStyle, interaction: css::InteractionState) -> bool is
-    return node_style(dom, sheet, node_id, inherited, interaction).display == "inline"
-end
-
-;; Rozmiar <img>: jawny CSS wygrywa; inaczej naturalny rozmiar pliku
-;; (przez FFI, jeśli mamy okno); inaczej 100x100.
-fn image_size(win_handle: int, path: string, st: style::ComputedStyle) -> LayoutBox is
-    let mut w: int = st.width
-    let mut h: int = st.height
-    if (w < 0 || h < 0) && win_handle >= 0 is
-        let nat_w: int = ffi_shim::silver_image_width(win_handle, path)
-        let nat_h: int = ffi_shim::silver_image_height(win_handle, path)
-        if w < 0 is w = if nat_w > 0 then nat_w else 100 end end
-        if h < 0 is h = if nat_h > 0 then nat_h else 100 end end
-    else is
-        if w < 0 is w = 100 end
-        if h < 0 is h = 100 end
+fn shift_boxes(boxes: [LayoutBox], dx: int, dy: int) -> [LayoutBox] is
+    if dx == 0 && dy == 0 is return boxes end
+    let mut out: [LayoutBox] = boxes
+    let mut i: int = 0
+    while i < array_len(out) is
+        out[i].x = out[i].x + dx
+        out[i].y = out[i].y + dy
+        if out[i].has_clip is
+            out[i].cx = out[i].cx + dx
+            out[i].cy = out[i].cy + dy
+        end
+        i += 1
     end
-    return LayoutBox { node_id: -1, x: 0, y: 0, w: w, h: h, st: st, text: "", img_src: path }
+    return out
 end
 
-;; ---------- inline flow (text/span/a w bloku non-flex) ----------
+;; Przycina KAŻDY box (od indeksu `from`) do prostokąta (część wspólna z istniejącym clipem).
+fn apply_clip(boxes: [LayoutBox], from: int, rx: int, ry: int, rw: int, rh: int) -> [LayoutBox] is
+    let mut out: [LayoutBox] = boxes
+    let mut i: int = from
+    while i < array_len(out) is
+        if out[i].has_clip is
+            let x0: int = if out[i].cx > rx then out[i].cx else rx
+            let y0: int = if out[i].cy > ry then out[i].cy else ry
+            let x1: int = if out[i].cx + out[i].cw < rx + rw then out[i].cx + out[i].cw else rx + rw
+            let y1: int = if out[i].cy + out[i].ch < ry + rh then out[i].cy + out[i].ch else ry + rh
+            out[i].cx = x0
+            out[i].cy = y0
+            out[i].cw = if x1 > x0 then x1 - x0 else 0
+            out[i].ch = if y1 > y0 then y1 - y0 else 0
+        else is
+            out[i].has_clip = true
+            out[i].cx = rx
+            out[i].cy = ry
+            out[i].cw = rw
+            out[i].ch = rh
+        end
+        i += 1
+    end
+    return out
+end
 
-;; Rozbudowa: `text-align` (left/center/right) na kontenerze bloku
-;; przesuwa całą już ułożoną linię na końcu jej zbierania — dokładnie
-;; tak jak w prawdziwym CSS wyrównanie działa per-linia, nie per-run.
-fn shift_line(acc: [LayoutBox], from_idx: int, dx: int) -> [LayoutBox] is
-    if dx == 0 is return acc end
-    let mut j: int = from_idx
-    while j < array_len(acc) is
-        acc[j].x = acc[j].x + dx
-        j += 1
+;; ---------- tekst ----------
+pub fn normal_line_height(font_size: int) -> int is
+    return font_size + font_size / 4 + 2
+end
+
+fn line_h_of(st: style::ComputedStyle) -> int is
+    if st.line_height > 0 is return st.line_height end
+    return normal_line_height(st.font_size)
+end
+
+fn style_flags(st: style::ComputedStyle) -> int is
+    let mut f: int = 0
+    if st.bold is f += 1 end
+    if st.italic is f += 2 end
+    if st.underline is f += 4 end
+    if st.strike is f += 8 end
+    return f
+end
+
+pub fn est_text_width(text: string, font_size: int) -> int is
+    return string_len(text) * font_size * 58 / 100
+end
+
+fn text_w(cx: LayoutCtx, text: string, st: style::ComputedStyle) -> int is
+    if text == "" is return 0 end
+    if cx.win < 0 is
+        let chars: int = ffi_shim::silver_utf8_len(text)
+        return (if st.bold then chars * st.font_size * 62 / 100 else chars * st.font_size * 58 / 100)
+    end
+    let w: int = ffi_shim::silver_measure_text_ex(cx.win, text, st.font_size, style_flags(st))
+    if w <= 0 is return est_text_width(text, st.font_size) end
+    return w
+end
+
+fn space_w(cx: LayoutCtx, st: style::ComputedStyle) -> int is
+    if cx.win < 0 is return st.font_size * 3 / 10 + 1 end
+    let w: int = ffi_shim::silver_measure_text_ex(cx.win, "a a", st.font_size, style_flags(st)) -
+                 ffi_shim::silver_measure_text_ex(cx.win, "aa", st.font_size, style_flags(st))
+    if w <= 0 is return st.font_size / 3 end
+    return w
+end
+
+fn apply_transform(text: string, mode: string) -> string is
+    if mode == "uppercase" is return string_upper(text) end
+    if mode == "lowercase" is return string_lower(text) end
+    if mode == "capitalize" is
+        let words: [string] = string_split(text, " ")
+        let mut out: string = ""
+        let mut i: int = 0
+        while i < array_len(words) is
+            let w: string = words[i]
+            let cap: string = if w == "" then "" else string_upper(string_slice(w, 0, 1)) + string_slice(w, 1, string_len(w))
+            out = if i == 0 then cap else out + " " + cap
+            i += 1
+        end
+        return out
+    end
+    return text
+end
+
+;; Dzieli zbyt długie słowo na kawałki mieszczące się w `max_w`.
+fn break_word(cx: LayoutCtx, text: string, st: style::ComputedStyle, max_w: int) -> [string] is
+    let mut parts: [string] = []
+    let mut rest: string = text
+    let mut guard: int = 0
+    while string_len(rest) > 0 && guard < 400 is
+        guard += 1
+        let mut cut: int = 0
+        if cx.win >= 0 is
+            cut = ffi_shim::silver_text_fit(cx.win, rest, st.font_size, style_flags(st), max_w)
+        else is
+            let denom: int = if st.font_size * 58 > 0 then st.font_size * 58 else 1
+            cut = ffi_shim::silver_utf8_offset(rest, max_w * 100 / denom)
+        end
+        if cut <= 0 is cut = ffi_shim::silver_utf8_next(rest, 0) end
+        parts = array_push(parts, string_slice(rest, 0, cut))
+        rest = string_slice(rest, cut, string_len(rest))
+    end
+    return parts
+end
+
+;; ---------- style (liczone raz) ----------
+fn is_live(d: dom::Dom, id: int) -> bool is
+    return id >= 0 && id < array_len(d.nodes) && !d.nodes[id].removed
+end
+
+;; Styl każdego węzła (indeks = id węzła), dziedziczenie od rodzica.
+pub fn compute_styles(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionState) -> [style::ComputedStyle] is
+    let n: int = array_len(d.nodes)
+    let mut styles: [style::ComputedStyle] = []
+    let mut i: int = 0
+    while i < n is
+        styles = array_push(styles, style::root_style())
+        i += 1
+    end
+    if n == 0 is return styles end
+    let mut stack: [int] = [0]
+    while array_len(stack) > 0 is
+        let id: int = stack[array_len(stack) - 1]
+        let mut ns: [int] = []
+        let mut k: int = 0
+        while k < array_len(stack) - 1 is
+            ns = array_push(ns, stack[k])
+            k += 1
+        end
+        stack = ns
+        let node: dom::DomNode = d.nodes[id]
+        if node.removed is continue end
+        let parent_st: style::ComputedStyle = if node.parent >= 0 then styles[node.parent] else style::root_style()
+        if id == 0 is
+            styles[0] = style::root_style()
+        elsif node.tag == "text" is
+            styles[id] = style::text_style(parent_st)
+        else is
+            styles[id] = style::resolve_ctx(sheet, d, id, parent_st, ix)
+        end
+        let mut c: int = array_len(node.children) - 1
+        while c >= 0 is
+            stack = array_push(stack, node.children[c])
+            c -= 1
+        end
+    end
+    return styles
+end
+
+fn style_of(cx: LayoutCtx, id: int) -> style::ComputedStyle is
+    return cx.styles[id]
+end
+
+fn is_replaced(tag: string) -> bool is
+    return tag == "img" || tag == "input" || tag == "textarea" || tag == "select"
+end
+
+fn is_out_of_flow(st: style::ComputedStyle) -> bool is
+    return st.position == "absolute" || st.position == "fixed"
+end
+
+fn is_inline_level(cx: LayoutCtx, id: int) -> bool is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    if n.removed is return false end
+    if n.tag == "text" is return n.text != "" end
+    let st: style::ComputedStyle = cx.styles[id]
+    if st.display == "none" || is_out_of_flow(st) is return false end
+    return st.display == "inline" || st.display == "inline-block" || st.display == "inline-flex"
+end
+
+fn is_rendered(cx: LayoutCtx, id: int) -> bool is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    if n.removed is return false end
+    if n.tag == "text" is return n.text != "" end
+    return cx.styles[id].display != "none"
+end
+
+fn is_decorated(st: style::ComputedStyle) -> bool is
+    return st.has_bg || st.has_grad || st.bt > 0 || st.br > 0 || st.bb > 0 || st.bl > 0 || st.bg_image != ""
+end
+
+fn collapse_margin(a: int, b: int) -> int is
+    if a >= 0 && b >= 0 is
+        if a > b is return a end
+        return b
+    end
+    if a < 0 && b < 0 is
+        if a < b is return a end
+        return b
+    end
+    return a + b
+end
+
+fn m_or_zero(v: int) -> int is
+    if v == auto_v() is return 0 end
+    return v
+end
+
+fn clamp_int(v: int, lo: int, hi: int) -> int is
+    if hi >= 0 && v > hi is return hi end
+    if v < lo is return lo end
+    return v
+end
+
+;; Domyślny rozmiar elementów zastępczych (obrazek bez wymiarów, pola formularza).
+fn input_kind(n: dom::DomNode) -> string is
+    let t: string = string_lower(n.attr_type)
+    if t == "checkbox" || t == "radio" is return t end
+    if t == "button" || t == "submit" || t == "reset" is return "button" end
+    if t == "hidden" is return "hidden" end
+    return "text"
+end
+
+fn replaced_natural(cx: LayoutCtx, id: int) -> style::BoxSides is
+    ;; zwraca (w=right, h=bottom) naturalnego rozmiaru zawartości (bez padding/border)
+    let n: dom::DomNode = cx.dom.nodes[id]
+    let st: style::ComputedStyle = cx.styles[id]
+    if n.tag == "img" is
+        let mut nw: int = 0
+        let mut nh: int = 0
+        if cx.win >= 0 && n.attr_src != "" is
+            nw = ffi_shim::silver_image_width(cx.win, n.attr_src)
+            nh = ffi_shim::silver_image_height(cx.win, n.attr_src)
+        end
+        if nw <= 0 is nw = 100 end
+        if nh <= 0 is nh = 100 end
+        return style::BoxSides { top: 0, right: nw, bottom: nh, left: 0 }
+    end
+    let lh: int = line_h_of(st)
+    if n.tag == "textarea" is
+        return style::BoxSides { top: 0, right: 220, bottom: lh * 4, left: 0 }
+    end
+    if n.tag == "select" is
+        let mut best: int = 80
+        let mut i: int = 0
+        while i < array_len(n.children) is
+            let c: dom::DomNode = cx.dom.nodes[n.children[i]]
+            if c.tag == "option" is
+                let t: string = dom::text_content(cx.dom, c.id)
+                let w: int = text_w(cx, t, st) + 24
+                if w > best is best = w end
+            end
+            i += 1
+        end
+        return style::BoxSides { top: 0, right: best, bottom: lh, left: 0 }
+    end
+    let kind: string = input_kind(n)
+    if kind == "checkbox" || kind == "radio" is
+        return style::BoxSides { top: 0, right: 16, bottom: 16, left: 0 }
+    end
+    if kind == "button" is
+        let label: string = if n.attr_value != "" then n.attr_value else "OK"
+        return style::BoxSides { top: 0, right: text_w(cx, label, st), bottom: lh, left: 0 }
+    end
+    return style::BoxSides { top: 0, right: 170, bottom: lh, left: 0 }
+end
+
+;; ---------- szerokość max-content (shrink-to-fit) ----------
+fn text_max_width(cx: LayoutCtx, text: string, st: style::ComputedStyle) -> int is
+    let t: string = apply_transform(text, st.text_transform)
+    if st.white_space == "pre" || st.white_space == "pre-wrap" is
+        let lines: [string] = string_split(t, "\n")
+        let mut best: int = 0
+        let mut i: int = 0
+        while i < array_len(lines) is
+            let w: int = text_w(cx, lines[i], st)
+            if w > best is best = w end
+            i += 1
+        end
+        return best
+    end
+    return text_w(cx, t, st)
+end
+
+fn pad_border_h(st: style::ComputedStyle) -> int is
+    return st.pad_left + st.pad_right + st.bl + st.br
+end
+
+fn pad_border_v(st: style::ComputedStyle) -> int is
+    return st.pad_top + st.pad_bottom + st.bt + st.bb
+end
+
+;; Szerokość ramki (border-box) elementu przy nieskończonej dostępnej szerokości.
+fn max_content(cx: LayoutCtx, id: int, depth: int) -> int is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    if n.removed is return 0 end
+    if n.tag == "text" is return text_max_width(cx, n.text, cx.styles[id]) end
+    let st: style::ComputedStyle = cx.styles[id]
+    if st.display == "none" || is_out_of_flow(st) is return 0 end
+    if depth > 40 is return 0 end
+    let own: int = pad_border_h(st)
+    if st.width_mode == "px" is
+        return if st.border_box then st.width else st.width + own
+    end
+    if is_replaced(n.tag) is
+        let nat: style::BoxSides = replaced_natural(cx, id)
+        let mut w: int = nat.right
+        if n.tag == "img" && st.height_mode == "px" && nat.bottom > 0 is w = st.height * nat.right / nat.bottom end
+        return w + own
+    end
+    let kids: [int] = n.children
+    let nk: int = array_len(kids)
+    let is_flex: bool = st.display == "flex" || st.display == "inline-flex"
+    let row: bool = st.flex_dir == "row" || st.flex_dir == "row-reverse"
+    let mut best: int = 0
+    let mut run: int = 0
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < nk is
+        let cid: int = kids[i]
+        i += 1
+        if !is_rendered(cx, cid) is continue end
+        let cst: style::ComputedStyle = cx.styles[cid]
+        if cx.dom.nodes[cid].tag != "text" && is_out_of_flow(cst) is continue end
+        let cw: int = max_content(cx, cid, depth + 1) + (if cx.dom.nodes[cid].tag == "text" then 0 else m_or_zero(cst.mar_left) + m_or_zero(cst.mar_right))
+        count += 1
+        if is_flex && row is
+            run = run + cw
+        elsif is_inline_level(cx, cid) && !is_flex is
+            run = run + cw + (if run > 0 && !cx.dom.nodes[cid].glue then space_w(cx, st) else 0)
+        else is
+            if run > best is best = run end
+            run = 0
+            if cw > best is best = cw end
+        end
+    end
+    if run > best is best = run end
+    if is_flex && row && count > 1 is best = best + st.gap * (count - 1) end
+    if st.display == "grid" && st.grid_cols != "" is
+        let cols: int = array_len(cssval::split_top(st.grid_cols))
+        if cols > 1 && count > 0 is best = best * (if cols < count then cols else count) end
+    end
+    return best + own
+end
+
+;; ---------- inline: atomy i łamanie wierszy ----------
+fn new_atom(kind: string, owner: int) -> Atom is
+    return Atom { kind: kind, text: "", w: 0, h: 0, owner: owner, deco: -1, sp: false, sw: 0, frag: [] }
+end
+
+fn nowrap_of(st: style::ComputedStyle) -> bool is
+    return st.white_space == "nowrap" || st.white_space == "pre"
+end
+
+;; Atomy z tekstu węzła tekstowego (słowa; "pre" → linie; nowrap → jeden atom).
+fn text_atoms(cx: LayoutCtx, text_id: int, owner: int, deco: int, avail_w: int, out: [Atom]) -> [Atom] is
+    let mut acc: [Atom] = out
+    let n: dom::DomNode = cx.dom.nodes[text_id]
+    let st: style::ComputedStyle = cx.styles[owner]
+    let t: string = apply_transform(n.text, st.text_transform)
+    let lh: int = line_h_of(st)
+    let sw: int = space_w(cx, st)
+    let pre: bool = st.white_space == "pre" || st.white_space == "pre-wrap"
+    if pre is
+        let lines: [string] = string_split(t, "\n")
+        let mut li: int = 0
+        while li < array_len(lines) is
+            if li > 0 is
+                let mut br: Atom = new_atom("br", owner)
+                br.h = lh
+                acc = array_push(acc, br)
+            end
+            if lines[li] != "" is
+                let mut a: Atom = new_atom("word", owner)
+                a.text = lines[li]
+                a.w = text_w(cx, lines[li], st)
+                a.h = lh
+                a.deco = deco
+                acc = array_push(acc, a)
+            end
+            li += 1
+        end
+        return acc
+    end
+    if st.white_space == "nowrap" is
+        let mut a: Atom = new_atom("word", owner)
+        a.text = t
+        a.w = text_w(cx, t, st)
+        a.h = lh
+        a.deco = deco
+        a.sp = !n.glue && array_len(acc) > 0
+        a.sw = sw
+        acc = array_push(acc, a)
+        return acc
+    end
+    let words: [string] = string_split(t, " ")
+    let mut first: bool = true
+    let mut wi: int = 0
+    while wi < array_len(words) is
+        let word: string = words[wi]
+        wi += 1
+        if word == "" is continue end
+        let ww: int = text_w(cx, word, st)
+        let lead_sp: bool = if first then (!n.glue && array_len(acc) > 0) else true
+        first = false
+        if ww > avail_w && avail_w > 8 is
+            let pieces: [string] = break_word(cx, word, st, avail_w)
+            let mut pi: int = 0
+            while pi < array_len(pieces) is
+                let mut a: Atom = new_atom("word", owner)
+                a.text = pieces[pi]
+                a.w = text_w(cx, pieces[pi], st)
+                a.h = lh
+                a.deco = deco
+                a.sp = if pi == 0 then lead_sp else false
+                a.sw = sw
+                acc = array_push(acc, a)
+                pi += 1
+            end
+        else is
+            let mut a: Atom = new_atom("word", owner)
+            a.text = word
+            a.w = ww
+            a.h = lh
+            a.deco = deco
+            a.sp = lead_sp
+            a.sw = sw
+            acc = array_push(acc, a)
+        end
     end
     return acc
 end
 
-fn line_align_dx(text_align: string, inner_w: int, used_w: int) -> int is
+;; Zbiera atomy z dzieci `ids` (rekurencyjnie dla elementów inline).
+fn collect_atoms(cx: LayoutCtx, ids: [int], owner: int, deco: int, avail_w: int, out: [Atom], depth: int) -> [Atom] is
+    let mut acc: [Atom] = out
+    if depth > 60 is return acc end
+    let mut i: int = 0
+    while i < array_len(ids) is
+        let id: int = ids[i]
+        i += 1
+        if !is_inline_level(cx, id) is continue end
+        let n: dom::DomNode = cx.dom.nodes[id]
+        if n.tag == "text" is
+            acc = text_atoms(cx, id, owner, deco, avail_w, acc)
+            continue
+        end
+        let st: style::ComputedStyle = cx.styles[id]
+        if n.tag == "br" is
+            let mut br: Atom = new_atom("br", owner)
+            br.h = line_h_of(cx.styles[owner])
+            acc = array_push(acc, br)
+            continue
+        end
+        if st.display == "inline" && !is_replaced(n.tag) is
+            let my_deco: int = if is_decorated(st) then id else deco
+            let padl: int = st.pad_left + st.bl + m_or_zero(st.mar_left)
+            let padr: int = st.pad_right + st.br + m_or_zero(st.mar_right)
+            if padl > 0 is
+                let mut o: Atom = new_atom("open", id)
+                o.w = padl
+                o.h = line_h_of(st)
+                o.deco = my_deco
+                o.sp = !n.glue && array_len(acc) > 0
+                acc = array_push(acc, o)
+            end
+            let before: int = array_len(acc)
+            acc = collect_atoms(cx, n.children, id, my_deco, avail_w, acc, depth + 1)
+            if padl == 0 && array_len(acc) > before is
+                acc[before].sp = acc[before].sp || (!n.glue && before > 0)
+            end
+            if padr > 0 is
+                let mut c: Atom = new_atom("close", id)
+                c.w = padr
+                c.h = line_h_of(st)
+                c.deco = my_deco
+                acc = array_push(acc, c)
+            end
+            continue
+        end
+        ;; inline-block / element zastępczy / button: układamy jako blok „shrink-to-fit"
+        let res: BlockRes = layout_block(cx, id, 0, 0, avail_w, -1, -1, true)
+        let mut a: Atom = new_atom("box", id)
+        a.w = res.w + res.ml + res.mr
+        a.h = res.h + res.mt + res.mb
+        a.deco = -1
+        a.sp = !n.glue && array_len(acc) > 0
+        a.sw = space_w(cx, cx.styles[owner])
+        a.frag = res.boxes
+        acc = array_push(acc, a)
+    end
+    return acc
+end
+
+fn align_dx(text_align: string, inner_w: int, used_w: int) -> int is
     if text_align == "center" is return (inner_w - used_w) / 2 end
-    if text_align == "right" is return inner_w - used_w end
+    if text_align == "right" || text_align == "end" is return inner_w - used_w end
     return 0
 end
 
-fn flow_inline_run(win_handle: int, dom: dom::Dom, sheet: css::Stylesheet, run: [int],
-                    inner_x: int, start_y: int, inner_w: int,
-                    inherited: style::ComputedStyle, interaction: css::InteractionState,
-                    boxes: [LayoutBox]) -> LayoutResult is
+;; Kończy wiersz: emituje boksy tekstu / dekoracji / fragmenty inline-block.
+fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs: [int], line_y: int, inner_x: int, inner_w: int,
+             text_align: string, boxes: [LayoutBox]) -> InlineRes is
     let mut acc: [LayoutBox] = boxes
-    let mut line_x: int = 0
-    let mut line_y: int = start_y
-    let mut line_max_h: int = 0
-    let mut line_start_idx: int = array_len(acc)
-    let gap: int = 6
+    let n: int = array_len(idxs)
+    if n == 0 is return InlineRes { boxes: acc, height: 0, used_w: 0 } end
 
-    let count: int = array_len(run)
+    let mut line_h: int = 0
+    let mut right: int = 0
     let mut i: int = 0
-    while i < count is
-        let node_id: int = run[i]
+    while i < n is
+        let a: Atom = atoms[idxs[i]]
+        if a.h > line_h is line_h = a.h end
+        let end_x: int = xs[i] + a.w
+        if end_x > right is right = end_x end
         i += 1
-        let st: style::ComputedStyle = node_style(dom, sheet, node_id, inherited, interaction)
-        let text: string = collect_text(dom, node_id)
-        if text == "" is continue end
+    end
+    let first_x: int = xs[0] + (if atoms[idxs[0]].sp then 0 else 0)
+    let used: int = right - first_x
+    let dx: int = align_dx(text_align, inner_w, used)
+    let base_x: int = inner_x + dx
 
-        let w: int = measure_text(win_handle, text, st.font_size)
-        let h: int = st.font_size + 6
-
-        if line_x > 0 && line_x + w > inner_w is
-            let used_w: int = line_x - gap
-            acc = shift_line(acc, line_start_idx, line_align_dx(inherited.text_align, inner_w, used_w))
-            line_y = line_y + line_max_h
-            line_x = 0
-            line_max_h = 0
-            line_start_idx = array_len(acc)
+    ;; tła elementów inline (po jednym na deco w wierszu)
+    let mut done: [int] = []
+    i = 0
+    while i < n is
+        let a: Atom = atoms[idxs[i]]
+        i += 1
+        if a.deco < 0 is continue end
+        let mut seen: bool = false
+        let mut d: int = 0
+        while d < array_len(done) is
+            if done[d] == a.deco is seen = true end
+            d += 1
         end
-
-        let b: LayoutBox = LayoutBox {
-            node_id: node_id, x: inner_x + line_x, y: line_y, w: w, h: h,
-            st: st, text: text, img_src: ""
-        }
-        acc = array_push(acc, b)
-
-        line_x = line_x + w + gap
-        if h > line_max_h is line_max_h = h end
+        if seen is continue end
+        done = array_push(done, a.deco)
+        let mut x0: int = 1000000
+        let mut x1: int = -1000000
+        let mut hh: int = 0
+        let mut j: int = 0
+        while j < n is
+            let b: Atom = atoms[idxs[j]]
+            if b.deco == a.deco is
+                if xs[j] < x0 is x0 = xs[j] end
+                if xs[j] + b.w > x1 is x1 = xs[j] + b.w end
+                if b.h > hh is hh = b.h end
+            end
+            j += 1
+        end
+        let dst: style::ComputedStyle = cx.styles[a.deco]
+        let bg_h: int = hh + dst.pad_top + dst.pad_bottom
+        let bgx: int = base_x + x0 - xs[0] + xs[0]
+        acc = array_push(acc, no_clip_box(a.deco, bgx, line_y + (line_h - hh) / 2 - dst.pad_top, x1 - x0, bg_h, dst, "inlinebg"))
     end
 
-    ;; ostatnia (albo jedyna) linia — nikt jej jeszcze nie wyrównał, bo
-    ;; nie było kolejnego elementu, który wymusiłby zawinięcie.
-    if array_len(acc) > line_start_idx is
-        let used_w: int = line_x - gap
-        acc = shift_line(acc, line_start_idx, line_align_dx(inherited.text_align, inner_w, used_w))
+    ;; teksty i boksy
+    i = 0
+    while i < n is
+        let a: Atom = atoms[idxs[i]]
+        if a.kind == "word" is
+            let ost: style::ComputedStyle = cx.styles[a.owner]
+            let mut text: string = a.text
+            let mut end_x: int = xs[i] + a.w
+            let mut j: int = i + 1
+            while j < n && atoms[idxs[j]].kind == "word" && atoms[idxs[j]].owner == a.owner is
+                let nxt: Atom = atoms[idxs[j]]
+                if nxt.sp is text = text + " " end
+                text = text + nxt.text
+                end_x = xs[j] + nxt.w
+                j += 1
+            end
+            let mut b: LayoutBox = no_clip_box(a.owner, base_x + xs[i], line_y + (line_h - a.h) / 2, end_x - xs[i], a.h, ost, "text")
+            b.text = text
+            acc = array_push(acc, b)
+            i = j
+            continue
+        end
+        if a.kind == "box" is
+            let by: int = line_y + (line_h - a.h) / 2
+            acc = concat_boxes(acc, shift_boxes(a.frag, base_x + xs[i], by))
+        end
+        i += 1
     end
-
-    let total_h: int = (line_y - start_y) + line_max_h
-    return LayoutResult { boxes: acc, height: total_h }
+    return InlineRes { boxes: acc, height: line_h, used_w: used }
 end
 
-;; ---------- flex (display: flex) ----------
-
-;; Zwraca "rozmiar w kierunku głównej osi" dziecka, jeśli jawnie
-;; ustawiony w CSS, inaczej -1 (auto -> dostanie równy udział miejsca).
-fn explicit_main_size(st: style::ComputedStyle, row: bool) -> int is
-    return if row then st.width else st.height
-end
-
-fn layout_flex(win_handle: int, dom: dom::Dom, sheet: css::Stylesheet, node_id: int,
-               x: int, y: int, st: style::ComputedStyle,
-               inner_x: int, inner_y: int, inner_w: int, interaction: css::InteractionState,
-               boxes: [LayoutBox]) -> LayoutResult is
-    let n: dom::DomNode = dom.nodes[node_id]
-    let row: bool = st.flex_dir != "column"
-    let main_avail: int = if row then inner_w else 1000000  ;; kolumna: brak twardego limitu wysokości
-
-    let ids: [int] = n.children
-    let count: int = array_len(ids)
-
-    ;; pass 1: policz jawne rozmiary głównej osi i ile dzieci jest "auto"
-    let mut sum_explicit: int = 0
-    let mut auto_count: int = 0
+;; Układa ciąg węzłów inline w wierszach szerokości `inner_w`.
+fn flow_inline(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: int, inner_w: int,
+               text_align: string, boxes: [LayoutBox]) -> InlineRes is
+    let atoms: [Atom] = collect_atoms(cx, ids, owner, -1, inner_w, [], 0)
+    let ost: style::ComputedStyle = cx.styles[owner]
+    let nowrap: bool = nowrap_of(ost)
+    let mut acc: [LayoutBox] = boxes
+    let mut y: int = start_y
+    let mut line_idx: [int] = []
+    let mut line_x: [int] = []
+    let mut x: int = 0
+    let mut max_used: int = 0
+    let total: int = array_len(atoms)
     let mut i: int = 0
-    while i < count is
-        let cst: style::ComputedStyle = node_style(dom, sheet, ids[i], st, interaction)
-        let m: int = explicit_main_size(cst, row)
-        if m >= 0 is sum_explicit = sum_explicit + m else is auto_count += 1 end
+    while i < total is
+        let a: Atom = atoms[i]
+        if a.kind == "br" is
+            line_idx = array_push(line_idx, i)
+            line_x = array_push(line_x, x)
+            let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, inner_x, inner_w, text_align, acc)
+            acc = r.boxes
+            y = y + r.height
+            if r.used_w > max_used is max_used = r.used_w end
+            line_idx = []
+            line_x = []
+            x = 0
+            i += 1
+            continue
+        end
+        let gap: int = if a.sp && array_len(line_idx) > 0 then a.sw else 0
+        if !nowrap && array_len(line_idx) > 0 && x + gap + a.w > inner_w && a.kind != "close" is
+            let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, inner_x, inner_w, text_align, acc)
+            acc = r.boxes
+            y = y + r.height
+            if r.used_w > max_used is max_used = r.used_w end
+            line_idx = []
+            line_x = []
+            x = 0
+            line_idx = array_push(line_idx, i)
+            line_x = array_push(line_x, 0)
+            x = a.w
+            i += 1
+            continue
+        end
+        line_idx = array_push(line_idx, i)
+        line_x = array_push(line_x, x + gap)
+        x = x + gap + a.w
         i += 1
     end
-    let gaps_total: int = if count > 1 then st.gap * (count - 1) else 0
-    let remaining: int = main_avail - sum_explicit - gaps_total
-    let per_auto: int = if auto_count > 0 && row then (if remaining > 0 then remaining / auto_count else 40) else -1
-
-    ;; pass 2: całkowity rozmiar użyty na głównej osi (do justify-content)
-    let mut total_main: int = gaps_total
-    i = 0
-    while i < count is
-        let cst: style::ComputedStyle = node_style(dom, sheet, ids[i], st, interaction)
-        let m: int = explicit_main_size(cst, row)
-        total_main = total_main + (if m >= 0 then m elsif row then per_auto else 0)
-        i += 1
+    if array_len(line_idx) > 0 is
+        let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, inner_x, inner_w, text_align, acc)
+        acc = r.boxes
+        y = y + r.height
+        if r.used_w > max_used is max_used = r.used_w end
     end
-
-    let mut cursor: int = 0
-    let mut extra_gap: int = 0
-    if row is
-        let free: int = inner_w - total_main
-        if st.justify == "center" is cursor = free / 2
-        elsif st.justify == "flex-end" is cursor = free
-        elsif st.justify == "space-between" && count > 1 is extra_gap = free / (count - 1)
+    ;; text-overflow: ellipsis dla pojedynczego, za szerokiego tekstu bez zawijania
+    if ost.ellipsis && nowrap && max_used > inner_w && array_len(acc) > 0 is
+        let mut k: int = array_len(acc) - 1
+        while k >= 0 is
+            if acc[k].kind == "text" && acc[k].x + acc[k].w > inner_x + inner_w is
+                let room: int = inner_x + inner_w - acc[k].x - text_w(cx, "…", ost)
+                let keep: int = if room > 0 then (if cx.win >= 0 then ffi_shim::silver_text_fit(cx.win, acc[k].text, ost.font_size, style_flags(ost), room) else 0) else 0
+                acc[k].text = string_slice(acc[k].text, 0, keep) + "…"
+                acc[k].w = inner_x + inner_w - acc[k].x
+            end
+            k -= 1
         end
     end
+    return InlineRes { boxes: acc, height: y - start_y, used_w: max_used }
+end
 
+;; ---------- blok ----------
+fn li_marker(cx: LayoutCtx, id: int) -> string is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    if n.parent < 0 is return "•" end
+    let parent: dom::DomNode = cx.dom.nodes[n.parent]
+    if parent.tag != "ol" is return "•" end
+    let mut idx: int = 0
+    let mut i: int = 0
+    while i < array_len(parent.children) is
+        let c: dom::DomNode = cx.dom.nodes[parent.children[i]]
+        if c.tag == "li" && !c.removed is idx += 1 end
+        if parent.children[i] == id is return to_string(idx) + "." end
+        i += 1
+    end
+    return "•"
+end
+
+fn scroll_offset(cx: LayoutCtx, id: int) -> int is
+    let mut i: int = 0
+    while i + 1 < array_len(cx.scrolls) is
+        if cx.scrolls[i] == id is return cx.scrolls[i + 1] end
+        i += 2
+    end
+    return 0
+end
+
+;; Normalny przepływ bloku: bloki pionowo (zwijanie marginesów) + serie inline.
+fn layout_flow(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, boxes: [LayoutBox]) -> InlineRes is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    let st: style::ComputedStyle = cx.styles[id]
     let mut acc: [LayoutBox] = boxes
-    let mut max_cross: int = 0
-    i = 0
-    while i < count is
-        let child_id: int = ids[i]
-        let cst: style::ComputedStyle = node_style(dom, sheet, child_id, st, interaction)
-        let explicit: int = explicit_main_size(cst, row)
-        let assigned_main: int = if explicit >= 0 then explicit elsif row then per_auto else -1
+    let mut cursor: int = y
+    let mut pending_mb: int = 0
+    let mut first_block: bool = true
+    let mut run: [int] = []
+    let mut max_used: int = 0
+    let mut i: int = 0
+    let total: int = array_len(n.children)
+    while i <= total is
+        let at_end: bool = i == total
+        let cid: int = if at_end then -1 else n.children[i]
+        i += 1
+        if !at_end && !is_rendered(cx, cid) is continue end
+        if !at_end && cx.dom.nodes[cid].tag != "text" && is_out_of_flow(cx.styles[cid]) is continue end
+        if !at_end && is_inline_level(cx, cid) is
+            run = array_push(run, cid)
+            continue
+        end
+        if array_len(run) > 0 is
+            cursor = cursor + pending_mb
+            pending_mb = 0
+            let r: InlineRes = flow_inline(cx, run, id, x, cursor, w, st.text_align, acc)
+            acc = r.boxes
+            cursor = cursor + r.height
+            if r.used_w > max_used is max_used = r.used_w end
+            run = []
+            first_block = false
+        end
+        if at_end is break end
+        let res: BlockRes = layout_block(cx, cid, x, cursor, w, inner_h, -1, false)
+        let want: int = collapse_margin(pending_mb, res.mt)
+        let delta: int = want - res.mt
+        let placed: [LayoutBox] = shift_boxes(res.boxes, 0, delta)
+        acc = concat_boxes(acc, placed)
+        cursor = cursor + want + res.h
+        pending_mb = res.mb
+        if res.w + res.ml + res.mr > max_used is max_used = res.w + res.ml + res.mr end
+        first_block = false
+    end
+    cursor = cursor + pending_mb
+    return InlineRes { boxes: acc, height: cursor - y, used_w: max_used }
+end
 
-        let before_len: int = array_len(acc)
-        let child_x: int = if row then inner_x + cursor else inner_x
-        let child_y: int = if row then inner_y else inner_y + cursor
-        let child_w: int = if row then assigned_main else inner_w
-        let res: LayoutResult = layout_node(win_handle, dom, sheet, child_id, child_x, child_y, child_w, st, interaction, acc)
-        acc = res.boxes
+struct FItem is
+    pub id:     int
+    pub is_text: bool
+    pub basis:  int
+    pub ml:     int
+    pub mr:     int
+    pub mt:     int
+    pub mb:     int
+    pub auto_l: bool
+    pub auto_r: bool
+    pub grow:   int
+    pub shrink: int
+    pub main:   int
+    pub min_w:  int
+    pub max_w:  int
+    pub align:  string
+end
 
-        ;; cross-axis align: przesuń pudełka tego dziecka (dodane w tej
-        ;; iteracji, [before_len..len)) o dx wg align-items (tylko dla
-        ;; kolumny — align w wierszu wymagałby znanej z góry wysokości
-        ;; kontenera, co na razie pomijamy jako uproszczenie — patrz
-        ;; ROADMAP.md).
-        if array_len(acc) > before_len is
-            let self_box: LayoutBox = acc[array_len(acc) - 1]  ;; self_box dziecka jest ostatnie (post-order)
-            if row is
-                if self_box.h > max_cross is max_cross = self_box.h end
+fn flex_items(cx: LayoutCtx, id: int, row: bool, container_align: string, inner_w: int) -> [FItem] is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    let mut items: [FItem] = []
+    let mut orders: [int] = []
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let cid: int = n.children[i]
+        i += 1
+        if !is_rendered(cx, cid) is continue end
+        let cn: dom::DomNode = cx.dom.nodes[cid]
+        let cst: style::ComputedStyle = cx.styles[cid]
+        if cn.tag != "text" && is_out_of_flow(cst) is continue end
+        let is_text: bool = cn.tag == "text"
+        let own_h: int = if is_text then 0 else pad_border_h(cst)
+        let mut basis: int = 0
+        if is_text is
+            basis = text_max_width(cx, cn.text, cx.styles[id])
+        else is
+            let w_spec: int = style::size_of(cst.width, cst.width_pct, cst.width_mode, inner_w)
+            if row && cst.flex_basis >= 0 is
+                basis = if cst.border_box then cst.flex_basis else cst.flex_basis + own_h
+            elsif row && w_spec >= 0 is
+                basis = if cst.border_box then w_spec else w_spec + own_h
+            elsif row is
+                basis = max_content(cx, cid, 0)
             else is
-                let cw: int = self_box.w
-                if cw > max_cross is max_cross = cw end
-                let dx: int = if st.align == "center" then (inner_w - cw) / 2
-                              elsif st.align == "flex-end" then inner_w - cw
-                              else 0
-                if dx != 0 is
-                    let mut j: int = before_len
-                    while j < array_len(acc) is
-                        acc[j].x = acc[j].x + dx
-                        j += 1
-                    end
+                basis = 0
+            end
+        end
+        let mut item: FItem = FItem {
+            id: cid, is_text: is_text, basis: basis,
+            ml: if is_text then 0 else m_or_zero(cst.mar_left), mr: if is_text then 0 else m_or_zero(cst.mar_right),
+            mt: if is_text then 0 else m_or_zero(cst.mar_top), mb: if is_text then 0 else m_or_zero(cst.mar_bottom),
+            auto_l: !is_text && cst.mar_left == auto_v(), auto_r: !is_text && cst.mar_right == auto_v(),
+            grow: if is_text then 0 else cst.flex_grow, shrink: if is_text then 1000 else cst.flex_shrink,
+            main: basis, min_w: if is_text then 0 else cst.min_width,
+            max_w: if is_text || cst.max_width_mode == "auto" then -1 else style::size_of(cst.max_width, cst.max_width_pct, cst.max_width_mode, inner_w),
+            align: if is_text || cst.align_self == "" then container_align else cst.align_self
+        }
+        if item.max_w >= 0 && item.basis > item.max_w is item.basis = item.max_w end
+        if item.basis < item.min_w is item.basis = item.min_w end
+        item.main = item.basis
+        let ord: int = if is_text then 0 else cst.order
+        ;; wstawianie stabilne wg `order`
+        let mut pos: int = array_len(items)
+        let mut k: int = array_len(items) - 1
+        while k >= 0 is
+            if orders[k] > ord is pos = k end
+            k -= 1
+        end
+        let mut ni: [FItem] = []
+        let mut no: [int] = []
+        let mut q: int = 0
+        while q < array_len(items) is
+            if q == pos is
+                ni = array_push(ni, item)
+                no = array_push(no, ord)
+            end
+            ni = array_push(ni, items[q])
+            no = array_push(no, orders[q])
+            q += 1
+        end
+        if pos >= array_len(items) is
+            ni = array_push(ni, item)
+            no = array_push(no, ord)
+        end
+        items = ni
+        orders = no
+    end
+    return items
+end
+
+fn reverse_items(items: [FItem]) -> [FItem] is
+    let mut out: [FItem] = []
+    let mut i: int = array_len(items) - 1
+    while i >= 0 is
+        out = array_push(out, items[i])
+        i -= 1
+    end
+    return out
+end
+
+;; Układa element tekstowy będący bezpośrednim dzieckiem kontenera flex/grid.
+fn layout_text_item(cx: LayoutCtx, tid: int, owner: int, w: int) -> BlockRes is
+    let ost: style::ComputedStyle = cx.styles[owner]
+    let r: InlineRes = flow_inline(cx, [tid], owner, 0, 0, w, ost.text_align, [])
+    return BlockRes { boxes: r.boxes, w: r.used_w, h: r.height, mt: 0, mb: 0, ml: 0, mr: 0 }
+end
+
+fn layout_item(cx: LayoutCtx, it: FItem, owner: int, force_w: int, avail_w: int, avail_h: int, fit: bool) -> BlockRes is
+    if it.is_text is return layout_text_item(cx, it.id, owner, if force_w >= 0 then force_w else avail_w) end
+    return layout_block(cx, it.id, 0, 0, avail_w, avail_h, force_w, fit)
+end
+
+fn layout_flex(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, boxes: [LayoutBox]) -> InlineRes is
+    let st: style::ComputedStyle = cx.styles[id]
+    let row: bool = st.flex_dir == "row" || st.flex_dir == "row-reverse"
+    let reverse: bool = st.flex_dir == "row-reverse" || st.flex_dir == "column-reverse"
+    let mut items: [FItem] = flex_items(cx, id, row, st.align, w)
+    if reverse is items = reverse_items(items) end
+    let count: int = array_len(items)
+    if count == 0 is return InlineRes { boxes: boxes, height: 0, used_w: 0 } end
+    let mut acc: [LayoutBox] = boxes
+    let main_gap: int = if row then st.gap else st.row_gap
+    let cross_gap: int = if row then st.row_gap else st.gap
+
+    if row is
+        ;; --- podział na linie ---
+        let mut line_start: [int] = [0]
+        if st.flex_wrap is
+            let mut used: int = 0
+            let mut i: int = 0
+            while i < count is
+                let outer: int = items[i].basis + items[i].ml + items[i].mr
+                let is_first: bool = array_len(line_start) > 0 && line_start[array_len(line_start) - 1] == i
+                if !is_first && used + main_gap + outer > w is
+                    line_start = array_push(line_start, i)
+                    used = outer
+                else is
+                    used = used + (if is_first then 0 else main_gap) + outer
+                end
+                i += 1
+            end
+        end
+        let nlines: int = array_len(line_start)
+        let mut cursor_y: int = y
+        let mut li: int = 0
+        while li < nlines is
+            let from: int = line_start[li]
+            let to: int = if li + 1 < nlines then line_start[li + 1] else count
+            ;; rozmiary główne w linii
+            let mut sum: int = 0
+            let mut grow_sum: int = 0
+            let mut shrink_sum: int = 0
+            let mut auto_margins: int = 0
+            let mut k: int = from
+            while k < to is
+                sum = sum + items[k].basis + items[k].ml + items[k].mr
+                grow_sum = grow_sum + items[k].grow
+                shrink_sum = shrink_sum + items[k].shrink * items[k].basis / 1000
+                if items[k].auto_l is auto_margins += 1 end
+                if items[k].auto_r is auto_margins += 1 end
+                k += 1
+            end
+            let gaps: int = main_gap * (to - from - 1)
+            let free: int = w - sum - gaps
+            k = from
+            while k < to is
+                let mut m: int = items[k].basis
+                if free > 0 && grow_sum > 0 is
+                    m = m + free * items[k].grow / grow_sum
+                elsif free < 0 && shrink_sum > 0 is
+                    m = m + free * (items[k].shrink * items[k].basis / 1000) / shrink_sum
+                end
+                if items[k].max_w >= 0 && m > items[k].max_w is m = items[k].max_w end
+                if m < items[k].min_w is m = items[k].min_w end
+                if m < 0 is m = 0 end
+                items[k].main = m
+                k += 1
+            end
+            ;; wolne miejsce po wzroście → auto-marginesy / justify
+            let mut used: int = gaps
+            k = from
+            while k < to is
+                used = used + items[k].main + items[k].ml + items[k].mr
+                k += 1
+            end
+            let left: int = w - used
+            let mut offset: int = 0
+            let mut extra_gap: int = 0
+            let mut auto_each: int = 0
+            if left > 0 && auto_margins > 0 is
+                auto_each = left / auto_margins
+            elsif left > 0 is
+                let j: string = st.justify
+                let nitems: int = to - from
+                if j == "center" is
+                    offset = left / 2
+                elsif j == "flex-end" || j == "end" || j == "right" is
+                    offset = left
+                elsif j == "space-between" && nitems > 1 is
+                    extra_gap = left / (nitems - 1)
+                elsif j == "space-around" is
+                    extra_gap = left / nitems
+                    offset = extra_gap / 2
+                elsif j == "space-evenly" is
+                    extra_gap = left / (nitems + 1)
+                    offset = extra_gap
                 end
             end
+            if reverse && left > 0 && auto_margins == 0 && offset == 0 && extra_gap == 0 is offset = 0 end
+            ;; układ elementów (na początku (0,0)), pomiar wysokości
+            let mut results: [BlockRes] = []
+            let mut line_cross: int = 0
+            k = from
+            while k < to is
+                let r: BlockRes = layout_item(cx, items[k], id, items[k].main, w, -1, false)
+                results = array_push(results, r)
+                let outer_h: int = r.h + items[k].mt + items[k].mb
+                if outer_h > line_cross is line_cross = outer_h end
+                k += 1
+            end
+            if !st.flex_wrap && inner_h >= 0 is line_cross = inner_h end
+            ;; pozycje
+            let mut px: int = x + offset
+            k = from
+            while k < to is
+                let it: FItem = items[k]
+                let r: BlockRes = results[k - from]
+                let lx: int = px + (if it.auto_l then auto_each else 0)
+                let outer_h: int = r.h + it.mt + it.mb
+                let mut dy: int = 0
+                let mut boxes_k: [LayoutBox] = r.boxes
+                if it.align == "center" is
+                    dy = (line_cross - outer_h) / 2
+                elsif it.align == "flex-end" is
+                    dy = line_cross - outer_h
+                elsif it.align == "stretch" && !it.is_text && cx.styles[it.id].height_mode == "auto" && array_len(boxes_k) > 0 is
+                    let want_h: int = line_cross - it.mt - it.mb
+                    if want_h > boxes_k[0].h is boxes_k[0].h = want_h end
+                end
+                acc = concat_boxes(acc, shift_boxes(boxes_k, lx, cursor_y + dy))
+                px = px + it.ml + it.main + it.mr + main_gap + extra_gap + (if it.auto_l then auto_each else 0) + (if it.auto_r then auto_each else 0)
+                k += 1
+            end
+            cursor_y = cursor_y + line_cross + (if li + 1 < nlines then cross_gap else 0)
+            li += 1
         end
+        return InlineRes { boxes: acc, height: cursor_y - y, used_w: w }
+    end
 
-        cursor = cursor + (if row then assigned_main else res.height) + st.gap + extra_gap
+    ;; --- kolumna ---
+    let mut results: [BlockRes] = []
+    let mut heights: [int] = []
+    let mut total: int = 0
+    let mut grow_sum: int = 0
+    let mut i: int = 0
+    while i < count is
+        let it: FItem = items[i]
+        let mut r: BlockRes = BlockRes { boxes: [], w: 0, h: 0, mt: 0, mb: 0, ml: 0, mr: 0 }
+        let avail: int = w - it.ml - it.mr
+        if it.is_text is
+            r = layout_text_item(cx, it.id, id, avail)
+        else is
+            let cst: style::ComputedStyle = cx.styles[it.id]
+            let stretch: bool = it.align == "stretch" && cst.width_mode == "auto" && !is_replaced(cx.dom.nodes[it.id].tag)
+            r = layout_block(cx, it.id, 0, 0, w, -1, if stretch then avail else -1, !stretch)
+        end
+        results = array_push(results, r)
+        heights = array_push(heights, r.h)
+        total = total + r.h + it.mt + it.mb
+        grow_sum = grow_sum + it.grow
         i += 1
     end
-
-    let total_h: int = if row then max_cross else cursor - st.gap - extra_gap
-    return LayoutResult { boxes: acc, height: if total_h > 0 then total_h else 0 }
+    total = total + main_gap * (count - 1)
+    let free: int = if inner_h >= 0 then inner_h - total else 0
+    let mut cursor: int = y
+    let mut offset: int = 0
+    let mut extra_gap: int = 0
+    if free > 0 && grow_sum == 0 is
+        if st.justify == "center" is
+            offset = free / 2
+        elsif st.justify == "flex-end" is
+            offset = free
+        elsif st.justify == "space-between" && count > 1 is
+            extra_gap = free / (count - 1)
+        elsif st.justify == "space-around" is
+            extra_gap = free / count
+            offset = extra_gap / 2
+        elsif st.justify == "space-evenly" is
+            extra_gap = free / (count + 1)
+            offset = extra_gap
+        end
+    end
+    cursor = cursor + offset
+    i = 0
+    while i < count is
+        let it: FItem = items[i]
+        let r: BlockRes = results[i]
+        let mut boxes_i: [LayoutBox] = r.boxes
+        let mut h: int = r.h
+        if free > 0 && grow_sum > 0 && it.grow > 0 is
+            let add: int = free * it.grow / grow_sum
+            h = h + add
+            if array_len(boxes_i) > 0 is boxes_i[0].h = h end
+        end
+        let outer_w: int = r.w + r.ml + r.mr + it.ml + it.mr
+        let mut dx: int = it.ml
+        if it.align == "center" is
+            dx = (w - outer_w) / 2 + it.ml
+        elsif it.align == "flex-end" is
+            dx = w - outer_w + it.ml
+        end
+        acc = concat_boxes(acc, shift_boxes(boxes_i, x + dx, cursor + it.mt))
+        cursor = cursor + it.mt + h + it.mb + main_gap + extra_gap
+        i += 1
+    end
+    cursor = cursor - main_gap - extra_gap
+    return InlineRes { boxes: acc, height: cursor - y, used_w: w }
 end
 
-;; ---------- główny layout węzła ----------
+;; ---------- grid ----------
+struct Track is
+    pub kind: string   ;; px | fr | auto
+    pub val:  int      ;; px lub fr*1000
+end
 
-;; Rozbudowa v0.2: rozwiązuje sentinel `-1` (auto) na `mar_left`/
-;; `mar_right` (patrz `style::parse_margin_lr`) w rzeczywiste piksele,
-;; rozdzielając nadmiarową przestrzeń (`avail_w - used_w`) — dokładnie
-;; klasyczne CSS-owe `margin: 0 auto`. Gdy żaden bok nie jest `auto`,
-;; zwraca wartości bez zmian (`space` i tak wtedy nie jest używane) —
-;; więc bezpieczne do wołania zawsze, nie tylko gdy `margin: auto`
-;; faktycznie wystąpiło w CSS.
-fn resolve_auto_margins(ml_in: int, mr_in: int, avail_w: int, used_w: int) -> style::BoxSides is
-    let mut ml: int = ml_in
-    let mut mr: int = mr_in
-    if ml == -1 || mr == -1 is
-        let remaining: int = avail_w - used_w
-        let space: int = if remaining > 0 then remaining else 0
-        if ml == -1 && mr == -1 is
-            ml = space / 2
-            mr = space - ml
-        elsif ml == -1 is
-            ml = space - mr
-            if ml < 0 is ml = 0 end
+fn parse_tracks(spec: string, avail: int, gap: int) -> [Track] is
+    let toks: [string] = cssval::split_top(string_lower(spec))
+    let mut out: [Track] = []
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if string_starts_with(t, "repeat(") is
+            let inner: [string] = cssval::split_commas(string_slice(t, 7, string_len(t) - 1))
+            if array_len(inner) >= 2 is
+                let sub: [Track] = parse_tracks(inner[1], avail, gap)
+                let mut times: int = 1
+                if inner[0] == "auto-fill" || inner[0] == "auto-fit" is
+                    let mut unit: int = 100
+                    if array_len(sub) > 0 && sub[0].kind == "px" is unit = sub[0].val end
+                    let ft: string = inner[1]
+                    let mm: int = string_find(ft, "minmax(")
+                    if mm >= 0 is
+                        let args: [string] = cssval::split_commas(string_slice(ft, mm + 7, string_find(ft, ")")))
+                        if array_len(args) >= 1 is
+                            let env: cssval::LenEnv = cssval::default_env()
+                            unit = cssval::px_of(cssval::parse_len(args[0], env), avail)
+                        end
+                    end
+                    if unit < 1 is unit = 1 end
+                    times = (avail + gap) / (unit + gap)
+                    if times < 1 is times = 1 end
+                else is
+                    times = str_to_int(inner[0])
+                end
+                let mut r: int = 0
+                while r < times is
+                    let mut s: int = 0
+                    while s < array_len(sub) is
+                        out = array_push(out, sub[s])
+                        s += 1
+                    end
+                    r += 1
+                end
+            end
+        elsif string_starts_with(t, "minmax(") is
+            let args: [string] = cssval::split_commas(string_slice(t, 7, string_len(t) - 1))
+            let last: string = if array_len(args) >= 2 then args[1] else "auto"
+            let sub: [Track] = parse_tracks(last, avail, gap)
+            if array_len(sub) > 0 is out = array_push(out, sub[0]) end
+        elsif string_ends_with(t, "fr") is
+            let f: int = conv_milli(string_slice(t, 0, string_len(t) - 2))
+            out = array_push(out, Track { kind: "fr", val: if f <= 0 then 1000 else f })
+        elsif t == "auto" || t == "min-content" || t == "max-content" is
+            out = array_push(out, Track { kind: "auto", val: 0 })
         else is
-            mr = space - ml
-            if mr < 0 is mr = 0 end
+            let env: cssval::LenEnv = cssval::default_env()
+            let l: cssval::Len = cssval::parse_len(t, env)
+            if l.ok && !l.auto is out = array_push(out, Track { kind: "px", val: cssval::px_of(l, avail) }) end
         end
     end
-    return style::BoxSides { top: 0, right: mr, bottom: 0, left: ml }
+    return out
 end
 
-fn layout_node(win_handle: int, dom: dom::Dom, sheet: css::Stylesheet, node_id: int,
-               x: int, y: int, avail_w: int, inherited: style::ComputedStyle,
-               interaction: css::InteractionState, boxes: [LayoutBox]) -> LayoutResult is
-    let n: dom::DomNode = dom.nodes[node_id]
+fn conv_milli(s: string) -> int is
+    let parts: [string] = string_split(string_trim(s), ".")
+    let whole: int = str_to_int(parts[0]) * 1000
+    if array_len(parts) < 2 is return whole end
+    let frac_raw: string = parts[1] + "000"
+    return whole + str_to_int(string_slice(frac_raw, 0, 3))
+end
 
-    if n.tag == "text" is
-        return flow_inline_run(win_handle, dom, sheet, [node_id], x, y, avail_w, inherited, interaction, boxes)
+fn layout_grid(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox]) -> InlineRes is
+    let st: style::ComputedStyle = cx.styles[id]
+    let items: [FItem] = flex_items(cx, id, true, "stretch", w)
+    let count: int = array_len(items)
+    if count == 0 is return InlineRes { boxes: boxes, height: 0, used_w: 0 } end
+    let mut tracks: [Track] = parse_tracks(st.grid_cols, w, st.gap)
+    if array_len(tracks) == 0 is tracks = array_push(tracks, Track { kind: "fr", val: 1000 }) end
+    let ncols: int = array_len(tracks)
+    ;; szerokości kolumn
+    let mut fixed: int = st.gap * (ncols - 1)
+    let mut fr_sum: int = 0
+    let mut auto_cols: int = 0
+    let mut i: int = 0
+    while i < ncols is
+        if tracks[i].kind == "px" is fixed = fixed + tracks[i].val end
+        if tracks[i].kind == "fr" is fr_sum = fr_sum + tracks[i].val end
+        if tracks[i].kind == "auto" is auto_cols += 1 end
+        i += 1
     end
-
-    let st: style::ComputedStyle = node_style(dom, sheet, node_id, inherited, interaction)
-    if st.display == "none" is
-        return LayoutResult { boxes: boxes, height: 0 }
+    let mut col_w: [int] = []
+    i = 0
+    while i < ncols is
+        let mut cw: int = 0
+        if tracks[i].kind == "px" is
+            cw = tracks[i].val
+        elsif tracks[i].kind == "auto" is
+            ;; max-content elementów w tej kolumnie (placement po kolei)
+            let mut j: int = i
+            while j < count is
+                let it: FItem = items[j]
+                let mc: int = if it.is_text then it.basis else max_content(cx, it.id, 0) + it.ml + it.mr
+                if mc > cw is cw = mc end
+                j += ncols
+            end
+            fixed = fixed + cw
+        end
+        col_w = array_push(col_w, cw)
+        i += 1
     end
-
-    let box_w: int = if st.width >= 0 then st.width else avail_w
-
-    if n.tag == "img" is
-        let img: LayoutBox = image_size(win_handle, n.attr_src, st)
-        ;; elementy zastępowalne (obrazki) też mogą korzystać z
-        ;; `margin: auto` — ich "używana szerokość" to naturalny/CSS-owy
-        ;; rozmiar (`img.w`), nie `box_w` (które dla img i tak nie jest
-        ;; liczone wyżej).
-        let img_m: style::BoxSides = resolve_auto_margins(st.mar_left, st.mar_right, avail_w, img.w)
-        let placed: LayoutBox = LayoutBox {
-            node_id: node_id, x: x + img_m.left, y: y + st.mar_top,
-            w: img.w, h: img.h, st: st, text: "", img_src: n.attr_src
-        }
-        let acc: [LayoutBox] = array_push(boxes, placed)
-        return LayoutResult { boxes: acc, height: placed.h + st.mar_top + st.mar_bottom }
+    let remaining: int = w - fixed
+    i = 0
+    while i < ncols is
+        if tracks[i].kind == "fr" is
+            col_w[i] = if fr_sum > 0 && remaining > 0 then remaining * tracks[i].val / fr_sum else 0
+        end
+        i += 1
     end
+    let row_tracks: [Track] = parse_tracks(st.grid_rows, 100000, st.row_gap)
+    let mut acc: [LayoutBox] = boxes
+    let mut cursor_y: int = y
+    let mut idx: int = 0
+    let mut row_i: int = 0
+    while idx < count is
+        ;; jedna linia siatki: dobierz elementy do wypełnienia kolumn (z uwzględnieniem span)
+        let mut col: int = 0
+        let mut cells: [BlockRes] = []
+        let mut cell_x: [int] = []
+        let mut cell_item: [int] = []
+        let mut cell_w: [int] = []
+        let mut row_h: int = 0
+        while idx < count && col < ncols is
+            let it: FItem = items[idx]
+            let span_raw: int = if it.is_text then 1 else cx.styles[it.id].grid_col_span
+            let span: int = if span_raw > ncols - col then ncols - col else span_raw
+            let mut cw: int = 0
+            let mut cx_off: int = 0
+            let mut c: int = 0
+            while c < col is
+                cx_off = cx_off + col_w[c] + st.gap
+                c += 1
+            end
+            c = col
+            while c < col + span is
+                cw = cw + col_w[c] + (if c > col then st.gap else 0)
+                c += 1
+            end
+            let r: BlockRes = layout_item(cx, it, id, cw - it.ml - it.mr, w, -1, false)
+            cells = array_push(cells, r)
+            cell_x = array_push(cell_x, cx_off)
+            cell_item = array_push(cell_item, idx)
+            cell_w = array_push(cell_w, cw)
+            let oh: int = r.h + it.mt + it.mb
+            if oh > row_h is row_h = oh end
+            col = col + span
+            idx += 1
+        end
+        if row_i < array_len(row_tracks) && row_tracks[row_i].kind == "px" is row_h = row_tracks[row_i].val end
+        let mut k: int = 0
+        while k < array_len(cells) is
+            let it: FItem = items[cell_item[k]]
+            let r: BlockRes = cells[k]
+            let mut bx: [LayoutBox] = r.boxes
+            let mut dy: int = 0
+            let oh: int = r.h + it.mt + it.mb
+            if it.align == "center" is
+                dy = (row_h - oh) / 2
+            elsif it.align == "flex-end" is
+                dy = row_h - oh
+            elsif it.align == "stretch" && !it.is_text && cx.styles[it.id].height_mode == "auto" && array_len(bx) > 0 is
+                bx[0].h = row_h - it.mt - it.mb
+            end
+            acc = concat_boxes(acc, shift_boxes(bx, x + cell_x[k] + it.ml, cursor_y + dy))
+            k += 1
+        end
+        cursor_y = cursor_y + row_h + (if idx < count then st.row_gap else 0)
+        row_i += 1
+    end
+    return InlineRes { boxes: acc, height: cursor_y - y, used_w: w }
+end
 
-    let m: style::BoxSides = resolve_auto_margins(st.mar_left, st.mar_right, avail_w, box_w)
-    let inner_w: int = box_w - st.pad_left - st.pad_right
-    let inner_x: int = x + m.left + st.pad_left
-    let inner_y_start: int = y + st.mar_top + st.pad_top
+;; ---------- główny układ bloku ----------
+pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_h: int, force_w: int, fit: bool) -> BlockRes is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    let st: style::ComputedStyle = cx.styles[id]
+    let own_h: int = pad_border_h(st)
+    let own_v: int = pad_border_v(st)
+    let mlz: int = m_or_zero(st.mar_left)
+    let mrz: int = m_or_zero(st.mar_right)
+    let mt: int = m_or_zero(st.mar_top)
+    let mb: int = m_or_zero(st.mar_bottom)
+    let replaced: bool = is_replaced(n.tag)
+    let w_spec: int = style::size_of(st.width, st.width_pct, st.width_mode, avail_w)
+    let h_spec: int = style::size_of(st.height, st.height_pct, st.height_mode, avail_h)
 
-    let mut content_res: LayoutResult = LayoutResult { boxes: boxes, height: 0 }
-
-    if st.display == "flex" is
-        content_res = layout_flex(win_handle, dom, sheet, node_id, x, y, st, inner_x, inner_y_start, inner_w, interaction, boxes)
+    let mut border_w: int = 0
+    let mut nat: style::BoxSides = style::BoxSides { top: 0, right: 0, bottom: 0, left: 0 }
+    if replaced is nat = replaced_natural(cx, id) end
+    if force_w >= 0 is
+        border_w = force_w
+    elsif w_spec >= 0 is
+        border_w = if st.border_box then w_spec else w_spec + own_h
+    elsif replaced is
+        let mut cw: int = nat.right
+        if n.tag == "img" && h_spec >= 0 && nat.bottom > 0 is
+            cw = (if st.border_box then h_spec - own_v else h_spec) * nat.right / nat.bottom
+        end
+        border_w = cw + own_h
+    elsif fit is
+        let mc: int = max_content(cx, id, 0)
+        let room: int = avail_w - mlz - mrz
+        border_w = if mc < room then mc else room
+        if border_w < own_h is border_w = own_h end
     else is
-        let mut acc: [LayoutBox] = boxes
-        let mut cursor_y: int = inner_y_start
-        let mut run: [int] = []
+        border_w = avail_w - mlz - mrz
+    end
+    if force_w < 0 is
+        let mn: int = style::size_of(st.min_width, st.min_width_pct, "pct", avail_w)
+        let mx: int = if st.max_width_mode == "auto" then -1 else style::size_of(st.max_width, st.max_width_pct, st.max_width_mode, avail_w)
+        let mn_b: int = if st.border_box then mn else mn + own_h
+        let mx_b: int = if mx < 0 then -1 elsif st.border_box then mx else mx + own_h
+        border_w = clamp_int(border_w, mn_b, mx_b)
+    end
+    if border_w < own_h is border_w = own_h end
 
-        let count: int = array_len(n.children)
-        let mut i: int = 0
-        while i < count is
-            let child_id: int = n.children[i]
-            i += 1
-
-            if is_inline(dom, sheet, child_id, st, interaction) is
-                run = array_push(run, child_id)
-                continue
-            end
-
-            if array_len(run) > 0 is
-                let rres: LayoutResult = flow_inline_run(win_handle, dom, sheet, run, inner_x, cursor_y, inner_w, st, interaction, acc)
-                acc = rres.boxes
-                cursor_y = cursor_y + rres.height
-                run = []
-            end
-
-            let res: LayoutResult = layout_node(win_handle, dom, sheet, child_id, inner_x, cursor_y, inner_w, st, interaction, acc)
-            acc = res.boxes
-            cursor_y = cursor_y + res.height
+    ;; marginesy poziome auto
+    let mut ml: int = mlz
+    let mut mr: int = mrz
+    if force_w < 0 is
+        let free: int = avail_w - border_w - mlz - mrz
+        if st.mar_left == auto_v() && st.mar_right == auto_v() is
+            ml = if free > 0 then free / 2 else 0
+            mr = if free > 0 then free - free / 2 else 0
+        elsif st.mar_left == auto_v() is
+            ml = if free > 0 then free else 0
+        elsif st.mar_right == auto_v() is
+            mr = if free > 0 then free else 0
         end
-
-        if array_len(run) > 0 is
-            let rres: LayoutResult = flow_inline_run(win_handle, dom, sheet, run, inner_x, cursor_y, inner_w, st, interaction, acc)
-            acc = rres.boxes
-            cursor_y = cursor_y + rres.height
-        end
-
-        content_res = LayoutResult { boxes: acc, height: cursor_y - inner_y_start }
     end
 
-    let content_h: int = content_res.height
-    let box_h: int = if st.height >= 0 then st.height else content_h + st.pad_top + st.pad_bottom
+    let cw: int = border_w - own_h
+    let cx0: int = x + ml + st.bl + st.pad_left
+    let cy0: int = y + mt + st.bt + st.pad_top
+    let mut inner_h_spec: int = -1
+    if h_spec >= 0 is
+        inner_h_spec = h_spec
+        if st.border_box is inner_h_spec = h_spec - own_v end
+        if inner_h_spec < 0 is inner_h_spec = 0 end
+    end
 
-    let self_box: LayoutBox = LayoutBox {
-        node_id: node_id, x: x + m.left, y: y + st.mar_top,
-        w: box_w, h: box_h, st: st, text: "", img_src: ""
-    }
-    let final_boxes: [LayoutBox] = array_push(content_res.boxes, self_box)
+    let mut kids: [LayoutBox] = []
+    let mut content_h: int = 0
+    if replaced is
+        content_h = nat.bottom
+        if n.tag == "img" && nat.right > 0 && w_spec >= 0 && h_spec < 0 is
+            content_h = cw * nat.bottom / nat.right
+        end
+    elsif st.display == "flex" || st.display == "inline-flex" is
+        let r: InlineRes = layout_flex(cx, id, cx0, cy0, cw, inner_h_spec, [])
+        kids = r.boxes
+        content_h = r.height
+    elsif st.display == "grid" is
+        let r: InlineRes = layout_grid(cx, id, cx0, cy0, cw, [])
+        kids = r.boxes
+        content_h = r.height
+    else is
+        let r: InlineRes = layout_flow(cx, id, cx0, cy0, cw, inner_h_spec, [])
+        kids = r.boxes
+        content_h = r.height
+    end
 
-    let total_h: int = box_h + st.mar_top + st.mar_bottom
-    return LayoutResult { boxes: final_boxes, height: total_h }
+    let mut border_h: int = 0
+    if h_spec >= 0 is
+        border_h = if st.border_box then h_spec else h_spec + own_v
+    else is
+        border_h = content_h + own_v
+    end
+    let min_h: int = if st.border_box then st.min_height else st.min_height + own_v
+    let max_h: int = if st.max_height_mode == "auto" then -1 elsif st.border_box then st.max_height else st.max_height + own_v
+    border_h = clamp_int(border_h, min_h, max_h)
+
+    let mut self_box: LayoutBox = no_clip_box(id, x + ml, y + mt, border_w, border_h, st, "box")
+    ;; przewijanie / przycinanie
+    if style::is_scroll_container(st) is
+        let px: int = x + ml + st.bl
+        let py: int = y + mt + st.bt
+        let pw: int = border_w - st.bl - st.br
+        let ph: int = border_h - st.bt - st.bb
+        let extent: int = content_h + st.pad_top + st.pad_bottom
+        let max_scroll: int = if extent > ph then extent - ph else 0
+        let mut sy: int = scroll_offset(cx, id)
+        if sy > max_scroll is sy = max_scroll end
+        if sy < 0 is sy = 0 end
+        kids = shift_boxes(kids, 0, 0 - sy)
+        kids = apply_clip(kids, 0, px, py, pw, ph)
+        self_box.content_h = extent
+        self_box.scroll_y = sy
+    end
+    let mut out: [LayoutBox] = [self_box]
+    out = concat_boxes(out, kids)
+
+    ;; znacznik listy
+    if st.display == "list-item" is
+        let marker: string = li_marker(cx, id)
+        let mw: int = text_w(cx, marker, st)
+        let mut mbx: LayoutBox = no_clip_box(id, cx0 - mw - 8, cy0, mw, line_h_of(st), st, "marker")
+        mbx.text = marker
+        out = array_push(out, mbx)
+    end
+    if n.tag == "img" is
+        out[0].img_src = n.attr_src
+    end
+
+    ;; position: relative
+    if st.position == "relative" is
+        let mut dx: int = 0
+        let mut dy: int = 0
+        if st.left != auto_v() is
+            dx = st.left
+        elsif st.right != auto_v() is
+            dx = 0 - st.right
+        end
+        if st.top != auto_v() is
+            dy = st.top
+        elsif st.bottom != auto_v() is
+            dy = 0 - st.bottom
+        end
+        out = shift_boxes(out, dx, dy)
+    end
+    return BlockRes { boxes: out, w: border_w, h: border_h, mt: mt, mb: mb, ml: ml, mr: mr }
 end
 
-;; Punkty wejścia. `win_handle`: uchwyt okna z załadowanym fontem, do
-;; realnego pomiaru tekstu i naturalnego rozmiaru obrazków — przekaż
-;; -1, jeśli layoutujesz bez otwartego okna (np. w testach).
-;;
-;; `layout` (bez stanu interakcji, `css::no_interaction()`) zostaje
-;; niezmieniony — używają go testy i każdy dotychczasowy kod, który nie
-;; wie nic o `:hover`/`:focus`. `layout_i` (rozbudowa v0.2) to to samo,
-;; ale ze stanem myszy/focusu, którego potrzebuje `app.h#`, żeby
-;; `:hover`/`:focus` faktycznie coś malowały.
-pub fn layout(dom: dom::Dom, sheet: css::Stylesheet, viewport_w: int, win_handle: int) -> [LayoutBox] is
-    return layout_i(dom, sheet, viewport_w, win_handle, css::no_interaction())
+;; ---------- elementy position: absolute / fixed ----------
+fn box_rect_of(boxes: [LayoutBox], id: int) -> style::BoxSides is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is
+            return style::BoxSides { top: boxes[i].y, right: boxes[i].w, bottom: boxes[i].h, left: boxes[i].x }
+        end
+        i += 1
+    end
+    return style::BoxSides { top: 0, right: 0, bottom: 0, left: 0 }
 end
 
-pub fn layout_i(dom: dom::Dom, sheet: css::Stylesheet, viewport_w: int, win_handle: int, interaction: css::InteractionState) -> [LayoutBox] is
-    if array_len(dom.nodes) == 0 is return [] end
-    let res: LayoutResult = layout_node(win_handle, dom, sheet, 0, 0, 0, viewport_w, style::root_style(), interaction, [])
-    return res.boxes
+fn positioned_ancestor(cx: LayoutCtx, id: int) -> int is
+    let mut p: int = cx.dom.nodes[id].parent
+    while p > 0 is
+        if cx.styles[p].position != "static" && !cx.dom.nodes[p].removed is return p end
+        p = cx.dom.nodes[p].parent
+    end
+    return -1
+end
+
+fn place_abs(cx: LayoutCtx, id: int, boxes: [LayoutBox], doc_h: int) -> [LayoutBox] is
+    let st: style::ComputedStyle = cx.styles[id]
+    let fixed: bool = st.position == "fixed"
+    let anc: int = if fixed then -1 else positioned_ancestor(cx, id)
+    let mut bx: int = 0
+    let mut by: int = 0
+    let mut bw: int = cx.vw
+    let mut bh: int = if fixed then cx.vh else (if doc_h > cx.vh then doc_h else cx.vh)
+    if anc >= 0 is
+        let r: style::BoxSides = box_rect_of(boxes, anc)
+        let a: style::ComputedStyle = cx.styles[anc]
+        bx = r.left + a.bl
+        by = r.top + a.bt
+        bw = r.right - a.bl - a.br
+        bh = r.bottom - a.bt - a.bb
+    end
+    let own_h: int = pad_border_h(st)
+    let mlz: int = m_or_zero(st.mar_left)
+    let mrz: int = m_or_zero(st.mar_right)
+    let w_spec: int = style::size_of(st.width, st.width_pct, st.width_mode, bw)
+    let mut force: int = -1
+    if w_spec < 0 && st.left != auto_v() && st.right != auto_v() is
+        force = bw - st.left - st.right - mlz - mrz
+        if force < own_h is force = own_h end
+    end
+    let res: BlockRes = layout_block(cx, id, 0, 0, bw, bh, force, true)
+    let mut x: int = bx + mlz
+    if st.left != auto_v() is
+        x = bx + st.left + mlz
+    elsif st.right != auto_v() is
+        x = bx + bw - st.right - res.w - mrz
+    end
+    let mut y: int = by + res.mt
+    if st.top != auto_v() is
+        y = by + st.top + res.mt
+    elsif st.bottom != auto_v() is
+        y = by + bh - st.bottom - res.h - res.mb
+    end
+    let mut placed: [LayoutBox] = shift_boxes(res.boxes, x - res.ml - 0, y - res.mt)
+    if fixed is
+        let mut i: int = 0
+        while i < array_len(placed) is
+            placed[i].fixed = true
+            i += 1
+        end
+    end
+    return concat_boxes(boxes, placed)
+end
+
+;; ---------- punkty wejścia ----------
+pub fn layout_full(d: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport_h: int, win_handle: int,
+                   ix: css::InteractionState, scrolls: [int]) -> LayoutResult is
+    if array_len(d.nodes) == 0 is return LayoutResult { boxes: [], height: 0 } end
+    let styles: [style::ComputedStyle] = compute_styles(d, sheet, ix)
+    let cx: LayoutCtx = LayoutCtx { dom: d, styles: styles, win: win_handle, vw: viewport_w, vh: viewport_h, scrolls: scrolls }
+    let res: BlockRes = layout_block(cx, 0, 0, 0, viewport_w, viewport_h, viewport_w, false)
+    let mut boxes: [LayoutBox] = res.boxes
+    let mut doc_h: int = res.h
+    ;; absolute / fixed w kolejności dokumentu
+    let order: [int] = dom::document_order(d)
+    let mut i: int = 0
+    while i < array_len(order) is
+        let id: int = order[i]
+        i += 1
+        if id == 0 || d.nodes[id].removed || d.nodes[id].tag == "text" is continue end
+        let st: style::ComputedStyle = styles[id]
+        if !is_out_of_flow(st) || st.display == "none" is continue end
+        ;; pomiń, jeśli przodek ma display:none
+        let mut hidden: bool = false
+        let mut p: int = d.nodes[id].parent
+        while p > 0 is
+            if styles[p].display == "none" is hidden = true end
+            p = d.nodes[p].parent
+        end
+        if hidden is continue end
+        boxes = place_abs(cx, id, boxes, doc_h)
+    end
+    i = 0
+    while i < array_len(boxes) is
+        if !boxes[i].fixed && boxes[i].y + boxes[i].h > doc_h && boxes[i].kind == "box" is doc_h = boxes[i].y + boxes[i].h end
+        i += 1
+    end
+    return LayoutResult { boxes: boxes, height: doc_h }
+end
+
+;; Zgodność wsteczna.
+pub fn layout_i(d: dom::Dom, sheet: css::Stylesheet, viewport_w: int, win_handle: int, ix: css::InteractionState) -> [LayoutBox] is
+    return layout_full(d, sheet, viewport_w, 600, win_handle, ix, []).boxes
+end
+
+pub fn layout(d: dom::Dom, sheet: css::Stylesheet, viewport_w: int, win_handle: int) -> [LayoutBox] is
+    return layout_i(d, sheet, viewport_w, win_handle, css::no_interaction())
 end
