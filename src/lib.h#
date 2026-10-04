@@ -1,7 +1,11 @@
 mod app
 mod window
 mod ipc
+mod ui
 mod dialog
+mod edit
+mod data
+mod engine
 
 pub fn version() -> string is
     return "0.2.0"
