@@ -1,145 +1,632 @@
 mod ffi_shim
 mod dom
 mod layout
-mod jsonval
+mod style
 
-;; Skaluje kanał alfa przez opacity (0..100, patrz engine/style.h#).
-;; opacity: 100 (domyślne, w pełni kryjące) zwraca `a` bez zmian.
-;; `pub`, żeby dało się przetestować bez otwartego okna/SDL — reszta
-;; `render()` woła prawdziwe FFI i nie nadaje się do testów jednostkowych.
+;; Stan potrzebny tylko do rysowania (budowany przez app.h# co klatkę).
+pub struct RenderState is
+    pub scroll_y:   int
+    pub focused:    int     ;; id węzła z fokusem (-1 = brak)
+    pub cursor:     int     ;; pozycja kursora (bajty) w polu z fokusem
+    pub anchor:     int     ;; początek zaznaczenia (bajty); == cursor gdy brak
+    pub caret_on:   bool    ;; faza migania kursora
+    pub ime:        string  ;; tekst kompozycji IME
+    pub hovered:    int
+    pub viewport_h: int
+end
+
+pub fn plain_state(scroll_y: int) -> RenderState is
+    return RenderState { scroll_y: scroll_y, focused: -1, cursor: 0, anchor: 0, caret_on: false, ime: "", hovered: -1, viewport_h: 100000 }
+end
+
 pub fn scaled_alpha(a: int, opacity: int) -> int is
-    if opacity >= 100 is return a end
-    if opacity <= 0 is return 0 end
     return a * opacity / 100
 end
 
-pub fn render(win_handle: int, boxes: [layout::LayoutBox], dom: dom::Dom,
-              scroll_y: int, input_values: jsonval::JsonValue, focused_id: string) is
-    ffi_shim::silver_clear(win_handle, 250, 250, 250)
+fn flags_of(st: style::ComputedStyle) -> int is
+    let mut f: int = 0
+    if st.bold is f += 1 end
+    if st.italic is f += 2 end
+    if st.underline is f += 4 end
+    if st.strike is f += 8 end
+    return f
+end
 
+fn fill(win: int, x: int, y: int, w: int, h: int, c: style::Color, opacity: int) -> int is
+    if w <= 0 || h <= 0 || c.a <= 0 is return 0 end
+    ffi_shim::silver_fill_rect(win, x, y, w, h, c.r, c.g, c.b, scaled_alpha(c.a, opacity))
+    return 0
+end
+
+fn max_radius(st: style::ComputedStyle) -> int is
+    let mut r: int = st.rad_tl
+    if st.rad_tr > r is r = st.rad_tr end
+    if st.rad_br > r is r = st.rad_br end
+    if st.rad_bl > r is r = st.rad_bl end
+    return r
+end
+
+fn round_fill(win: int, x: int, y: int, w: int, h: int, rad: int, c: style::Color, opacity: int) -> int is
+    if w <= 0 || h <= 0 || c.a <= 0 is return 0 end
+    let a: int = scaled_alpha(c.a, opacity)
+    if rad <= 0 is
+        ffi_shim::silver_fill_rect(win, x, y, w, h, c.r, c.g, c.b, a)
+    else is
+        ffi_shim::silver_fill_round_rect(win, x, y, w, h, rad, c.r, c.g, c.b, a)
+    end
+    return 0
+end
+
+fn same_color(a: style::Color, b: style::Color) -> bool is
+    return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
+end
+
+;; ---------- cień ----------
+fn draw_shadow(win: int, x: int, y: int, w: int, h: int, st: style::ComputedStyle) -> int is
+    let blur: int = if st.sh_blur > 12 then 12 else st.sh_blur
+    let layers: int = if blur < 1 then 1 else blur
+    let rad: int = max_radius(st)
+    let per: int = st.sh_color.a / (layers + 1)
+    let mut i: int = 1
+    while i <= layers is
+        let grow: int = st.sh_spread + (layers - i + 1) * (if st.sh_blur > 0 then st.sh_blur else 0) / layers
+        let c: style::Color = style::Color { r: st.sh_color.r, g: st.sh_color.g, b: st.sh_color.b, a: per + (if i == layers then per else 0) }
+        round_fill(win, x + st.sh_x - grow, y + st.sh_y - grow, w + grow * 2, h + grow * 2, rad + grow, c, st.opacity)
+        i += 1
+    end
+    return 0
+end
+
+;; ---------- obramowanie ----------
+fn draw_border(win: int, x: int, y: int, w: int, h: int, st: style::ComputedStyle) -> int is
+    if st.bt <= 0 && st.br <= 0 && st.bb <= 0 && st.bl <= 0 is return 0 end
+    let rad: int = max_radius(st)
+    let uniform: bool = st.bt == st.br && st.br == st.bb && st.bb == st.bl &&
+                        same_color(st.bct, st.bcr) && same_color(st.bcr, st.bcb) && same_color(st.bcb, st.bcl)
+    if uniform is
+        let c: style::Color = st.bct
+        if c.a > 0 is
+            if rad > 0 is
+                ffi_shim::silver_stroke_round_rect(win, x, y, w, h, rad, st.bt, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity))
+            else is
+                fill(win, x, y, w, st.bt, c, st.opacity)
+                fill(win, x, y + h - st.bb, w, st.bb, c, st.opacity)
+                fill(win, x, y + st.bt, st.bl, h - st.bt - st.bb, c, st.opacity)
+                fill(win, x + w - st.br, y + st.bt, st.br, h - st.bt - st.bb, c, st.opacity)
+            end
+        end
+        return 0
+    end
+    fill(win, x, y, w, st.bt, st.bct, st.opacity)
+    fill(win, x, y + h - st.bb, w, st.bb, st.bcb, st.opacity)
+    fill(win, x, y + st.bt, st.bl, h - st.bt - st.bb, st.bcl, st.opacity)
+    fill(win, x + w - st.br, y + st.bt, st.br, h - st.bt - st.bb, st.bcr, st.opacity)
+    return 0
+end
+
+;; ---------- obrazy (object-fit / background-size) ----------
+fn draw_fitted(win: int, path: string, x: int, y: int, w: int, h: int, mode: string, alpha: int, rx: int, ry: int, rw: int, rh: int) -> int is
+    let iw: int = ffi_shim::silver_image_width(win, path)
+    let ih: int = ffi_shim::silver_image_height(win, path)
+    if iw <= 0 || ih <= 0 is return 0 end
+    if mode == "fill" || mode == "100% 100%" is
+        ffi_shim::silver_draw_image(win, path, x, y, w, h, alpha)
+        return 0
+    end
+    let mut dw: int = w
+    let mut dh: int = h
+    if mode == "contain" || mode == "scale-down" is
+        if iw * h > ih * w is
+            dw = w
+            dh = w * ih / iw
+        else is
+            dh = h
+            dw = h * iw / ih
+        end
+    elsif mode == "cover" is
+        if iw * h > ih * w is
+            dh = h
+            dw = h * iw / ih
+        else is
+            dw = w
+            dh = w * ih / iw
+        end
+    elsif mode == "none" || mode == "auto" is
+        dw = iw
+        dh = ih
+    end
+    let dx: int = x + (w - dw) / 2
+    let dy: int = y + (h - dh) / 2
+    ffi_shim::silver_clip_set(win, rx, ry, rw, rh)
+    ffi_shim::silver_draw_image(win, path, dx, dy, dw, dh, alpha)
+    return 0
+end
+
+;; ---------- pola tekstowe ----------
+fn size_of(st: style::ComputedStyle) -> int is
+    return st.font_size
+end
+
+fn text_width(win: int, s: string, st: style::ComputedStyle) -> int is
+    if s == "" is return 0 end
+    return ffi_shim::silver_measure_text_ex(win, s, st.font_size, flags_of(st))
+end
+
+fn mask_of(s: string) -> string is
+    let n: int = ffi_shim::silver_utf8_len(s)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        out = out + "•"
+        i += 1
+    end
+    return out
+end
+
+;; Tekst do pokazania w polu (hasło → kropki). Pozycje kursora przeliczane jest przez prefiks.
+fn shown_prefix(value: string, pos: int, password: bool) -> string is
+    let p: string = string_slice(value, 0, if pos > string_len(value) then string_len(value) else pos)
+    if password is return mask_of(p) end
+    return p
+end
+
+pub struct TaLines is
+    pub lines:  [string]
+    pub starts: [int]
+end
+
+;; Dzieli wartość textarea na wiersze (twarde \n + zawijanie do `inner_w`).
+pub fn ta_lines(win: int, value: string, st: style::ComputedStyle, inner_w: int) -> TaLines is
+    let mut lines: [string] = []
+    let mut starts: [int] = []
+    let hard: [string] = string_split(value, "\n")
+    let mut base: int = 0
+    let mut hi: int = 0
+    while hi < array_len(hard) is
+        let mut rest: string = hard[hi]
+        let mut off: int = 0
+        if rest == "" is
+            lines = array_push(lines, "")
+            starts = array_push(starts, base)
+        end
+        let mut guard: int = 0
+        while rest != "" && guard < 2000 is
+            guard += 1
+            let mut cut: int = ffi_shim::silver_text_fit(win, rest, st.font_size, flags_of(st), inner_w)
+            if cut >= string_len(rest) is
+                cut = string_len(rest)
+            else is
+                ;; preferuj łamanie na spacji
+                let head: string = string_slice(rest, 0, cut)
+                let mut sp: int = -1
+                let mut k: int = string_len(head) - 1
+                while k > 0 is
+                    if string_slice(head, k, k + 1) == " " is
+                        sp = k
+                        break
+                    end
+                    k -= 1
+                end
+                if sp > 0 is cut = sp + 1 end
+                if cut <= 0 is cut = ffi_shim::silver_utf8_next(rest, 0) end
+            end
+            lines = array_push(lines, string_slice(rest, 0, cut))
+            starts = array_push(starts, base + off)
+            off = off + cut
+            rest = string_slice(rest, cut, string_len(rest))
+        end
+        base = base + string_len(hard[hi]) + 1
+        hi += 1
+    end
+    if array_len(lines) == 0 is
+        lines = array_push(lines, "")
+        starts = array_push(starts, 0)
+    end
+    return TaLines { lines: lines, starts: starts }
+end
+
+;; indeks wiersza zawierającego pozycję `pos`
+pub fn ta_line_of(t: TaLines, pos: int) -> int is
+    let mut best: int = 0
+    let mut i: int = 0
+    while i < array_len(t.starts) is
+        if t.starts[i] <= pos is best = i end
+        i += 1
+    end
+    return best
+end
+
+fn draw_input(win: int, d: dom::Dom, b: layout::LayoutBox, by: int, rs: RenderState) -> int is
+    let n: dom::DomNode = d.nodes[b.node_id]
+    let st: style::ComputedStyle = b.st
+    let focused: bool = rs.focused == b.node_id
+    let ix: int = b.x + st.bl + st.pad_left
+    let iy: int = by + st.bt + st.pad_top
+    let iw: int = b.w - st.bl - st.br - st.pad_left - st.pad_right
+    let ih: int = b.h - st.bt - st.bb - st.pad_top - st.pad_bottom
+    let lh: int = layout::normal_line_height(st.font_size)
+    let fl: int = flags_of(st)
+    let kind: string = string_lower(n.attr_type)
+    let password: bool = kind == "password"
+    let value: string = n.attr_value
+    ffi_shim::silver_clip_set(win, ix, by + st.bt, iw, b.h - st.bt - st.bb)
+    let tc: style::Color = st.color
+    if n.tag == "textarea" is
+        let t: TaLines = ta_lines(win, value, st, iw)
+        let mut li: int = 0
+        if focused && rs.anchor != rs.cursor is
+            let lo: int = if rs.anchor < rs.cursor then rs.anchor else rs.cursor
+            let hi: int = if rs.anchor < rs.cursor then rs.cursor else rs.anchor
+            li = 0
+            while li < array_len(t.lines) is
+                let ls: int = t.starts[li]
+                let le: int = ls + string_len(t.lines[li])
+                let a0: int = if lo > ls then lo else ls
+                let a1: int = if hi < le then hi else le
+                if a1 > a0 is
+                    let x0: int = text_width(win, string_slice(value, ls, a0), st)
+                    let x1: int = text_width(win, string_slice(value, ls, a1), st)
+                    fill(win, ix + x0, iy + li * lh, x1 - x0, lh, style::Color { r: 51, g: 144, b: 255, a: 110 }, 100)
+                end
+                li += 1
+            end
+        end
+        if value == "" && n.attr_placeholder != "" && !focused is
+            ffi_shim::silver_draw_text_ex(win, ix, iy, n.attr_placeholder, tc.r, tc.g, tc.b, 110, st.font_size, fl)
+        end
+        li = 0
+        while li < array_len(t.lines) is
+            let line: string = t.lines[li]
+            let trimmed: string = if string_ends_with(line, " ") then string_slice(line, 0, string_len(line) - 1) else line
+            if trimmed != "" is
+                ffi_shim::silver_draw_text_ex(win, ix, iy + li * lh, trimmed, tc.r, tc.g, tc.b, scaled_alpha(tc.a, st.opacity), st.font_size, fl)
+            end
+            li += 1
+        end
+        if focused && rs.caret_on is
+            let cl: int = ta_line_of(t, rs.cursor)
+            let cx: int = text_width(win, string_slice(value, t.starts[cl], rs.cursor), st)
+            fill(win, ix + cx, iy + cl * lh, 1, lh, tc, 100)
+        end
+        return 0
+    end
+
+    ;; jednowierszowe pole
+    let shown: string = if password then mask_of(value) else value
+    let caret_x: int = text_width(win, shown_prefix(value, rs.cursor, password), st)
+    let mut scroll: int = 0
+    if focused && caret_x > iw - 2 is scroll = caret_x - iw + 2 end
+    let ty: int = iy + (ih - lh) / 2
+    if focused && rs.anchor != rs.cursor is
+        let lo: int = if rs.anchor < rs.cursor then rs.anchor else rs.cursor
+        let hi: int = if rs.anchor < rs.cursor then rs.cursor else rs.anchor
+        let x0: int = text_width(win, shown_prefix(value, lo, password), st)
+        let x1: int = text_width(win, shown_prefix(value, hi, password), st)
+        fill(win, ix + x0 - scroll, ty, x1 - x0, lh, style::Color { r: 51, g: 144, b: 255, a: 110 }, 100)
+    end
+    if value == "" && n.attr_placeholder != "" && rs.ime == "" is
+        ffi_shim::silver_draw_text_ex(win, ix, ty, n.attr_placeholder, tc.r, tc.g, tc.b, 110, st.font_size, fl)
+    end
+    if shown != "" is
+        ffi_shim::silver_draw_text_ex(win, ix - scroll, ty, shown, tc.r, tc.g, tc.b, scaled_alpha(tc.a, st.opacity), st.font_size, fl)
+    end
+    if focused && rs.ime != "" is
+        let ime_x: int = ix - scroll + caret_x
+        ffi_shim::silver_draw_text_ex(win, ime_x, ty, rs.ime, tc.r, tc.g, tc.b, 255, st.font_size, 4)
+    end
+    if focused && rs.caret_on is
+        let ime_w: int = if rs.ime != "" then text_width(win, rs.ime, st) else 0
+        fill(win, ix - scroll + caret_x + ime_w, ty, 1, lh, tc, 100)
+    end
+    return 0
+end
+
+fn draw_check(win: int, b: layout::LayoutBox, by: int, d: dom::Dom, rs: RenderState, radio: bool) -> int is
+    let n: dom::DomNode = d.nodes[b.node_id]
+    let st: style::ComputedStyle = b.st
+    let size: int = 16
+    let x: int = b.x + (b.w - size) / 2
+    let y: int = by + (b.h - size) / 2
+    let accent: style::Color = style::Color { r: 11, g: 107, b: 203, a: 255 }
+    let edge: style::Color = if n.checked then accent else style::Color { r: 118, g: 118, b: 118, a: 255 }
+    let rad: int = if radio then 8 else 3
+    round_fill(win, x, y, size, size, rad, if n.checked && !radio then accent else style::Color { r: 255, g: 255, b: 255, a: 255 }, st.opacity)
+    ffi_shim::silver_stroke_round_rect(win, x, y, size, size, rad, 1, edge.r, edge.g, edge.b, scaled_alpha(255, st.opacity))
+    if n.checked is
+        if radio is
+            round_fill(win, x + 4, y + 4, 8, 8, 4, accent, st.opacity)
+        else is
+            let w: style::Color = style::Color { r: 255, g: 255, b: 255, a: 255 }
+            ;; ptaszek z odcinków 2 px
+            let mut i: int = 0
+            while i < 3 is
+                fill(win, x + 3 + i, y + 8 + i, 2, 2, w, st.opacity)
+                i += 1
+            end
+            i = 0
+            while i < 6 is
+                fill(win, x + 6 + i, y + 10 - i, 2, 2, w, st.opacity)
+                i += 1
+            end
+        end
+    end
+    if rs.focused == b.node_id is
+        ffi_shim::silver_stroke_round_rect(win, x - 2, y - 2, size + 4, size + 4, rad + 2, 1, 51, 144, 255, 200)
+    end
+    return 0
+end
+
+;; Tekst wybranej opcji <select>
+pub fn select_label(d: dom::Dom, node_id: int) -> string is
+    let n: dom::DomNode = d.nodes[node_id]
+    let mut first: string = ""
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let c: dom::DomNode = d.nodes[n.children[i]]
+        i += 1
+        if c.tag != "option" || c.removed is continue end
+        let label: string = dom::text_content(d, c.id)
+        let val: string = if c.attr_value != "" then c.attr_value else label
+        if first == "" is first = label end
+        if n.attr_value != "" && val == n.attr_value is return label end
+        if n.attr_value == "" && dom::has_attr(c, "selected") is return label end
+    end
+    return first
+end
+
+fn draw_select(win: int, d: dom::Dom, b: layout::LayoutBox, by: int, rs: RenderState) -> int is
+    let st: style::ComputedStyle = b.st
+    let ix: int = b.x + st.bl + st.pad_left
+    let lh: int = layout::normal_line_height(st.font_size)
+    let ty: int = by + (b.h - lh) / 2
+    let label: string = select_label(d, b.node_id)
+    ffi_shim::silver_clip_set(win, ix, by, b.w - st.bl - st.br - st.pad_left - 22, b.h)
+    ffi_shim::silver_draw_text_ex(win, ix, ty, label, st.color.r, st.color.g, st.color.b, scaled_alpha(st.color.a, st.opacity), st.font_size, flags_of(st))
+    ffi_shim::silver_clip_clear(win)
+    let ax: int = b.x + b.w - st.br - 16
+    let ay: int = by + b.h / 2 - 2
+    let mut i: int = 0
+    while i < 4 is
+        ffi_shim::silver_fill_rect(win, ax + i, ay + i, 8 - i * 2, 1, 90, 90, 90, 255)
+        i += 1
+    end
+    return 0
+end
+
+fn draw_button_input(win: int, d: dom::Dom, b: layout::LayoutBox, by: int) -> int is
+    let n: dom::DomNode = d.nodes[b.node_id]
+    let st: style::ComputedStyle = b.st
+    let label: string = if n.attr_value != "" then n.attr_value else "OK"
+    let tw: int = text_width(win, label, st)
+    let lh: int = layout::normal_line_height(st.font_size)
+    ffi_shim::silver_draw_text_ex(win, b.x + (b.w - tw) / 2, by + (b.h - lh) / 2, label, st.color.r, st.color.g, st.color.b,
+                                  scaled_alpha(st.color.a, st.opacity), st.font_size, flags_of(st))
+    return 0
+end
+
+;; ---------- pasek przewijania ----------
+fn draw_scrollbar(win: int, b: layout::LayoutBox, by: int) -> int is
+    let st: style::ComputedStyle = b.st
+    if st.overflow_y != "scroll" && st.overflow_y != "auto" is return 0 end
+    let inner_h: int = b.h - st.bt - st.bb
+    if b.content_h <= inner_h || inner_h <= 0 is return 0 end
+    ffi_shim::silver_clip_clear(win)
+    let track_x: int = b.x + b.w - st.br - 7
+    let mut thumb: int = inner_h * inner_h / b.content_h
+    if thumb < 24 is thumb = 24 end
+    let range: int = b.content_h - inner_h
+    let travel: int = inner_h - thumb
+    let ty: int = by + st.bt + (if range > 0 then b.scroll_y * travel / range else 0)
+    ffi_shim::silver_fill_round_rect(win, track_x, ty, 5, thumb, 2, 90, 90, 90, 140)
+    return 0
+end
+
+;; ---------- główne rysowanie ----------
+fn background_of(win: int, b: layout::LayoutBox, x: int, y: int, w: int, h: int) -> int is
+    let st: style::ComputedStyle = b.st
+    let rad: int = max_radius(st)
+    if st.has_shadow is draw_shadow(win, x, y, w, h, st) end
+    if st.has_bg is
+        round_fill(win, x, y, w, h, rad, st.background, st.opacity)
+    end
+    if st.has_grad is
+        let a1: int = scaled_alpha(st.grad_from.a, st.opacity)
+        let a2: int = scaled_alpha(st.grad_to.a, st.opacity)
+        ffi_shim::silver_fill_gradient(win, x, y, w, h, st.grad_from.r, st.grad_from.g, st.grad_from.b, a1,
+                                       st.grad_to.r, st.grad_to.g, st.grad_to.b, a2, if st.grad_vertical then 1 else 0)
+    end
+    if st.bg_image != "" is
+        let mode: string = if st.bg_size == "auto" then "none" else st.bg_size
+        draw_fitted(win, st.bg_image, x, y, w, h, mode, scaled_alpha(255, st.opacity), x, y, w, h)
+    end
+    return 0
+end
+
+fn set_box_clip(win: int, b: layout::LayoutBox, dy: int) -> int is
+    if b.has_clip is
+        let cy: int = if b.fixed then b.cy else b.cy + dy
+        ffi_shim::silver_clip_set(win, b.cx, cy, b.cw, b.ch)
+    else is
+        ffi_shim::silver_clip_clear(win)
+    end
+    return 0
+end
+
+pub fn render(win: int, boxes: [layout::LayoutBox], d: dom::Dom, rs: RenderState, bg: style::Color) -> int is
+    ffi_shim::silver_clear(win, bg.r, bg.g, bg.b)
     let count: int = array_len(boxes)
-    let mut i: int = count - 1
+    let mut i: int = 0
+    while i < count is
+        let b: layout::LayoutBox = boxes[i]
+        i += 1
+        let dy: int = if b.fixed then 0 else 0 - rs.scroll_y
+        let by: int = b.y + dy
+        if by > rs.viewport_h || by + b.h < 0 && b.kind != "text" is continue end
+        if by > rs.viewport_h is continue end
+        set_box_clip(win, b, dy)
+        let st: style::ComputedStyle = b.st
+        if !st.visible is continue end
+        if b.kind == "box" || b.kind == "inlinebg" is
+            let n: dom::DomNode = d.nodes[b.node_id]
+            background_of(win, b, b.x, by, b.w, b.h)
+            if b.img_src != "" is
+                let pad_x: int = b.x + st.bl + st.pad_left
+                let pad_y: int = by + st.bt + st.pad_top
+                let iw: int = b.w - st.bl - st.br - st.pad_left - st.pad_right
+                let ih: int = b.h - st.bt - st.bb - st.pad_top - st.pad_bottom
+                draw_fitted(win, b.img_src, pad_x, pad_y, iw, ih, st.object_fit, scaled_alpha(255, st.opacity), pad_x, pad_y, iw, ih)
+                set_box_clip(win, b, dy)
+            end
+            draw_border(win, b.x, by, b.w, b.h, st)
+            if b.kind == "box" is
+                if n.tag == "input" is
+                    let kind: string = string_lower(n.attr_type)
+                    if kind == "checkbox" || kind == "radio" is
+                        draw_check(win, b, by, d, rs, kind == "radio")
+                    elsif kind == "button" || kind == "submit" || kind == "reset" is
+                        draw_button_input(win, d, b, by)
+                    elsif kind != "hidden" is
+                        draw_input(win, d, b, by, rs)
+                    end
+                elsif n.tag == "textarea" is
+                    draw_input(win, d, b, by, rs)
+                elsif n.tag == "select" is
+                    draw_select(win, d, b, by, rs)
+                end
+                if rs.focused == b.node_id && st.outline_w > 0 is
+                    let o: style::Color = st.outline_color
+                    ffi_shim::silver_clip_clear(win)
+                    ffi_shim::silver_stroke_round_rect(win, b.x - st.outline_w, by - st.outline_w, b.w + st.outline_w * 2, b.h + st.outline_w * 2,
+                                                       max_radius(st) + st.outline_w, st.outline_w, o.r, o.g, o.b, scaled_alpha(o.a, st.opacity))
+                    set_box_clip(win, b, dy)
+                end
+                if style::is_scroll_container(st) is
+                    draw_scrollbar(win, b, by)
+                end
+            end
+        elsif b.kind == "text" || b.kind == "marker" is
+            if b.text != "" is
+                let c: style::Color = st.color
+                ffi_shim::silver_draw_text_ex(win, b.x, by, b.text, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity), st.font_size, flags_of(st))
+            end
+        end
+    end
+    ffi_shim::silver_clip_clear(win)
+    return 0
+end
+
+;; ---------- hit-test ----------
+;; Punkt (px, py) we współrzędnych OKNA; scroll_y dodajemy do boxów nie-fixed.
+fn inside_clip(b: layout::LayoutBox, px: int, py_doc: int, py_view: int) -> bool is
+    if !b.has_clip is return true end
+    let py: int = if b.fixed then py_view else py_doc
+    return px >= b.cx && px < b.cx + b.cw && py >= b.cy && py < b.cy + b.ch
+end
+
+;; id węzła na wierzchu w punkcie (dowolny element), -1 gdy nic.
+pub fn hit_test_at(boxes: [layout::LayoutBox], px: int, py: int, scroll_y: int) -> int is
+    let mut i: int = array_len(boxes) - 1
     while i >= 0 is
         let b: layout::LayoutBox = boxes[i]
         i -= 1
-        let by: int = b.y - scroll_y
-
-        if b.img_src != "" is
-            ffi_shim::silver_draw_image(win_handle, b.img_src, b.x, by, b.w, b.h,
-                scaled_alpha(255, b.st.opacity))
-            continue
-        end
-
-        if b.text != "" is
-            ffi_shim::silver_draw_text(win_handle, b.x, by, b.text,
-                b.st.color.r, b.st.color.g, b.st.color.b,
-                scaled_alpha(b.st.color.a, b.st.opacity))
-            continue
-        end
-
-        if b.st.has_bg is
-            ffi_shim::silver_fill_rect(win_handle, b.x, by, b.w, b.h,
-                b.st.background.r, b.st.background.g, b.st.background.b,
-                scaled_alpha(b.st.background.a, b.st.opacity))
-        end
-        if b.st.border > 0 is
-            ffi_shim::silver_stroke_rect(win_handle, b.x, by, b.w, b.h,
-                b.st.border_color.r, b.st.border_color.g, b.st.border_color.b,
-                scaled_alpha(b.st.border_color.a, b.st.opacity))
-        end
-
-        if b.node_id >= 0 && dom.nodes[b.node_id].tag == "input" is
-            draw_input(win_handle, dom, b, by, input_values, focused_id)
-        end
-    end
-
-    ffi_shim::silver_present(win_handle)
-end
-
-fn draw_input(win_handle: int, dom: dom::Dom, b: layout::LayoutBox, by: int,
-              input_values: jsonval::JsonValue, focused_id: string) is
-    let node: dom::DomNode = dom.nodes[b.node_id]
-    let stored: string = jsonval::get_str(input_values, node.attr_id)
-    let value: string = if stored != "" then stored else node.attr_value
-    let text_x: int = b.x + 8
-    let text_y: int = by + (b.h - b.st.font_size) / 2
-
-    if value != "" is
-        ffi_shim::silver_draw_text(win_handle, text_x, text_y, value,
-            b.st.color.r, b.st.color.g, b.st.color.b, 255)
-    end
-
-    if node.attr_id != "" && node.attr_id == focused_id is
-        let cursor_x: int = text_x + ffi_shim::silver_measure_text(win_handle, value) + 2
-        ffi_shim::silver_fill_rect(win_handle, cursor_x, by + 4, 2, b.h - 8,
-            b.st.color.r, b.st.color.g, b.st.color.b, 255)
-    end
-end
-
-;; Zwraca node_id pierwszego (najbardziej "na wierzchu") elementu z
-;; niepustym on_click, którego prostokąt zawiera (px, py) — we
-;; WSPÓŁRZĘDNYCH EKRANU (a więc już przesuniętych o scroll_y przez
-;; wywołującego, patrz app.h#), albo -1. Używane wyłącznie do
-;; dispatchu komend (`app::handle_click`) — dla stylu (`:hover`/
-;; `:active`) używaj `hit_test_any` niżej, które nie ma tego filtra.
-pub fn hit_test(boxes: [layout::LayoutBox], dom: dom::Dom, px: int, py: int) -> int is
-    let count: int = array_len(boxes)
-    let mut i: int = 0
-    while i < count is
-        let b: layout::LayoutBox = boxes[i]
-        i += 1
-        if b.node_id < 0 is continue end
-        let node: dom::DomNode = dom.nodes[b.node_id]
-        if node.on_click == "" is continue end
-        if px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h is
+        let y_doc: int = py + scroll_y
+        let y: int = if b.fixed then py else y_doc
+        if px >= b.x && px < b.x + b.w && y >= b.y && y < b.y + b.h && inside_clip(b, px, y_doc, py) && b.st.visible is
             return b.node_id
         end
     end
     return -1
 end
 
-;; Rozbudowa v0.2: jak `hit_test`, ale bez filtra `on_click != ""` —
-;; zwraca node_id NAJGŁĘBIEJ zagnieżdżonego elementu (dowolnego, nie
-;; tylko klikalnego) pod kursorem, albo -1. To właśnie ten hit-test
-;; zasila `App.hovered_node`/`App.active_node` (patrz `app.h#`), więc
-;; CSS `:hover`/`:active` działa teraz na KAŻDYM elemencie ze
-;; stylem, nie tylko na tych z `on-click` — dawniej to było
-;; udokumentowane ograniczenie (patrz ROADMAP.md).
-;;
-;; "Najgłębiej zagnieżdżony pierwszy" wynika z kolejności `boxes`:
-;; `layout_node` dopisuje "self box" elementu PO jego dzieciach
-;; (post-order), więc skan od początku tablicy trafia najpierw na
-;; potomków, potem na przodków — dokładnie odwrotność kolejności
-;; malowania (`paint::render` idzie od końca), i dokładnie to, czego
-;; chcemy: najbardziej szczegółowe trafienie.
+;; Zgodność wsteczna: punkt we współrzędnych dokumentu.
 pub fn hit_test_any(boxes: [layout::LayoutBox], px: int, py: int) -> int is
-    let count: int = array_len(boxes)
-    let mut i: int = 0
-    while i < count is
-        let b: layout::LayoutBox = boxes[i]
-        i += 1
-        if b.node_id < 0 is continue end
-        if px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h is
-            return b.node_id
+    return hit_test_at(boxes, px, py, 0)
+end
+
+;; Najbliższy przodek-lub-ten-węzeł spełniający `pred`: "click" | "input" | "hover"
+pub fn find_handler_node(d: dom::Dom, start: int, kind: string) -> int is
+    let mut cur: int = start
+    while cur >= 0 is
+        let n: dom::DomNode = d.nodes[cur]
+        if kind == "click" && (n.on_click != "" || n.tag == "button" || n.tag == "a" || n.tag == "label" || n.tag == "select" ||
+                               (n.tag == "input" && (string_lower(n.attr_type) == "checkbox" || string_lower(n.attr_type) == "radio" ||
+                                                     string_lower(n.attr_type) == "submit" || string_lower(n.attr_type) == "button")) ) is
+            return cur
         end
+        if kind == "input" && (n.tag == "textarea" || n.tag == "select" || (n.tag == "input" && string_lower(n.attr_type) != "hidden")) is return cur end
+        if kind == "hover" && n.on_hover != "" is return cur end
+        cur = n.parent
     end
     return -1
 end
 
-;; Jak wyżej, ale szuka <input> pod (px, py) i zwraca jego attr_id
-;; (albo "" jeśli nic nie trafiono) — używane do ustawiania fokusu.
-pub fn hit_test_input(boxes: [layout::LayoutBox], dom: dom::Dom, px: int, py: int) -> string is
-    let count: int = array_len(boxes)
+;; Zgodność wsteczna: węzeł z on-click pod kursorem albo -1.
+pub fn hit_test(boxes: [layout::LayoutBox], d: dom::Dom, px: int, py: int) -> int is
+    let hit: int = hit_test_at(boxes, px, py, 0)
+    let mut cur: int = hit
+    while cur >= 0 is
+        if d.nodes[cur].on_click != "" is return cur end
+        cur = d.nodes[cur].parent
+    end
+    return -1
+end
+
+;; Węzeł pola formularza pod kursorem albo -1.
+pub fn hit_input_node(boxes: [layout::LayoutBox], d: dom::Dom, px: int, py: int, scroll_y: int) -> int is
+    let hit: int = hit_test_at(boxes, px, py, scroll_y)
+    return find_handler_node(d, hit, "input")
+end
+
+;; Zgodność wsteczna: attr_id pola formularza pod kursorem ("" gdy brak).
+pub fn hit_test_input(boxes: [layout::LayoutBox], d: dom::Dom, px: int, py: int) -> string is
+    let id: int = hit_input_node(boxes, d, px, py, 0)
+    if id < 0 is return "" end
+    return d.nodes[id].attr_id
+end
+
+;; Najwyższy kontener przewijany (overflow scroll/auto z nadmiarem) pod punktem.
+pub fn scroll_container_at(boxes: [layout::LayoutBox], d: dom::Dom, px: int, py: int, scroll_y: int) -> int is
+    let hit: int = hit_test_at(boxes, px, py, scroll_y)
+    let mut cur: int = hit
+    while cur >= 0 is
+        let mut i: int = 0
+        while i < array_len(boxes) is
+            let b: layout::LayoutBox = boxes[i]
+            i += 1
+            if b.node_id == cur && b.kind == "box" && b.content_h > b.h - b.st.bt - b.st.bb && style::is_scroll_container(b.st) is
+                return cur
+            end
+        end
+        cur = d.nodes[cur].parent
+    end
+    return -1
+end
+
+;; Wysokość maksymalnego przewinięcia kontenera.
+pub fn max_scroll_of(boxes: [layout::LayoutBox], node_id: int) -> int is
     let mut i: int = 0
-    while i < count is
+    while i < array_len(boxes) is
         let b: layout::LayoutBox = boxes[i]
         i += 1
-        if b.node_id < 0 is continue end
-        let node: dom::DomNode = dom.nodes[b.node_id]
-        if node.tag != "input" is continue end
-        if px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h is
-            return node.attr_id
+        if b.node_id == node_id && b.kind == "box" is
+            let inner: int = b.h - b.st.bt - b.st.bb
+            return if b.content_h > inner then b.content_h - inner else 0
         end
     end
-    return ""
+    return 0
+end
+
+;; Kursor CSS pod punktem (z dziedziczenia stylu boxa na wierzchu).
+pub fn cursor_at(boxes: [layout::LayoutBox], px: int, py: int, scroll_y: int) -> string is
+    let mut i: int = array_len(boxes) - 1
+    while i >= 0 is
+        let b: layout::LayoutBox = boxes[i]
+        i -= 1
+        let y_doc: int = py + scroll_y
+        let y: int = if b.fixed then py else y_doc
+        if px >= b.x && px < b.x + b.w && y >= b.y && y < b.y + b.h && inside_clip(b, px, y_doc, py) is
+            return b.st.cursor
+        end
+    end
+    return "default"
 end
