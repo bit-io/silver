@@ -1,11 +1,59 @@
-<div class="page">
-    <div class="card">
-        <h1>Kitchen Sink</h1>
-        <p>Cześć, {{name}}!</p>
-        <input id="name" value="" />
-        <div class="row">
-            <div class="btn primary" on-click="say_hello"><span>Powiedz cześć</span></div>
-            <div class="btn"><span>Drugi przycisk</span></div>
-        </div>
+<!DOCTYPE html>
+<html>
+<head><title>Silver — kitchen sink</title></head>
+<body>
+<div class="wrap">
+  <h1>Silver 0.2 — przegląd</h1>
+  <p class="lead">Własny silnik HTML/CSS: zawijanie tekstu, flexbox, grid, formularze, przewijanie, przejścia i motyw ciemny.</p>
+
+  <section class="panel">
+    <h2>Formularz</h2>
+    <form on-submit="on_submit" class="form">
+      <label>Imię <input id="name" type="text" placeholder="Wpisz imię…" on-input="on_name"></label>
+      <label><input type="checkbox" id="agree" on-change="on_agree"> Zgadzam się</label>
+      <label>Kolor
+        <select id="color" on-change="on_color">
+          <option value="czerwony">czerwony</option>
+          <option value="zielony">zielony</option>
+          <option value="niebieski">niebieski</option>
+        </select>
+      </label>
+      <label><input type="radio" name="size" value="s" checked> S</label>
+      <label><input type="radio" name="size" value="m"> M</label>
+      <textarea id="notes" placeholder="Notatki (wielowierszowe, Ctrl+A/C/V działa)…"></textarea>
+      <button type="submit">Wyślij</button>
+    </form>
+    <p id="hello" class="ok">…</p>
+    <p id="agree-state">zgoda: NIE</p>
+    <p id="color-state">kolor: czerwony</p>
+    <p id="status"></p>
+  </section>
+
+  <section class="panel">
+    <h2>Flexbox i grid</h2>
+    <div class="flex">
+      <div class="box">A</div><div class="box grow">B (flex: 1)</div><div class="box">C</div>
     </div>
+    <div class="grid">
+      <div class="cell">1</div><div class="cell">2</div><div class="cell wide">3 (span 2)</div>
+      <div class="cell">4</div><div class="cell">5</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Tekst i zawijanie</h2>
+    <p>Długi akapit zawija się do szerokości kontenera: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. <b>Pogrubienie</b>, <i>kursywa</i>, <a href="#">link</a> i <code>kod</code> płyną w jednej linii.</p>
+    <ul><li>Lista punktowana</li><li>z zawijaniem tekstu w pozycjach, gdy jest naprawdę bardzo długa</li></ul>
+    <ol><li>Lista</li><li>numerowana</li></ol>
+  </section>
+
+  <section class="panel">
+    <h2>Przewijany kontener</h2>
+    <div class="scroller">
+      <p>Wiersz 1</p><p>Wiersz 2</p><p>Wiersz 3</p><p>Wiersz 4</p><p>Wiersz 5</p><p>Wiersz 6</p>
+      <p>Wiersz 7</p><p>Wiersz 8</p><p>Wiersz 9</p><p>Wiersz 10</p><p>Wiersz 11</p><p>Wiersz 12</p>
+    </div>
+  </section>
 </div>
+</body>
+</html>
