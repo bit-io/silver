@@ -1,0 +1,25 @@
+* { box-sizing: border-box; }
+body { background: #eef0f6; font-size: 15px; color: #222; }
+.app { max-width: 480px; margin: 24px auto; background: white; border-radius: 14px; padding: 20px;
+       box-shadow: 0 4px 16px rgba(30,40,90,0.15); }
+header { display: flex; align-items: center; justify-content: space-between; }
+h1 { font-size: 26px; margin: 0; }
+.pill { background: #3a5edc; color: white; border-radius: 999px; padding: 2px 12px; font-weight: bold; }
+.add { display: flex; gap: 8px; margin: 16px 0 8px 0; }
+.add input { flex: 1; }
+button { background: #3a5edc; color: white; border-color: #3a5edc; transition: 140ms; }
+button:hover { background: #2f4ec0; }
+button.ghost { background: transparent; color: #3a5edc; }
+button.ghost:hover { background: #e8ecff; }
+.filters { display: flex; gap: 6px; margin-bottom: 8px; }
+.filters button { background: #f0f1f6; color: #444; border-color: #dadbe4; }
+.filters button.active { background: #3a5edc; color: white; border-color: #3a5edc; }
+ul { list-style: none; margin: 0; padding: 0; }
+li.todo { display: flex; align-items: center; gap: 10px; padding: 10px 6px; border-bottom: 1px solid #eee; }
+li.todo .title { flex: 1; }
+li.todo.done .title { color: #999; text-decoration: line-through; }
+li.todo .del { background: transparent; color: #c33; border-color: transparent; padding: 2px 8px; }
+li.todo .del:hover { background: #fde8e8; }
+footer { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.toast { margin-left: auto; color: #0a7a3a; font-size: 13px; }
+.empty { color: #999; text-align: center; padding: 20px; }
