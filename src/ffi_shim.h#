@@ -6,41 +6,76 @@ extern static [c, "silvershim"] is
     fn silver_set_title(h: int, title: string) -> bool
     fn silver_get_width(h: int) -> int
     fn silver_get_height(h: int) -> int
+    fn silver_get_scale(h: int) -> int
+    fn silver_set_min_size(h: int, w: int, hh: int) -> bool
+    fn silver_set_max_size(h: int, w: int, hh: int) -> bool
+    fn silver_set_size(h: int, w: int, hh: int) -> bool
+    fn silver_set_position(h: int, x: int, y: int) -> bool
+    fn silver_get_x(h: int) -> int
+    fn silver_get_y(h: int) -> int
+    fn silver_set_fullscreen(h: int, on: int) -> bool
+    fn silver_is_fullscreen(h: int) -> bool
+    fn silver_set_resizable(h: int, on: int) -> bool
+    fn silver_set_bordered(h: int, on: int) -> bool
+    fn silver_set_always_on_top(h: int, on: int) -> bool
+    fn silver_set_opacity(h: int, pct: int) -> bool
+    fn silver_maximize(h: int) -> bool
+    fn silver_minimize(h: int) -> bool
+    fn silver_restore(h: int) -> bool
+    fn silver_raise(h: int) -> bool
+    fn silver_show(h: int) -> bool
+    fn silver_hide(h: int) -> bool
+    fn silver_set_icon(h: int, path: string) -> bool
 
-    ;; fonty
+    ;; fonty (path == "" → font systemowy)
     fn silver_load_font(h: int, path: string, size: int) -> bool
+    fn silver_find_system_font() -> string
 
-    ;; input tekstowy (edytowalne <input>, patrz app.h#)
+    ;; UTF-8 (H# liczy bajty — te funkcje wyznaczają granice znaków)
+    fn silver_utf8_next(s: string, pos: int) -> int
+    fn silver_utf8_prev(s: string, pos: int) -> int
+    fn silver_utf8_len(s: string) -> int
+    fn silver_utf8_offset(s: string, nchars: int) -> int
+
+    ;; input tekstowy / IME
     fn silver_start_text_input(h: int) -> bool
     fn silver_stop_text_input(h: int) -> bool
+    fn silver_set_text_input_rect(h: int, x: int, y: int, w: int, hh: int) -> bool
 
-    ;; obrazki (<img>, patrz engine/layout.h# i engine/paint.h#)
+    ;; obrazki
     fn silver_image_width(h: int, path: string) -> int
     fn silver_image_height(h: int, path: string) -> int
+    fn silver_image_forget(h: int, path: string) -> bool
     fn silver_draw_image(h: int, path: string, x: int, y: int, w: int, rh: int, a: int) -> bool
 
-    ;; motyw systemowy — best-effort, patrz native/silver_shim.c
+    ;; schowek, kursor, powiadomienia, motyw
+    fn silver_clipboard_get() -> string
+    fn silver_clipboard_set(text: string) -> bool
+    fn silver_set_cursor(h: int, kind: int) -> bool
+    fn silver_notify(title: string, body: string) -> bool
     fn silver_system_theme() -> string
 
-    ;; zdarzenia — kody zwracane przez silver_poll_event:
-    ;; 0 brak, 1 QUIT, 2 MOUSE_DOWN, 3 MOUSE_UP, 4 MOUSE_MOVE,
-    ;; 5 KEY_DOWN, 6 RESIZE, 7 TEXT_INPUT, 8 MOUSE_WHEEL,
-    ;; 9 FOCUS_GAINED, 10 FOCUS_LOST, 11 KEY_UP
+    ;; zdarzenia
     fn silver_poll_event(h: int) -> int
     fn silver_event_payload(h: int) -> string
+    fn silver_wait_event(ms: int) -> bool
 
-    ;; rysowanie (immediate-mode, wołane co klatkę przez engine/paint.h#)
-    ;; v0.2: wszystkie cztery mają teraz kanał alfa (a: 0-255) — patrz
-    ;; native/silver_shim.c i ROADMAP.md, "Alfa dla tekstu/obramowań/
-    ;; obrazków" (wcześniej udokumentowane ograniczenie, teraz naprawione,
-    ;; łącznie z ukrytym błędem brakującego SDL_BLENDMODE_BLEND we
-    ;; fill_rect, który sprawiał że nawet istniejąca alfa tła była
-    ;; ignorowana przez SDL2).
+    ;; rysowanie (współrzędne logiczne; HiDPI robi shim)
     fn silver_clear(h: int, r: int, g: int, b: int) -> bool
     fn silver_fill_rect(h: int, x: int, y: int, w: int, rh: int, r: int, g: int, b: int, a: int) -> bool
     fn silver_stroke_rect(h: int, x: int, y: int, w: int, rh: int, r: int, g: int, b: int, a: int) -> bool
+    fn silver_fill_round_rect(h: int, x: int, y: int, w: int, rh: int, rad: int, r: int, g: int, b: int, a: int) -> bool
+    fn silver_stroke_round_rect(h: int, x: int, y: int, w: int, rh: int, rad: int, bw: int, r: int, g: int, b: int, a: int) -> bool
+    fn silver_fill_gradient(h: int, x: int, y: int, w: int, rh: int, r1: int, g1: int, b1: int, a1: int, r2: int, g2: int, b2: int, a2: int, vertical: int) -> bool
+    fn silver_clip_set(h: int, x: int, y: int, w: int, rh: int) -> bool
+    fn silver_clip_clear(h: int) -> bool
     fn silver_draw_text(h: int, x: int, y: int, text: string, r: int, g: int, b: int, a: int) -> int
+    fn silver_draw_text_ex(h: int, x: int, y: int, text: string, r: int, g: int, b: int, a: int, size: int, style: int) -> int
     fn silver_measure_text(h: int, text: string) -> int
+    fn silver_measure_text_ex(h: int, text: string, size: int, style: int) -> int
+    fn silver_font_height(h: int, size: int) -> int
+    fn silver_text_fit(h: int, text: string, size: int, style: int, max_w: int) -> int
     fn silver_present(h: int) -> bool
     fn silver_delay(ms: int) -> bool
+    fn silver_ticks() -> int
 end
