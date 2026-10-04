@@ -1,8 +1,17 @@
 extern static [c, "silverjs"] is
-    fn js_init(win_handle: int) -> int              ;; -> kontekst JS (uchwyt) albo -1
+    fn js_init(win_handle: int) -> int              ;; -> uchwyt kontekstu albo -1
+    fn js_set_budget(js_handle: int, ms: int) -> bool
+    fn js_set_memory_limit_mb(js_handle: int, mb: int) -> bool
     fn js_load_file(js_handle: int, path: string) -> bool
+    fn js_eval(js_handle: int, code: string, name: string) -> bool
     fn js_poll_invoke(js_handle: int) -> string       ;; "" | "call_id\u0001cmd\u0001json"
+    fn js_pending_invokes(js_handle: int) -> int
     fn js_resolve(js_handle: int, call_id: string, result_json: string) -> bool
+    fn js_reject(js_handle: int, call_id: string, message: string) -> bool
     fn js_emit(js_handle: int, event_name: string, payload_json: string) -> bool
+    fn js_tick(js_handle: int) -> int                 ;; odpala timery + Promise
+    fn js_next_timer_ms(js_handle: int) -> int        ;; -1 brak, 0 teraz
+    fn js_has_jobs(js_handle: int) -> bool
+    fn js_last_error(js_handle: int) -> string
     fn js_shutdown(js_handle: int) -> bool
 end
