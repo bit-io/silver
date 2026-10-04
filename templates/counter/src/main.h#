@@ -1,16 +1,19 @@
-use "silver -> app" from "app"
+use "bit -> silver" from "silver"
 use "std -> sync"    from "sync"
 
+;; Stan żyje w H# (atomowy licznik) — widok tylko go pokazuje.
 fn increment(args_json: string) -> string is
     let n: int = sync::atomic_add("counter", 1)
-    return "{\"count\": \"" + to_string(n) + "\"}"
+    return "{{\"count\": \"" + to_string(n) + "\"}}"
 end
 
 fn decrement(args_json: string) -> string is
     let n: int = sync::atomic_add("counter", -1)
-    return "{\"count\": \"" + to_string(n) + "\"}"
+    return "{{\"count\": \"" + to_string(n) + "\"}}"
 end
 
+;; on_tick jest wołany CYKLICZNIE (co 100 ms), więc zmiana licznika z innego
+;; wątku trafia na ekran bez żadnego kliknięcia.
 fn sync_state(a: app::App) -> app::App is
     let n: int = sync::atomic_load("counter")
     return app::set_state(a, "count", to_string(n))
@@ -19,19 +22,17 @@ end
 fn main() is
     sync::atomic_new("counter", 0)
 
-    let mut a = app::new("Licznik", 420, 280)
-    a = app::with_font(a, "frontend/fonts/DejaVuSans.ttf", 16)
+    let mut a = app::new("Licznik", 420, 300)
     a = app::load_html(a, "frontend/index.html")
     a = app::load_css(a, "frontend/style.css")
     a = app::command(a, "increment", increment)
     a = app::command(a, "decrement", decrement)
     a = app::on_tick(a, sync_state)
-
-    ;; Opcjonalnie: odkomentuj, żeby przyciski wołały silver.invoke()
-    ;; z prawdziwego JS zamiast on-click w HTML (wymaga zbudowanego
-    ;; libsilverjs.so, patrz native/README.md):
-    ;;   a = app::load_js(a, ["frontend/silver_api.js", "frontend/app.js"])
-
+    a = app::set_tick_interval(a, 100)
     a = app::set_state(a, "count", "0")
+
+    ;; JS: przyciski „reset" i skrót klawiszowy (patrz frontend/app.js)
+    a = app::load_js(a, ["frontend/app.js"])
+    a = app::enable_hot_reload(a)
     app::run(a)
 end
