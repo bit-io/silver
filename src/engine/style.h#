@@ -1,5 +1,6 @@
 mod css
 mod dom
+mod cssval
 use "std -> conv" from "conv"
 
 pub struct Color is
@@ -16,367 +17,1083 @@ pub struct BoxSides is
     pub left:   int
 end
 
+;; Wartość marginesu `auto` / „brak” (np. top/left dla position).
+pub fn auto_val() -> int is return -100000 end
+
 pub struct ComputedStyle is
-    pub display:    string   ;; "block" | "inline" | "none" | "flex"
+    pub display:    string   ;; block | inline | inline-block | none | flex | inline-flex | grid | list-item
+    pub position:   string   ;; static | relative | absolute | fixed
+    pub visible:    bool     ;; visibility: visible
+    pub overflow_x: string   ;; visible | hidden | scroll | auto
+    pub overflow_y: string
     pub color:      Color
     pub background: Color
     pub has_bg:     bool
-    pub width:      int      ;; px, -1 = auto (wypełnij rodzica / dopasuj treść)
-    pub height:     int      ;; px, -1 = auto
-    pub padding:    int      ;; px, jednolite (kept dla wstecznej zgodności — top+bottom lub left+right, patrz pad_*)
-    pub margin:     int      ;; px, jednolite (kept dla wstecznej zgodności, patrz mar_*)
-    pub pad_top:    int      ;; px — rozbudowa: padding per-strona (shorthand 1/2/4 wartości + padding-*)
+    pub bg_image:   string
+    pub bg_size:    string   ;; auto | cover | contain | 100% 100%
+    pub has_grad:   bool
+    pub grad_from:  Color
+    pub grad_to:    Color
+    pub grad_vertical: bool
+
+    ;; rozmiary: *_mode = auto | px | pct (pct: px = offset z calc(), pct = setne % -> 5000 = 50%)
+    pub width:      int
+    pub width_pct:  int
+    pub width_mode: string
+    pub height:     int
+    pub height_pct: int
+    pub height_mode: string
+    pub min_width:  int
+    pub min_width_pct: int
+    pub max_width:  int
+    pub max_width_pct: int
+    pub max_width_mode: string
+    pub min_height: int
+    pub max_height: int
+    pub max_height_mode: string
+    pub border_box: bool
+
+    pub padding:    int
+    pub margin:     int
+    pub pad_top:    int
     pub pad_right:  int
     pub pad_bottom: int
     pub pad_left:   int
-    pub mar_top:    int      ;; px — rozbudowa: margin per-strona (shorthand 1/2/4 wartości + margin-*)
+    pub mar_top:    int
     pub mar_right:  int
     pub mar_bottom: int
     pub mar_left:   int
-    pub font_size:  int      ;; px
-    pub border:     int      ;; px, 0 = brak
-    pub border_color: Color
-    pub gap:        int      ;; px, odstęp między dziećmi flex
-    pub flex_dir:   string    ;; "row" | "column" (tylko gdy display == "flex")
-    pub justify:    string     ;; "flex-start" | "center" | "space-between" | "flex-end"
-    pub align:      string      ;; "flex-start" | "center" | "flex-end" (cross-axis)
-    pub text_align: string       ;; rozbudowa: "left" | "center" | "right" (dziedziczone)
-    pub opacity:    int            ;; rozbudowa: 0-100 (procent), 100 = w pełni kryjący
+    pub top:        int      ;; auto_val() = nie ustawione
+    pub right:      int
+    pub bottom:     int
+    pub left:       int
+    pub z_index:    int
+
+    pub font_size:  int
+    pub bold:       bool
+    pub italic:     bool
+    pub underline:  bool
+    pub strike:     bool
+    pub line_height: int     ;; px; 0 = normal
+    pub text_align: string
+    pub text_transform: string
+    pub white_space: string  ;; normal | nowrap | pre | pre-wrap
+    pub ellipsis:   bool
+    pub break_words: bool
+    pub cursor:     string
+
+    pub border:     int      ;; = szerokość górnej krawędzi (zgodność wsteczna)
+    pub bt:         int
+    pub br:         int
+    pub bb:         int
+    pub bl:         int
+    pub border_color: Color  ;; kolor górnej krawędzi (zgodność wsteczna)
+    pub bct:        Color
+    pub bcr:        Color
+    pub bcb:        Color
+    pub bcl:        Color
+    pub rad_tl:     int
+    pub rad_tr:     int
+    pub rad_br:     int
+    pub rad_bl:     int
+    pub has_shadow: bool
+    pub sh_x:       int
+    pub sh_y:       int
+    pub sh_blur:    int
+    pub sh_spread:  int
+    pub sh_color:   Color
+    pub outline_w:  int
+    pub outline_color: Color
+
+    pub gap:        int      ;; = column-gap (zgodność wsteczna)
+    pub row_gap:    int
+    pub flex_dir:   string   ;; row | column | row-reverse | column-reverse
+    pub flex_wrap:  bool
+    pub justify:    string
+    pub align:      string   ;; align-items: flex-start | center | flex-end | stretch
+    pub align_self: string   ;; "" = auto
+    pub flex_grow:  int      ;; x1000 (1.5 -> 1500)
+    pub flex_shrink: int     ;; x1000, domyślnie 1000
+    pub flex_basis: int      ;; px, -1 = auto
+    pub order:      int
+    pub grid_cols:  string
+    pub grid_rows:  string
+    pub grid_col_span: int
+
+    pub opacity:    int
+    pub object_fit: string
+    pub trans_ms:   int      ;; transition-duration pierwszego wpisu (0 = brak)
+    pub content:    string   ;; content: "…" dla ::before/::after (po usunięciu cudzysłowów)
+    pub has_content: bool
+    pub vars:       string   ;; zmienne CSS: "\u0002--nazwa\u0001wartość…"
 end
 
-;; Styl "korzenia dokumentu" — jedyne miejsce, gdzie kolor/font-size
-;; nie pochodzą z dziedziczenia, bo nie ma rodzica. Odpowiednik
-;; przeglądarkowego `:root { color: #141414; font-size: 16px }`.
+pub fn black() -> Color is return Color { r: 0, g: 0, b: 0, a: 255 } end
+pub fn transparent() -> Color is return Color { r: 0, g: 0, b: 0, a: 0 } end
+
 pub fn root_style() -> ComputedStyle is
+    let a: int = auto_val()
     return ComputedStyle {
-        display: "block",
-        color: Color { r: 20, g: 20, b: 20, a: 255 },
-        background: Color { r: 0, g: 0, b: 0, a: 0 },
-        has_bg: false,
-        width: -1, height: -1,
-        padding: 0, margin: 0,
-        pad_top: 0, pad_right: 0, pad_bottom: 0, pad_left: 0,
+        display: "block", position: "static", visible: true, overflow_x: "visible", overflow_y: "visible",
+        color: Color { r: 20, g: 20, b: 20, a: 255 }, background: transparent(), has_bg: false,
+        bg_image: "", bg_size: "auto", has_grad: false, grad_from: transparent(), grad_to: transparent(), grad_vertical: true,
+        width: -1, width_pct: 0, width_mode: "auto", height: -1, height_pct: 0, height_mode: "auto",
+        min_width: 0, min_width_pct: 0, max_width: -1, max_width_pct: 0, max_width_mode: "auto",
+        min_height: 0, max_height: -1, max_height_mode: "auto", border_box: false,
+        padding: 0, margin: 0, pad_top: 0, pad_right: 0, pad_bottom: 0, pad_left: 0,
         mar_top: 0, mar_right: 0, mar_bottom: 0, mar_left: 0,
-        font_size: 16,
-        border: 0,
-        border_color: Color { r: 0, g: 0, b: 0, a: 255 },
-        gap: 0, flex_dir: "row", justify: "flex-start", align: "flex-start",
-        text_align: "left", opacity: 100
+        top: a, right: a, bottom: a, left: a, z_index: 0,
+        font_size: 16, bold: false, italic: false, underline: false, strike: false, line_height: 0,
+        text_align: "left", text_transform: "none", white_space: "normal", ellipsis: false,
+        break_words: false, cursor: "default",
+        border: 0, bt: 0, br: 0, bb: 0, bl: 0, border_color: black(),
+        bct: black(), bcr: black(), bcb: black(), bcl: black(),
+        rad_tl: 0, rad_tr: 0, rad_br: 0, rad_bl: 0,
+        has_shadow: false, sh_x: 0, sh_y: 0, sh_blur: 0, sh_spread: 0, sh_color: Color { r: 0, g: 0, b: 0, a: 60 },
+        outline_w: 0, outline_color: black(),
+        gap: 0, row_gap: 0, flex_dir: "row", flex_wrap: false, justify: "flex-start", align: "stretch",
+        align_self: "", flex_grow: 0, flex_shrink: 1000, flex_basis: -1, order: 0,
+        grid_cols: "", grid_rows: "", grid_col_span: 1,
+        opacity: 100, object_fit: "fill", trans_ms: 0, content: "", has_content: false, vars: ""
     }
 end
 
-fn default_style_for(tag: string, inherited: ComputedStyle) -> ComputedStyle is
-    let mut disp: string = "block"
-    if tag == "span" || tag == "a" || tag == "text" is disp = "inline" end
-
-    ;; Nagłówki mają domyślny (przeglądarkowy) rozmiar czcionki, który
-    ;; wygrywa z dziedziczeniem — dokładnie jak UA stylesheet w
-    ;; prawdziwej przeglądarce — ale jawna reguła CSS `font-size` na
-    ;; danym elemencie nadal go nadpisze (patrz koniec `resolve`).
-    let mut fsize: int = inherited.font_size
-    if tag == "h1" is fsize = 32 end
-    if tag == "h2" is fsize = 24 end
-    if tag == "h3" is fsize = 20 end
-
-    return ComputedStyle {
-        display: disp,
-        color: inherited.color,
-        background: Color { r: 0, g: 0, b: 0, a: 0 },
-        has_bg: false,
-        width: -1, height: -1,
-        padding: 0, margin: 0,
-        pad_top: 0, pad_right: 0, pad_bottom: 0, pad_left: 0,
-        mar_top: 0, mar_right: 0, mar_bottom: 0, mar_left: 0,
-        font_size: fsize,
-        border: 0,
-        border_color: Color { r: 0, g: 0, b: 0, a: 255 },
-        gap: 0, flex_dir: "row", justify: "flex-start", align: "flex-start",
-        text_align: inherited.text_align, opacity: 100
-    }
-end
-
-;; Bazowy rozmiar czcionki roota do jednostki `rem` — stały, bo Silver
-;; nie pozwala nadpisać font-size na samym roocie (`style::root_style()`
-;; zawsze zwraca 16, nie ma odpowiednika `<html>` do stylowania).
 pub fn root_font_size() -> int is return 16 end
 
-;; Rozbudowa (ostatnia przed wydaniem v0.2): wspólny parser DŁUGOŚCI CSS
-;; obsługujący `px` (domyślne, też bez jednostki — leniency), `em`
-;; (mnożnik przez `em_base`) i `rem` (mnożnik przez `root_font_size()`).
-;; `auto`/`""` -> -1 (sentinel, jak dotychczas w `parse_px`).
-;;
-;; UPROSZCZENIE: prawdziwy CSS liczy `em` na WŁASNYM obliczonym
-;; font-size elementu (a dla samej właściwości `font-size: ...em` — na
-;; font-size RODZICA). Tutaj wszystkie użycia `em` (łącznie z `font-size`)
-;; dostają ten sam `em_base`, którym `apply_decls` przekazuje
-;; `inherited.font_size` (font-size odziedziczony PRZED zastosowaniem
-;; reguł CSS z tego przebiegu) — dla `font-size: 1.5em` to dokładnie
-;; poprawne zgodnie ze specyfikacją; dla innych właściwości (np.
-;; `padding: 0.5em`) to bardzo bliskie przybliżenie własnego font-size
-;; (różni się tylko, gdy `font-size` jest NADPISYWANY w tej samej
-;; regule co inna właściwość w `em` — rzadki przypadek). Patrz
-;; ROADMAP.md po pełne wyjaśnienie i dlaczego nie robimy tu dwóch
-;; przebiegów po `decls`, żeby to naprawić dokładnie.
-fn parse_len(val: string, em_base: int) -> int is
-    let v: string = string_trim(val)
-    if v == "auto" || v == "" is return -1 end
-    if string_ends_with(v, "rem") is
-        let num: string = string_trim(string_slice(v, 0, string_len(v) - 3))
-        let f: f64 = conv::str_to_float(num)
-        return conv::float_to_int(f * conv::int_to_float(root_font_size()))
-    end
-    if string_ends_with(v, "em") is
-        let num: string = string_trim(string_slice(v, 0, string_len(v) - 2))
-        let f: f64 = conv::str_to_float(num)
-        return conv::float_to_int(f * conv::int_to_float(em_base))
-    end
-    let stripped: string = string_replace(v, "px", "")
-    return str_to_int(string_trim(stripped))
+;; Styl startowy elementu: dziedziczone pola z rodzica, reszta domyślna.
+fn base_for(inherited: ComputedStyle) -> ComputedStyle is
+    let mut st: ComputedStyle = root_style()
+    st.color = inherited.color
+    st.font_size = inherited.font_size
+    st.bold = inherited.bold
+    st.italic = inherited.italic
+    st.underline = inherited.underline
+    st.strike = inherited.strike
+    st.line_height = inherited.line_height
+    st.text_align = inherited.text_align
+    st.text_transform = inherited.text_transform
+    st.white_space = inherited.white_space
+    st.visible = inherited.visible
+    st.cursor = inherited.cursor
+    st.vars = inherited.vars
+    st.align = "stretch"
+    return st
 end
 
-fn parse_px(val: string, em_base: int) -> int is
-    return parse_len(val, em_base)
+;; Style agenta użytkownika (domyślny wygląd tagów HTML).
+fn apply_ua(tag: string, st0: ComputedStyle, parent: ComputedStyle) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    if tag == "span" || tag == "a" || tag == "text" || tag == "b" || tag == "strong" || tag == "i" || tag == "em" ||
+       tag == "u" || tag == "small" || tag == "code" || tag == "label" || tag == "sub" || tag == "sup" ||
+       tag == "abbr" || tag == "mark" || tag == "kbd" || tag == "s" || tag == "del" || tag == "img" || tag == "cite" is
+        st.display = "inline"
+    end
+    if tag == "head" || tag == "script" || tag == "style" || tag == "title" || tag == "meta" || tag == "link" || tag == "option" ||
+       tag == "template" || tag == "#comment" || tag == "noscript" is
+        st.display = "none"
+    end
+    if tag == "li" is st.display = "list-item" end
+    if tag == "tr" is st.display = "flex" end
+    if tag == "td" || tag == "th" is
+        st.display = "block"
+        st.flex_grow = 1000
+        st.flex_basis = 0
+        st.pad_top = 4
+        st.pad_bottom = 4
+        st.pad_left = 8
+        st.pad_right = 8
+    end
+    if tag == "h1" is st.font_size = 32 end
+    if tag == "h2" is st.font_size = 24 end
+    if tag == "h3" is st.font_size = 19 end
+    if tag == "h4" is st.font_size = 16 end
+    if tag == "h5" is st.font_size = 13 end
+    if tag == "h6" is st.font_size = 11 end
+    if tag == "h1" || tag == "h2" || tag == "h3" || tag == "h4" || tag == "h5" || tag == "h6" is
+        st.bold = true
+        st.mar_top = st.font_size / 2
+        st.mar_bottom = st.font_size / 2
+    end
+    if tag == "b" || tag == "strong" || tag == "th" is st.bold = true end
+    if tag == "th" is st.text_align = "center" end
+    if tag == "i" || tag == "em" || tag == "cite" is st.italic = true end
+    if tag == "u" || tag == "ins" is st.underline = true end
+    if tag == "s" || tag == "del" is st.strike = true end
+    if tag == "small" is st.font_size = parent.font_size * 85 / 100 end
+    if tag == "sub" || tag == "sup" is st.font_size = parent.font_size * 80 / 100 end
+    if tag == "a" is
+        st.color = Color { r: 6, g: 69, b: 173, a: 255 }
+        st.underline = true
+        st.cursor = "pointer"
+    end
+    if tag == "mark" is
+        st.background = Color { r: 255, g: 235, b: 59, a: 255 }
+        st.has_bg = true
+    end
+    if tag == "code" || tag == "kbd" is
+        st.background = Color { r: 235, g: 235, b: 235, a: 255 }
+        st.has_bg = true
+        st.rad_tl = 3
+        st.rad_tr = 3
+        st.rad_br = 3
+        st.rad_bl = 3
+    end
+    if tag == "pre" is
+        st.white_space = "pre"
+        st.background = Color { r: 240, g: 240, b: 240, a: 255 }
+        st.has_bg = true
+        st.pad_top = 8
+        st.pad_bottom = 8
+        st.pad_left = 10
+        st.pad_right = 10
+        st.mar_top = 8
+        st.mar_bottom = 8
+    end
+    if tag == "p" is
+        st.mar_top = 0
+        st.mar_bottom = 8
+    end
+    if tag == "ul" || tag == "ol" is
+        st.pad_left = 24
+        st.mar_top = 4
+        st.mar_bottom = 8
+    end
+    if tag == "blockquote" is
+        st.pad_left = 12
+        st.bl = 3
+        st.bct = Color { r: 200, g: 200, b: 200, a: 255 }
+        st.bcl = Color { r: 200, g: 200, b: 200, a: 255 }
+        st.mar_top = 8
+        st.mar_bottom = 8
+    end
+    if tag == "hr" is
+        st.height = 1
+        st.height_mode = "px"
+        st.has_bg = true
+        st.background = Color { r: 204, g: 204, b: 204, a: 255 }
+        st.mar_top = 8
+        st.mar_bottom = 8
+    end
+    if tag == "button" is
+        st.display = "inline-block"
+        st.pad_top = 6
+        st.pad_bottom = 6
+        st.pad_left = 14
+        st.pad_right = 14
+        st.bt = 1
+        st.br = 1
+        st.bb = 1
+        st.bl = 1
+        st.border = 1
+        let bc: Color = Color { r: 150, g: 150, b: 150, a: 255 }
+        st.bct = bc
+        st.bcr = bc
+        st.bcb = bc
+        st.bcl = bc
+        st.border_color = bc
+        st.rad_tl = 5
+        st.rad_tr = 5
+        st.rad_br = 5
+        st.rad_bl = 5
+        st.background = Color { r: 239, g: 239, b: 239, a: 255 }
+        st.has_bg = true
+        st.text_align = "center"
+        st.cursor = "pointer"
+        st.color = Color { r: 20, g: 20, b: 20, a: 255 }
+    end
+    if tag == "input" || tag == "textarea" || tag == "select" is
+        st.display = "inline-block"
+        st.pad_top = 6
+        st.pad_bottom = 6
+        st.pad_left = 8
+        st.pad_right = 8
+        st.bt = 1
+        st.br = 1
+        st.bb = 1
+        st.bl = 1
+        st.border = 1
+        let bc: Color = Color { r: 150, g: 150, b: 150, a: 255 }
+        st.bct = bc
+        st.bcr = bc
+        st.bcb = bc
+        st.bcl = bc
+        st.border_color = bc
+        st.rad_tl = 4
+        st.rad_tr = 4
+        st.rad_br = 4
+        st.rad_bl = 4
+        st.background = Color { r: 255, g: 255, b: 255, a: 255 }
+        st.has_bg = true
+        st.cursor = if tag == "select" then "pointer" else "text"
+        st.color = Color { r: 20, g: 20, b: 20, a: 255 }
+    end
+    if tag == "label" is st.cursor = "pointer" end
+    if tag == "img" is st.display = "inline-block" end
+    return st
 end
 
-;; Pomocnicza j.w., ale dla `padding` (i marginesu góra/dół — patrz
-;; `parse_margin_tb`), gdzie `auto` nie jest prawidłową wartością CSS
-;; (specyfikacja go po prostu nie definiuje dla `padding`) — traktujemy
-;; je jako 0 zamiast błędu parsowania, żeby jeden zepsuty token nie
-;; wywalił całej reguły. Dla `margin-left`/`margin-right`, gdzie `auto`
-;; MA sens (centrowanie), używamy zamiast tego `parse_margin_lr`
-;; (sentinel -1, patrz niżej).
-fn parse_box_px(val: string, em_base: int) -> int is
-    let n: int = parse_len(val, em_base)
-    if n < 0 is return 0 end
-    return n
+pub fn default_style_for(tag: string, inherited: ComputedStyle) -> ComputedStyle is
+    return apply_ua(tag, base_for(inherited), inherited)
 end
 
-;; Rozwija skrót CSS `padding`/`margin` (1, 2, 3 lub 4 wartości
-;; rozdzielone spacją) w cztery boki, dokładnie jak w prawdziwym CSS:
-;;   1 wartość  -> wszystkie boki
-;;   2 wartości -> góra/dół, lewo/prawo
-;;   3 wartości -> góra, lewo/prawo, dół
-;;   4 wartości -> góra, prawo, dół, lewo (zgodnie z ruchem wskazówek zegara)
-;; string_split na wielokrotnych spacjach potrafi dać puste elementy
-;; — odfiltruj je, żeby "10px  20px" (dwie spacje) nie liczyło się
-;; jako 3 wartości. Dzielone przez `parse_box_shorthand` (padding) i
-;; `parse_margin_shorthand` (margin, rozbudowa v0.2 — auto).
-fn split_box_tokens(val: string) -> [string] is
-    let parts: [string] = string_split(string_trim(val), " ")
-    let mut clean: [string] = []
-    let raw_count: int = array_len(parts)
-    let mut i: int = 0
-    while i < raw_count is
-        let p: string = string_trim(parts[i])
-        i += 1
-        if p != "" is clean = array_push(clean, p) end
-    end
-    return clean
+;; ---------- zmienne CSS ----------
+fn vars_get(vars: string, name: string) -> string is
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(vars, key)
+    if idx < 0 is return "" end
+    let start: int = idx + string_len(key)
+    let e: int = dom::find_from(vars, "\u0002", start)
+    return string_slice(vars, start, if e < 0 then string_len(vars) else e)
 end
 
-fn parse_box_shorthand(val: string, em_base: int) -> BoxSides is
-    let clean: [string] = split_box_tokens(val)
-    let n: int = array_len(clean)
-    if n == 1 is
-        let v: int = parse_box_px(clean[0], em_base)
-        return BoxSides { top: v, right: v, bottom: v, left: v }
-    end
-    if n == 2 is
-        let v: int = parse_box_px(clean[0], em_base)
-        let h: int = parse_box_px(clean[1], em_base)
-        return BoxSides { top: v, right: h, bottom: v, left: h }
-    end
-    if n == 3 is
-        let t: int = parse_box_px(clean[0], em_base)
-        let h: int = parse_box_px(clean[1], em_base)
-        let b: int = parse_box_px(clean[2], em_base)
-        return BoxSides { top: t, right: h, bottom: b, left: h }
-    end
-    if n >= 4 is
-        return BoxSides {
-            top: parse_box_px(clean[0], em_base), right: parse_box_px(clean[1], em_base),
-            bottom: parse_box_px(clean[2], em_base), left: parse_box_px(clean[3], em_base)
-        }
-    end
-    return BoxSides { top: 0, right: 0, bottom: 0, left: 0 }
+fn vars_set(vars: string, name: string, val: string) -> string is
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(vars, key)
+    if idx < 0 is return vars + key + val end
+    let start: int = idx + string_len(key)
+    let e: int = dom::find_from(vars, "\u0002", start)
+    let tail: string = if e < 0 then "" else string_slice(vars, e, string_len(vars))
+    return string_slice(vars, 0, idx) + key + val + tail
 end
 
-;; `auto` dla marginesu góra/dół w normalnym przepływie blokowym (bez
-;; pozycjonowania absolutnego, którego Silver nie ma) rozwiązuje się do
-;; 0 — to prawdziwa reguła CSS, nie uproszczenie silnika.
-fn parse_margin_tb(val: string, em_base: int) -> int is
-    return parse_box_px(val, em_base)
+;; Podstawia var(--x, fallback) (także zagnieżdżone, do 8 przebiegów).
+pub fn substitute_vars(val: string, vars: string) -> string is
+    let mut cur: string = val
+    let mut pass: int = 0
+    while string_find(cur, "var(") >= 0 && pass < 8 is
+        pass += 1
+        let start: int = string_find(cur, "var(")
+        let mut depth: int = 0
+        let mut e: int = start + 3
+        let n: int = string_len(cur)
+        while e < n is
+            let c: string = string_at(cur, e)
+            if c == "(" is depth += 1 end
+            if c == ")" is
+                depth -= 1
+                if depth == 0 is break end
+            end
+            e += 1
+        end
+        let inner: string = string_slice(cur, start + 4, e)
+        let comma: int = string_find(inner, ",")
+        let name: string = string_trim(if comma < 0 then inner else string_slice(inner, 0, comma))
+        let fallback: string = if comma < 0 then "" else string_trim(string_slice(inner, comma + 1, string_len(inner)))
+        let found: string = vars_get(vars, name)
+        cur = string_slice(cur, 0, start) + (if found != "" then found else fallback) + string_slice(cur, if e + 1 > n then n else e + 1, n)
+    end
+    return cur
 end
 
-;; `auto` dla marginesu lewo/prawo to sentinel -1: sygnalizuje
-;; `engine/layout.h#`, że ten bok ma dostać całą (albo połowę, jeśli
-;; oba boki są `auto`) przestrzeni, która zostaje po odjęciu jawnej
-;; szerokości elementu od dostępnej szerokości rodzica — dokładnie tak
-;; wygląda klasyczne CSS-owe centrowanie `margin: 0 auto`. Rozbudowa v0.2.
-fn parse_margin_lr(val: string, em_base: int) -> int is
-    if string_trim(val) == "auto" is return -1 end
-    return parse_box_px(val, em_base)
+;; ---------- parsowanie wartości ----------
+fn to_color(c: cssval::Color) -> Color is
+    return Color { r: c.r, g: c.g, b: c.b, a: c.a }
 end
 
-;; Jak `parse_box_shorthand`, ale strona lewa/prawa może zostać
-;; sentinelem -1 (`auto`) — patrz `parse_margin_lr`.
-fn parse_margin_shorthand(val: string, em_base: int) -> BoxSides is
-    let clean: [string] = split_box_tokens(val)
-    let n: int = array_len(clean)
-    if n == 1 is
-        return BoxSides {
-            top: parse_margin_tb(clean[0], em_base), right: parse_margin_lr(clean[0], em_base),
-            bottom: parse_margin_tb(clean[0], em_base), left: parse_margin_lr(clean[0], em_base)
-        }
-    end
-    if n == 2 is
-        return BoxSides {
-            top: parse_margin_tb(clean[0], em_base), right: parse_margin_lr(clean[1], em_base),
-            bottom: parse_margin_tb(clean[0], em_base), left: parse_margin_lr(clean[1], em_base)
-        }
-    end
-    if n == 3 is
-        return BoxSides {
-            top: parse_margin_tb(clean[0], em_base), right: parse_margin_lr(clean[1], em_base),
-            bottom: parse_margin_tb(clean[2], em_base), left: parse_margin_lr(clean[1], em_base)
-        }
-    end
-    if n >= 4 is
-        return BoxSides {
-            top: parse_margin_tb(clean[0], em_base), right: parse_margin_lr(clean[1], em_base),
-            bottom: parse_margin_tb(clean[2], em_base), left: parse_margin_lr(clean[3], em_base)
-        }
-    end
-    return BoxSides { top: 0, right: 0, bottom: 0, left: 0 }
+pub fn parse_color(val: string) -> Color is
+    return to_color(cssval::parse_color(val))
 end
 
-;; `opacity` w CSS to 0.0..1.0 (czasem zapisywane jako "50%"); Silver
-;; trzyma to wewnętrznie jako int 0..100, żeby nie mieszać f64 do reszty
-;; box-modelu, który jest cały w int px.
-fn parse_opacity(val: string) -> int is
+fn env_for(em: int, ix: css::InteractionState) -> cssval::LenEnv is
+    return cssval::LenEnv { em: em, rem: root_font_size(), vw: ix.viewport_w, vh: ix.viewport_h }
+end
+
+;; Długość w px; `auto` -> -1 (pct ignorowane — używać `set_size` dla rozmiarów).
+fn len_px_or(val: string, env: cssval::LenEnv, basis: int, dflt: int) -> int is
+    let l: cssval::Len = cssval::parse_len(val, env)
+    if !l.ok || l.auto is return dflt end
+    return cssval::px_of(l, basis)
+end
+
+fn box_px(val: string, env: cssval::LenEnv, basis: int) -> int is
+    let l: cssval::Len = cssval::parse_len(val, env)
+    if !l.ok || l.auto is return 0 end
+    let v: int = cssval::px_of(l, basis)
+    return v
+end
+
+fn margin_px(val: string, env: cssval::LenEnv, basis: int) -> int is
+    let l: cssval::Len = cssval::parse_len(val, env)
+    if !l.ok is return 0 end
+    if l.auto is return auto_val() end
+    return cssval::px_of(l, basis)
+end
+
+fn pos_px(val: string, env: cssval::LenEnv, basis: int) -> int is
+    let l: cssval::Len = cssval::parse_len(val, env)
+    if !l.ok || l.auto is return auto_val() end
+    return cssval::px_of(l, basis)
+end
+
+fn parse_box_shorthand(val: string, env: cssval::LenEnv, basis: int) -> BoxSides is
+    let toks: [string] = cssval::split_top(val)
+    let n: int = array_len(toks)
+    if n == 0 is return BoxSides { top: 0, right: 0, bottom: 0, left: 0 } end
+    let t: int = box_px(toks[0], env, basis)
+    let r: int = if n >= 2 then box_px(toks[1], env, basis) else t
+    let b: int = if n >= 3 then box_px(toks[2], env, basis) else t
+    let l: int = if n >= 4 then box_px(toks[3], env, basis) else r
+    return BoxSides { top: t, right: r, bottom: b, left: l }
+end
+
+fn parse_margin_shorthand(val: string, env: cssval::LenEnv, basis: int) -> BoxSides is
+    let toks: [string] = cssval::split_top(val)
+    let n: int = array_len(toks)
+    if n == 0 is return BoxSides { top: 0, right: 0, bottom: 0, left: 0 } end
+    let t: int = margin_px(toks[0], env, basis)
+    let r: int = if n >= 2 then margin_px(toks[1], env, basis) else t
+    let b: int = if n >= 3 then margin_px(toks[2], env, basis) else t
+    let l: int = if n >= 4 then margin_px(toks[3], env, basis) else r
+    return BoxSides { top: t, right: r, bottom: b, left: l }
+end
+
+pub fn parse_opacity(val: string) -> int is
     let v: string = string_trim(val)
     if string_ends_with(v, "%") is
-        let pct: string = string_slice(v, 0, string_len(v) - 1)
-        let n: int = str_to_int(string_trim(pct))
+        let n: int = str_to_int(string_trim(string_slice(v, 0, string_len(v) - 1)))
         if n < 0 is return 0 end
         if n > 100 is return 100 end
         return n
     end
     let f: f64 = conv::str_to_float(v)
-    let pct: int = conv::float_to_int(f * 100.0 + 0.5)  ;; zaokrąglenie w górę o pół
+    let pct: int = conv::float_to_int(f * 100.0 + 0.5)
     if pct < 0 is return 0 end
     if pct > 100 is return 100 end
     return pct
 end
 
-;; Rozpoznaje: nazwane kolory podstawowe + #rrggbb.
-fn parse_color(val: string) -> Color is
-    let v: string = string_trim(val)
-    if v == "white"       is return Color { r: 255, g: 255, b: 255, a: 255 } end
-    if v == "black"       is return Color { r: 0,   g: 0,   b: 0,   a: 255 } end
-    if v == "red"         is return Color { r: 220, g: 40,  b: 40,  a: 255 } end
-    if v == "green"       is return Color { r: 40,  g: 170, b: 90,  a: 255 } end
-    if v == "blue"        is return Color { r: 40,  g: 90,  b: 220, a: 255 } end
-    if v == "gray" || v == "grey" is return Color { r: 130, g: 130, b: 130, a: 255 } end
-    if v == "transparent" is return Color { r: 0,   g: 0,   b: 0,   a: 0   } end
+fn parse_milli(val: string) -> int is
+    let f: f64 = conv::str_to_float(string_trim(val))
+    return conv::float_to_int(f * 1000.0 + (if f < 0.0 then -0.5 else 0.5))
+end
 
-    if string_starts_with(v, "#") && string_len(v) >= 7 is
-        let r: int = hex_to_int(string_slice(v, 1, 3))
-        let g: int = hex_to_int(string_slice(v, 3, 5))
-        let b: int = hex_to_int(string_slice(v, 5, 7))
-        return Color { r: r, g: g, b: b, a: 255 }
+;; Rozmiar (width/height itp.): zwraca [px, pct, mode] zakodowane w BoxSides-podobnej parze.
+struct SizeRes is
+    pub px:   int
+    pub pct:  int
+    pub mode: string
+end
+
+fn parse_size(val: string, env: cssval::LenEnv) -> SizeRes is
+    let l: cssval::Len = cssval::parse_len(val, env)
+    let v: string = string_lower(string_trim(val))
+    if !l.ok || l.auto || v == "none" || v == "max-content" || v == "fit-content" is
+        return SizeRes { px: -1, pct: 0, mode: "auto" }
     end
-    return Color { r: 0, g: 0, b: 0, a: 255 }
+    if l.pct != 0 is return SizeRes { px: l.px, pct: l.pct, mode: "pct" } end
+    return SizeRes { px: l.px, pct: 0, mode: "px" }
 end
 
-fn hex_to_int(h: string) -> int is
-    ;; std -> hex / std -> conv wystawiają konwersję hex->int (patrz
-    ;; std/hex.h# i std/conv.h#) — tutaj wołamy przez alias `conv`.
-    return conv::hex_to_int(h)
+fn strip_quotes(v: string) -> string is
+    let t: string = string_trim(v)
+    if string_len(t) >= 2 && (string_starts_with(t, "\"") && string_ends_with(t, "\"") || string_starts_with(t, "'") && string_ends_with(t, "'")) is
+        return string_slice(t, 1, string_len(t) - 1)
+    end
+    return t
 end
 
-pub fn resolve(sheet: css::Stylesheet, tag: string, id: string, classes: [string], inherited: ComputedStyle) -> ComputedStyle is
-    let st: ComputedStyle = default_style_for(tag, inherited)
-    let decls: [css::CssDecl] = css::matching_decls(sheet, tag, id, classes)
-    return apply_decls(st, decls, inherited.font_size)
+fn is_line_style(t: string) -> bool is
+    return t == "solid" || t == "dashed" || t == "dotted" || t == "double" || t == "groove" || t == "ridge" || t == "inset" || t == "outset"
 end
 
-;; Jak `resolve`, ale drzewo-świadomy: rozwiązuje też selektory złożone
-;; (potomek/dziecko/rodzeństwo, np. ".card p", ".a > .b", ".a + .b",
-;; ".a ~ .b") i pseudoklasy `:hover`/`:focus` przez
-;; `css::matching_decls_ctx` chodzące po `dom::Dom` i sprawdzające
-;; `interaction`. Rozbudowa v0.2 — tego wariantu używa
-;; `engine/layout.h#`; stary `resolve` zostaje bez zmian (m.in. dla
-;; testów, które budują style bez pełnego drzewa DOM).
-pub fn resolve_ctx(sheet: css::Stylesheet, dom: dom::Dom, node_id: int, inherited: ComputedStyle, interaction: css::InteractionState) -> ComputedStyle is
-    let n: dom::DomNode = dom.nodes[node_id]
-    let st: ComputedStyle = default_style_for(n.tag, inherited)
-    let decls: [css::CssDecl] = css::matching_decls_ctx(sheet, dom, node_id, interaction)
-    return apply_decls(st, decls, inherited.font_size)
+;; border / border-top… : [width] [style] [color] w dowolnej kolejności
+struct BorderRes is
+    pub w:     int
+    pub color: Color
+    pub has_color: bool
 end
 
-;; Wspólna logika nakładania deklaracji na już-domyślny styl — dzielona
-;; przez `resolve` i `resolve_ctx`, żeby nie duplikować tej samej
-;; 20-linijkowej gałęzi if/elsif w dwóch miejscach. `em_base` to
-;; font-size RODZICA (`inherited.font_size`), używany do rozwiązywania
-;; jednostek `em` — patrz komentarz przy `parse_len` po dokładne
-;; wyjaśnienie i uproszczenie.
-fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int) -> ComputedStyle is
-    let mut st: ComputedStyle = base
-    let count: int = array_len(decls)
+fn parse_border_value(val: string, env: cssval::LenEnv, cur_color: Color) -> BorderRes is
+    let toks: [string] = cssval::split_top(val)
+    let mut w: int = 3
+    let mut none: bool = false
+    let mut color: Color = cur_color
+    let mut has_c: bool = false
     let mut i: int = 0
-    while i < count is
-        let d: css::CssDecl = decls[i]
+    while i < array_len(toks) is
+        let t: string = string_lower(toks[i])
         i += 1
-        if d.prop == "display" is st.display = string_trim(d.val)
-        elsif d.prop == "color" is st.color = parse_color(d.val)
-        elsif d.prop == "background" || d.prop == "background-color" is
-            st.background = parse_color(d.val)
-            st.has_bg = d.val != "transparent"
-        elsif d.prop == "width" is st.width = parse_px(d.val, em_base)
-        elsif d.prop == "height" is st.height = parse_px(d.val, em_base)
-        elsif d.prop == "padding" is
-            let sides: BoxSides = parse_box_shorthand(d.val, em_base)
-            st.pad_top = sides.top
-            st.pad_right = sides.right
-            st.pad_bottom = sides.bottom
-            st.pad_left = sides.left
-            st.padding = sides.top  ;; pole `padding` zachowane wstecznie: pokazuje "top", patrz layout.h#
-        elsif d.prop == "padding-top" is st.pad_top = parse_box_px(d.val, em_base)
-        elsif d.prop == "padding-right" is st.pad_right = parse_box_px(d.val, em_base)
-        elsif d.prop == "padding-bottom" is st.pad_bottom = parse_box_px(d.val, em_base)
-        elsif d.prop == "padding-left" is st.pad_left = parse_box_px(d.val, em_base)
-        elsif d.prop == "margin" is
-            let sides: BoxSides = parse_margin_shorthand(d.val, em_base)
-            st.mar_top = sides.top
-            st.mar_right = sides.right
-            st.mar_bottom = sides.bottom
-            st.mar_left = sides.left
-            ;; pole `margin` zachowane wstecznie: pokazuje "top" — ale
-            ;; jeśli "top" jest auto (rzadkie, zwykle 0 i tak), sentinel
-            ;; -1 by tu przeciekł; parse_margin_tb nigdy nie zwraca -1,
-            ;; więc to bezpieczne bez dodatkowej gałęzi.
-            st.margin = sides.top
-        elsif d.prop == "margin-top" is st.mar_top = parse_margin_tb(d.val, em_base)
-        elsif d.prop == "margin-right" is st.mar_right = parse_margin_lr(d.val, em_base)
-        elsif d.prop == "margin-bottom" is st.mar_bottom = parse_margin_tb(d.val, em_base)
-        elsif d.prop == "margin-left" is st.mar_left = parse_margin_lr(d.val, em_base)
-        elsif d.prop == "font-size" is st.font_size = parse_px(d.val, em_base)
-        elsif d.prop == "border" is st.border = parse_px(d.val, em_base)
-        elsif d.prop == "border-color" is st.border_color = parse_color(d.val)
-        elsif d.prop == "gap" is st.gap = parse_px(d.val, em_base)
-        elsif d.prop == "flex-direction" is st.flex_dir = string_trim(d.val)
-        elsif d.prop == "justify-content" is st.justify = string_trim(d.val)
-        elsif d.prop == "align-items" is st.align = string_trim(d.val)
-        elsif d.prop == "text-align" is st.text_align = string_trim(d.val)
-        elsif d.prop == "opacity" is st.opacity = parse_opacity(d.val)
+        if t == "none" || t == "hidden" is
+            none = true
+        elsif is_line_style(t) is
+            w = w
+        elsif t == "thin" is
+            w = 1
+        elsif t == "medium" is
+            w = 3
+        elsif t == "thick" is
+            w = 5
+        elsif cssval::is_color(t) is
+            color = parse_color(t)
+            has_c = true
+        else is
+            let l: cssval::Len = cssval::parse_len(t, env)
+            if l.ok && !l.auto is w = cssval::px_of(l, 0) end
+        end
+    end
+    return BorderRes { w: if none then 0 else w, color: color, has_color: has_c }
+end
+
+fn parse_radius_all(val: string, env: cssval::LenEnv, w_hint: int) -> BoxSides is
+    let main: [string] = string_split(val, "/")
+    let toks: [string] = cssval::split_top(main[0])
+    let n: int = array_len(toks)
+    if n == 0 is return BoxSides { top: 0, right: 0, bottom: 0, left: 0 } end
+    let tl: int = box_px(toks[0], env, w_hint)
+    let tr: int = if n >= 2 then box_px(toks[1], env, w_hint) else tl
+    let br: int = if n >= 3 then box_px(toks[2], env, w_hint) else tl
+    let bl: int = if n >= 4 then box_px(toks[3], env, w_hint) else tr
+    return BoxSides { top: tl, right: tr, bottom: br, left: bl }
+end
+
+fn parse_font_weight(val: string) -> bool is
+    let v: string = string_lower(string_trim(val))
+    if v == "bold" || v == "bolder" is return true end
+    if v == "normal" || v == "lighter" is return false end
+    return str_to_int(v) >= 600
+end
+
+fn parse_line_height(val: string, font_size: int, env: cssval::LenEnv) -> int is
+    let v: string = string_lower(string_trim(val))
+    if v == "normal" || v == "" is return 0 end
+    let is_plain: bool = string_find(v, "px") < 0 && string_find(v, "em") < 0 && string_find(v, "%") < 0 &&
+                         string_find(v, "pt") < 0 && string_find(v, "calc") < 0
+    if is_plain is
+        let f: f64 = conv::str_to_float(v)
+        return conv::float_to_int(f * conv::int_to_float(font_size) + 0.5)
+    end
+    if string_ends_with(v, "%") is
+        let f: f64 = conv::str_to_float(string_slice(v, 0, string_len(v) - 1))
+        return conv::float_to_int(f * conv::int_to_float(font_size) / 100.0 + 0.5)
+    end
+    return len_px_or(v, env, font_size, 0)
+end
+
+;; box-shadow (pierwszy cień, bez inset): offset-x offset-y [blur [spread]] [color]
+fn apply_shadow(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let first: [string] = cssval::split_commas(val)
+    if array_len(first) == 0 || string_lower(string_trim(first[0])) == "none" is
+        st.has_shadow = false
+        return st
+    end
+    let toks: [string] = cssval::split_top(first[0])
+    let mut nums: [int] = []
+    let mut col: Color = Color { r: 0, g: 0, b: 0, a: 64 }
+    let mut inset: bool = false
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if string_lower(t) == "inset" is
+            inset = true
+        elsif cssval::is_color(t) is
+            col = parse_color(t)
+        else is
+            nums = array_push(nums, len_px_or(t, env, 0, 0))
+        end
+    end
+    if inset || array_len(nums) < 2 is
+        st.has_shadow = false
+        return st
+    end
+    st.has_shadow = true
+    st.sh_x = nums[0]
+    st.sh_y = nums[1]
+    st.sh_blur = if array_len(nums) >= 3 then nums[2] else 0
+    st.sh_spread = if array_len(nums) >= 4 then nums[3] else 0
+    st.sh_color = col
+    return st
+end
+
+;; background / background-image: obsługa color, url(...), linear-gradient(...)
+fn parse_gradient(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let open: int = string_find(val, "(")
+    let close: int = string_len(val) - 1
+    let parts: [string] = cssval::split_commas(string_slice(val, open + 1, close))
+    if array_len(parts) < 2 is return st end
+    let mut vertical: bool = true
+    let mut first_idx: int = 0
+    let head: string = string_lower(string_trim(parts[0]))
+    if string_starts_with(head, "to ") is
+        vertical = string_find(head, "bottom") >= 0 || string_find(head, "top") >= 0
+        first_idx = 1
+    elsif string_ends_with(head, "deg") is
+        let deg: int = str_to_int(string_slice(head, 0, string_len(head) - 3))
+        let d: int = ((deg % 360) + 360) % 360
+        vertical = d < 45 || (d >= 135 && d < 225) || d >= 315
+        first_idx = 1
+    end
+    let flipped: bool = string_find(head, "to top") >= 0 || string_find(head, "to left") >= 0
+    let c1_tok: string = cssval::split_top(parts[first_idx])[0]
+    let c2_tok: string = cssval::split_top(parts[array_len(parts) - 1])[0]
+    let mut a: Color = parse_color(c1_tok)
+    let mut b: Color = parse_color(c2_tok)
+    if flipped is
+        let tmp: Color = a
+        a = b
+        b = tmp
+    end
+    st.has_grad = true
+    st.grad_from = a
+    st.grad_to = b
+    st.grad_vertical = vertical
+    return st
+end
+
+fn apply_background(st0: ComputedStyle, val: string, em: int, env: cssval::LenEnv) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let v: string = string_trim(val)
+    if string_find(v, "linear-gradient") >= 0 is
+        let s: int = string_find(v, "linear-gradient")
+        st = parse_gradient(st, string_slice(v, s, string_len(v)))
+        return st
+    end
+    let toks: [string] = cssval::split_top(v)
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if string_starts_with(string_lower(t), "url(") is
+            st.bg_image = strip_quotes(string_slice(t, 4, string_len(t) - 1))
+        elsif string_lower(t) == "none" is
+            st.bg_image = ""
+        elsif cssval::is_color(t) is
+            st.background = parse_color(t)
+            st.has_bg = st.background.a > 0
         end
     end
     return st
 end
 
-;; Rozbija `class="a b c"` na ["a","b","c"].
+;; flex: none | auto | <grow> [<shrink>] [<basis>]
+fn apply_flex_shorthand(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let v: string = string_lower(string_trim(val))
+    if v == "none" is
+        st.flex_grow = 0
+        st.flex_shrink = 0
+        st.flex_basis = -1
+        return st
+    end
+    if v == "auto" is
+        st.flex_grow = 1000
+        st.flex_shrink = 1000
+        st.flex_basis = -1
+        return st
+    end
+    let toks: [string] = cssval::split_top(v)
+    let n: int = array_len(toks)
+    if n == 0 is return st end
+    let is_num0: bool = string_find(toks[0], "px") < 0 && string_find(toks[0], "%") < 0 && string_find(toks[0], "em") < 0
+    if is_num0 is
+        st.flex_grow = parse_milli(toks[0])
+        st.flex_shrink = 1000
+        st.flex_basis = 0
+        if n >= 2 is
+            let t1: string = toks[1]
+            let is_num1: bool = string_find(t1, "px") < 0 && string_find(t1, "%") < 0 && string_find(t1, "em") < 0 && t1 != "auto"
+            if is_num1 is
+                st.flex_shrink = parse_milli(t1)
+            else is
+                st.flex_basis = len_px_or(t1, env, 0, -1)
+            end
+        end
+        if n >= 3 is st.flex_basis = len_px_or(toks[2], env, 0, -1) end
+    else is
+        st.flex_grow = 1000
+        st.flex_basis = len_px_or(toks[0], env, 0, -1)
+    end
+    return st
+end
+
+fn apply_flex_flow(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let toks: [string] = cssval::split_top(string_lower(val))
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if t == "row" || t == "column" || t == "row-reverse" || t == "column-reverse" is st.flex_dir = t end
+        if t == "wrap" || t == "wrap-reverse" is st.flex_wrap = true end
+        if t == "nowrap" is st.flex_wrap = false end
+    end
+    return st
+end
+
+fn apply_text_decoration(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let v: string = string_lower(val)
+    st.underline = string_find(v, "underline") >= 0
+    st.strike = string_find(v, "line-through") >= 0
+    return st
+end
+
+fn apply_overflow(st0: ComputedStyle, val: string, axis: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let toks: [string] = cssval::split_top(string_lower(val))
+    if array_len(toks) == 0 is return st end
+    let x: string = toks[0]
+    let y: string = if array_len(toks) >= 2 then toks[1] else toks[0]
+    if axis == "both" is
+        st.overflow_x = x
+        st.overflow_y = y
+    elsif axis == "x" is
+        st.overflow_x = x
+    else is
+        st.overflow_y = x
+    end
+    return st
+end
+
+fn first_duration_ms(val: string) -> int is
+    let toks: [string] = cssval::split_top(string_lower(val))
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if string_ends_with(t, "ms") is
+            return str_to_int(string_slice(t, 0, string_len(t) - 2))
+        end
+        if string_ends_with(t, "s") && !string_ends_with(t, "ms") && string_len(t) > 1 is
+            let c: string = string_slice(t, 0, 1)
+            if (c >= "0" && c <= "9") || c == "." is
+                return conv::float_to_int(conv::str_to_float(string_slice(t, 0, string_len(t) - 1)) * 1000.0)
+            end
+        end
+    end
+    return 0
+end
+
+pub fn is_trivial_value(v: string) -> bool is
+    let l: string = string_lower(string_trim(v))
+    return l == "initial" || l == "unset" || l == "inherit"
+end
+
+fn set_all_borders(st0: ComputedStyle, w: int, c: Color, set_color: bool) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    st.bt = w
+    st.br = w
+    st.bb = w
+    st.bl = w
+    st.border = w
+    if set_color is
+        st.bct = c
+        st.bcr = c
+        st.bcb = c
+        st.bcl = c
+        st.border_color = c
+    end
+    return st
+end
+
+;; Zbiera zmienne --x z deklaracji (dziedziczone po potomkach).
+fn collect_vars(inherited_vars: string, decls: [css::CssDecl]) -> string is
+    let mut vars: string = inherited_vars
+    let mut i: int = 0
+    while i < array_len(decls) is
+        if string_starts_with(decls[i].prop, "--") is
+            vars = vars_set(vars, decls[i].prop, decls[i].val)
+        end
+        i += 1
+    end
+    return vars
+end
+
+pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix: css::InteractionState, parent: ComputedStyle) -> ComputedStyle is
+    let mut st: ComputedStyle = base
+    st.vars = collect_vars(st.vars, decls)
+    let basis: int = ix.viewport_w
+    let mut i: int = 0
+    while i < array_len(decls) is
+        let d: css::CssDecl = decls[i]
+        i += 1
+        if string_starts_with(d.prop, "--") is continue end
+        let val: string = string_trim(substitute_vars(d.val, st.vars))
+        let prop: string = d.prop
+        let lower: string = string_lower(val)
+        if lower == "inherit" is
+            if prop == "color" is st.color = parent.color end
+            if prop == "font-size" is st.font_size = parent.font_size end
+            continue
+        end
+        if lower == "initial" || lower == "unset" is continue end
+        let em: int = if prop == "font-size" then parent.font_size else st.font_size
+        let env: cssval::LenEnv = env_for(if em > 0 then em else em_base, ix)
+
+        if prop == "display" is
+            st.display = lower
+            if lower == "inline-flex" is st.display = "inline-flex" end
+            if lower == "table" || lower == "table-row-group" || lower == "flow-root" is st.display = "block" end
+            if lower == "table-row" is st.display = "flex" end
+            if lower == "table-cell" is st.display = "block" end
+        elsif prop == "position" is st.position = lower
+        elsif prop == "visibility" is st.visible = lower != "hidden" && lower != "collapse"
+        elsif prop == "color" is
+            if lower == "currentcolor" is st.color = st.color else is st.color = parse_color(val) end
+        elsif prop == "background" is
+            st = apply_background(st, val, em, env)
+        elsif prop == "background-color" is
+            st.background = parse_color(val)
+            st.has_bg = st.background.a > 0
+        elsif prop == "background-image" is
+            if string_find(lower, "linear-gradient") >= 0 is
+                st = parse_gradient(st, string_slice(val, string_find(lower, "linear-gradient"), string_len(val)))
+            elsif string_starts_with(lower, "url(") is
+                st.bg_image = strip_quotes(string_slice(val, 4, string_len(val) - 1))
+            else is
+                st.bg_image = ""
+                st.has_grad = false
+            end
+        elsif prop == "background-size" is st.bg_size = lower
+        elsif prop == "width" is
+            let s: SizeRes = parse_size(val, env)
+            st.width = s.px
+            st.width_pct = s.pct
+            st.width_mode = s.mode
+        elsif prop == "height" is
+            let s: SizeRes = parse_size(val, env)
+            st.height = s.px
+            st.height_pct = s.pct
+            st.height_mode = s.mode
+        elsif prop == "min-width" is
+            let s: SizeRes = parse_size(val, env)
+            st.min_width = if s.px < 0 then 0 else s.px
+            st.min_width_pct = s.pct
+        elsif prop == "max-width" is
+            let s: SizeRes = parse_size(val, env)
+            st.max_width = s.px
+            st.max_width_pct = s.pct
+            st.max_width_mode = s.mode
+        elsif prop == "min-height" is
+            let s: SizeRes = parse_size(val, env)
+            st.min_height = if s.px < 0 then 0 else s.px
+        elsif prop == "max-height" is
+            let s: SizeRes = parse_size(val, env)
+            st.max_height = s.px
+            st.max_height_mode = s.mode
+        elsif prop == "box-sizing" is st.border_box = lower == "border-box"
+        elsif prop == "padding" is
+            let sides: BoxSides = parse_box_shorthand(val, env, basis)
+            st.pad_top = sides.top
+            st.pad_right = sides.right
+            st.pad_bottom = sides.bottom
+            st.pad_left = sides.left
+            st.padding = sides.top
+        elsif prop == "padding-top" is st.pad_top = box_px(val, env, basis)
+        elsif prop == "padding-right" is st.pad_right = box_px(val, env, basis)
+        elsif prop == "padding-bottom" is st.pad_bottom = box_px(val, env, basis)
+        elsif prop == "padding-left" is st.pad_left = box_px(val, env, basis)
+        elsif prop == "margin" is
+            let sides: BoxSides = parse_margin_shorthand(val, env, basis)
+            st.mar_top = sides.top
+            st.mar_right = sides.right
+            st.mar_bottom = sides.bottom
+            st.mar_left = sides.left
+            st.margin = sides.top
+        elsif prop == "margin-top" is st.mar_top = margin_px(val, env, basis)
+        elsif prop == "margin-right" is st.mar_right = margin_px(val, env, basis)
+        elsif prop == "margin-bottom" is st.mar_bottom = margin_px(val, env, basis)
+        elsif prop == "margin-left" is st.mar_left = margin_px(val, env, basis)
+        elsif prop == "top" is st.top = pos_px(val, env, ix.viewport_h)
+        elsif prop == "right" is st.right = pos_px(val, env, basis)
+        elsif prop == "bottom" is st.bottom = pos_px(val, env, ix.viewport_h)
+        elsif prop == "left" is st.left = pos_px(val, env, basis)
+        elsif prop == "inset" is
+            let sides: BoxSides = parse_margin_shorthand(val, env, basis)
+            st.top = sides.top
+            st.right = sides.right
+            st.bottom = sides.bottom
+            st.left = sides.left
+        elsif prop == "z-index" is st.z_index = str_to_int(lower)
+        elsif prop == "font-size" is
+            let fs: int = if lower == "small" then 13 elsif lower == "medium" then 16 elsif lower == "large" then 18
+                          elsif lower == "x-large" then 24 elsif lower == "xx-large" then 32
+                          elsif lower == "smaller" then parent.font_size * 83 / 100
+                          elsif lower == "larger" then parent.font_size * 120 / 100
+                          else len_px_or(val, env, parent.font_size, st.font_size)
+            st.font_size = if fs < 1 then 1 else fs
+        elsif prop == "font-weight" is st.bold = parse_font_weight(val)
+        elsif prop == "font-style" is st.italic = lower == "italic" || lower == "oblique"
+        elsif prop == "font" is
+            let toks: [string] = cssval::split_top(val)
+            let mut k: int = 0
+            while k < array_len(toks) is
+                let t: string = string_lower(toks[k])
+                k += 1
+                if t == "bold" || t == "700" || t == "800" || t == "900" is st.bold = true end
+                if t == "italic" is st.italic = true end
+                let slash: int = string_find(t, "/")
+                let head: string = if slash >= 0 then string_slice(t, 0, slash) else t
+                if string_find(head, "px") >= 0 || string_find(head, "rem") >= 0 || (string_find(head, "em") >= 0 && head != "em") is
+                    st.font_size = len_px_or(head, env, parent.font_size, st.font_size)
+                    if slash >= 0 is st.line_height = parse_line_height(string_slice(t, slash + 1, string_len(t)), st.font_size, env) end
+                end
+            end
+        elsif prop == "line-height" is st.line_height = parse_line_height(val, st.font_size, env)
+        elsif prop == "text-align" is st.text_align = if lower == "start" then "left" elsif lower == "end" then "right" else lower
+        elsif prop == "text-transform" is st.text_transform = lower
+        elsif prop == "text-decoration" || prop == "text-decoration-line" is st = apply_text_decoration(st, val)
+        elsif prop == "text-overflow" is st.ellipsis = lower == "ellipsis"
+        elsif prop == "white-space" is st.white_space = lower
+        elsif prop == "word-break" || prop == "overflow-wrap" || prop == "word-wrap" is
+            st.break_words = lower == "break-all" || lower == "break-word" || lower == "anywhere"
+        elsif prop == "cursor" is st.cursor = lower
+        elsif prop == "overflow" is st = apply_overflow(st, val, "both")
+        elsif prop == "overflow-x" is st = apply_overflow(st, val, "x")
+        elsif prop == "overflow-y" is st = apply_overflow(st, val, "y")
+        elsif prop == "border" is
+            let b: BorderRes = parse_border_value(val, env, st.border_color)
+            st = set_all_borders(st, b.w, b.color, true)
+        elsif prop == "border-width" is
+            let sides: BoxSides = parse_box_shorthand(val, env, 0)
+            st.bt = sides.top
+            st.br = sides.right
+            st.bb = sides.bottom
+            st.bl = sides.left
+            st.border = sides.top
+        elsif prop == "border-color" is
+            let toks: [string] = cssval::split_top(val)
+            if array_len(toks) > 0 is
+                let c1: Color = parse_color(toks[0])
+                let c2: Color = if array_len(toks) >= 2 then parse_color(toks[1]) else c1
+                let c3: Color = if array_len(toks) >= 3 then parse_color(toks[2]) else c1
+                let c4: Color = if array_len(toks) >= 4 then parse_color(toks[3]) else c2
+                st.bct = c1
+                st.bcr = c2
+                st.bcb = c3
+                st.bcl = c4
+                st.border_color = c1
+            end
+        elsif prop == "border-style" is
+            if lower == "none" || lower == "hidden" is st = set_all_borders(st, 0, st.border_color, false) end
+        elsif prop == "border-top" is
+            let b: BorderRes = parse_border_value(val, env, st.bct)
+            st.bt = b.w
+            st.border = b.w
+            if b.has_color is
+                st.bct = b.color
+                st.border_color = b.color
+            end
+        elsif prop == "border-right" is
+            let b: BorderRes = parse_border_value(val, env, st.bcr)
+            st.br = b.w
+            if b.has_color is st.bcr = b.color end
+        elsif prop == "border-bottom" is
+            let b: BorderRes = parse_border_value(val, env, st.bcb)
+            st.bb = b.w
+            if b.has_color is st.bcb = b.color end
+        elsif prop == "border-left" is
+            let b: BorderRes = parse_border_value(val, env, st.bcl)
+            st.bl = b.w
+            if b.has_color is st.bcl = b.color end
+        elsif prop == "border-top-width" is
+            st.bt = box_px(val, env, 0)
+            st.border = st.bt
+        elsif prop == "border-right-width" is st.br = box_px(val, env, 0)
+        elsif prop == "border-bottom-width" is st.bb = box_px(val, env, 0)
+        elsif prop == "border-left-width" is st.bl = box_px(val, env, 0)
+        elsif prop == "border-top-color" is
+            st.bct = parse_color(val)
+            st.border_color = st.bct
+        elsif prop == "border-right-color" is st.bcr = parse_color(val)
+        elsif prop == "border-bottom-color" is st.bcb = parse_color(val)
+        elsif prop == "border-left-color" is st.bcl = parse_color(val)
+        elsif prop == "border-radius" is
+            let r: BoxSides = parse_radius_all(val, env, 0)
+            st.rad_tl = r.top
+            st.rad_tr = r.right
+            st.rad_br = r.bottom
+            st.rad_bl = r.left
+        elsif prop == "border-top-left-radius" is st.rad_tl = box_px(val, env, 0)
+        elsif prop == "border-top-right-radius" is st.rad_tr = box_px(val, env, 0)
+        elsif prop == "border-bottom-right-radius" is st.rad_br = box_px(val, env, 0)
+        elsif prop == "border-bottom-left-radius" is st.rad_bl = box_px(val, env, 0)
+        elsif prop == "box-shadow" is st = apply_shadow(st, val, env)
+        elsif prop == "outline" is
+            let b: BorderRes = parse_border_value(val, env, st.outline_color)
+            st.outline_w = b.w
+            if b.has_color is st.outline_color = b.color end
+        elsif prop == "outline-width" is st.outline_w = box_px(val, env, 0)
+        elsif prop == "outline-color" is st.outline_color = parse_color(val)
+        elsif prop == "gap" is
+            let toks: [string] = cssval::split_top(val)
+            st.row_gap = box_px(toks[0], env, 0)
+            st.gap = if array_len(toks) >= 2 then box_px(toks[1], env, 0) else st.row_gap
+        elsif prop == "column-gap" || prop == "grid-column-gap" is st.gap = box_px(val, env, 0)
+        elsif prop == "row-gap" || prop == "grid-row-gap" is st.row_gap = box_px(val, env, 0)
+        elsif prop == "flex-direction" is st.flex_dir = lower
+        elsif prop == "flex-wrap" is st.flex_wrap = lower == "wrap" || lower == "wrap-reverse"
+        elsif prop == "flex-flow" is st = apply_flex_flow(st, val)
+        elsif prop == "flex" is st = apply_flex_shorthand(st, val, env)
+        elsif prop == "flex-grow" is st.flex_grow = parse_milli(val)
+        elsif prop == "flex-shrink" is st.flex_shrink = parse_milli(val)
+        elsif prop == "flex-basis" is st.flex_basis = len_px_or(val, env, 0, -1)
+        elsif prop == "order" is st.order = str_to_int(lower)
+        elsif prop == "justify-content" is st.justify = if lower == "start" then "flex-start" elsif lower == "end" then "flex-end" else lower
+        elsif prop == "align-items" is st.align = if lower == "start" then "flex-start" elsif lower == "end" then "flex-end" elsif lower == "normal" then "stretch" else lower
+        elsif prop == "align-self" is st.align_self = if lower == "auto" then "" elsif lower == "start" then "flex-start" elsif lower == "end" then "flex-end" else lower
+        elsif prop == "grid-template-columns" is st.grid_cols = val
+        elsif prop == "grid-template-rows" is st.grid_rows = val
+        elsif prop == "grid-column" || prop == "grid-column-start" is
+            if string_find(lower, "span") >= 0 is
+                st.grid_col_span = str_to_int(string_trim(string_slice(lower, string_find(lower, "span") + 4, string_len(lower))))
+                if st.grid_col_span < 1 is st.grid_col_span = 1 end
+            end
+        elsif prop == "opacity" is st.opacity = parse_opacity(val)
+        elsif prop == "object-fit" is st.object_fit = lower
+        elsif prop == "transition" || prop == "transition-duration" is st.trans_ms = first_duration_ms(val)
+        elsif prop == "content" is
+            st.has_content = lower != "none" && lower != "normal"
+            st.content = strip_quotes(val)
+        end
+    end
+    return st
+end
+
+;; Główna funkcja: styl węzła z kaskady + dziedziczenie.
+pub fn resolve_ctx(sheet: css::Stylesheet, d: dom::Dom, node_id: int, inherited: ComputedStyle, ix: css::InteractionState) -> ComputedStyle is
+    let n: dom::DomNode = d.nodes[node_id]
+    let st: ComputedStyle = default_style_for(n.tag, inherited)
+    let decls: [css::CssDecl] = css::matching_decls_ctx(sheet, d, node_id, ix)
+    return apply_decls(st, decls, inherited.font_size, ix, inherited)
+end
+
+;; Zgodność wsteczna (bez kontekstu drzewa).
+pub fn resolve(sheet: css::Stylesheet, tag: string, id: string, classes: [string], inherited: ComputedStyle) -> ComputedStyle is
+    let st: ComputedStyle = default_style_for(tag, inherited)
+    let decls: [css::CssDecl] = css::matching_decls(sheet, tag, id, classes)
+    return apply_decls(st, decls, inherited.font_size, css::no_interaction(), inherited)
+end
+
 pub fn split_classes(attr_class: string) -> [string] is
     if string_trim(attr_class) == "" is return [] end
     return string_split(string_trim(attr_class), " ")
+end
+
+;; Stały rozmiar z trybu: -1 gdy auto, inaczej px (+ procent z `basis`).
+pub fn size_of(px: int, pct: int, mode: string, basis: int) -> int is
+    if mode == "auto" is return -1 end
+    if mode == "pct" is
+        if basis < 0 is return -1 end
+        return px + basis * pct / 10000
+    end
+    return px
+end
+
+;; Styl tekstu węzła tekstowego: dziedziczy po rodzicu, display inline.
+pub fn text_style(parent: ComputedStyle) -> ComputedStyle is
+    let mut st: ComputedStyle = base_for(parent)
+    st.display = "inline"
+    return st
+end
+
+pub fn is_scroll_container(st: ComputedStyle) -> bool is
+    return st.overflow_x != "visible" || st.overflow_y != "visible"
+end
+
+pub fn line_height_of(st: ComputedStyle, font_h: int) -> int is
+    if st.line_height > 0 is return st.line_height end
+    return font_h
 end
