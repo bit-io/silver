@@ -8,25 +8,51 @@ pub struct Window is
     pub open:   bool
 end
 
+;; Zdarzenie wejściowe po zdekodowaniu payloadu z shimu.
+;;  kind: none | quit | mouse_down | mouse_up | mouse_move | key_down | key_up |
+;;        resize | text | text_edit | scroll | focus_gained | focus_lost |
+;;        drop_file | drop_text | expose | mouse_leave
 pub struct InputEvent is
-    pub kind: string   ;; "quit" | "mouse_down" | "mouse_up" | "mouse_move"
-                        ;; | "key_down" | "key_up" | "resize" | "text"
-                        ;; | "scroll" | "focus_gained" | "focus_lost" | "none"
-    pub x:    int
-    pub y:    int
-    pub code: int       ;; keycode dla key_down/key_up, przycisk myszy dla mouse_*,
-                         ;; delta (px) dla scroll (w polu y)
-    pub text: string     ;; wpisany tekst dla "text"
+    pub kind:   string
+    pub x:      int
+    pub y:      int
+    pub code:   int      ;; keycode (key_*), przycisk (mouse_*), skala % (resize)
+    pub text:   string   ;; tekst (text/text_edit/drop_*)
+    pub mods:   int      ;; 1 shift, 2 ctrl, 4 alt, 8 gui
+    pub clicks: int      ;; 1 = klik, 2 = dwuklik…
+    pub repeat: bool
+    pub dx:     int      ;; scroll w poziomie (px)
 end
+
+;; Modyfikatory
+pub fn mod_shift() -> int is return 1 end
+pub fn mod_ctrl()  -> int is return 2 end
+pub fn mod_alt()   -> int is return 4 end
+pub fn mod_gui()   -> int is return 8 end
+
+;; Kody klawiszy SDL (keysym)
+pub fn key_backspace() -> int is return 8 end
+pub fn key_tab()       -> int is return 9 end
+pub fn key_enter()     -> int is return 13 end
+pub fn key_escape()    -> int is return 27 end
+pub fn key_space()     -> int is return 32 end
+pub fn key_delete()    -> int is return 127 end
+pub fn key_right()     -> int is return 1073741903 end
+pub fn key_left()      -> int is return 1073741904 end
+pub fn key_down()      -> int is return 1073741905 end
+pub fn key_up()        -> int is return 1073741906 end
+pub fn key_home()      -> int is return 1073741898 end
+pub fn key_end()       -> int is return 1073741901 end
+pub fn key_pageup()    -> int is return 1073741899 end
+pub fn key_pagedown()  -> int is return 1073741902 end
+pub fn key_kp_enter()  -> int is return 1073741912 end
 
 pub fn create(title: string, width: int, height: int) -> Window is
     let h: int = ffi_shim::silver_window_create(title, width, height)
     return Window { handle: h, title: title, width: width, height: height, open: h >= 0 }
 end
 
-;; Ładuje font użyty przez engine::paint do rysowania tekstu.
-;; Domyślnie warto wskazać jakiś font systemowy, np.
-;; "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+;; path == "" -> font systemowy
 pub fn load_font(win: Window, path: string, size: int) -> bool is
     return ffi_shim::silver_load_font(win.handle, path, size)
 end
@@ -35,72 +61,146 @@ pub fn is_open(win: Window) -> bool is
     return win.open && ffi_shim::silver_is_open(win.handle)
 end
 
-;; Zwraca kolejne zdarzenie wejścia z kolejki SDL. Wołaj w pętli
-;; (`while true` z `poll` zwracającym "none" gdy kolejka pusta) raz na
-;; klatkę, zanim wykonasz layout/paint.
+;; Treść po drugim separatorze '|' (tekst może sam zawierać '|').
+fn tail_after_bars(payload: string, bars: int) -> string is
+    let mut p: int = 0
+    let mut seen: int = 0
+    let n: int = string_len(payload)
+    while p < n && seen < bars is
+        if string_slice(payload, p, p + 1) == "|" is seen += 1 end
+        p += 1
+    end
+    return string_slice(payload, p, n)
+end
+
+fn ev(kind: string) -> InputEvent is
+    return InputEvent { kind: kind, x: 0, y: 0, code: 0, text: "", mods: 0, clicks: 1, repeat: false, dx: 0 }
+end
+
+fn field(parts: [string], i: int) -> int is
+    if i < array_len(parts) is return str_to_int(parts[i]) end
+    return 0
+end
+
+;; Dekoduje payload zdarzenia o danym kodzie (wydzielone dla testów).
+pub fn decode(code: int, payload: string) -> InputEvent is
+    let parts: [string] = string_split(payload, "|")
+    let mut e: InputEvent = ev("none")
+    if code == 1 is
+        e.kind = "quit"
+    elsif code == 2 || code == 3 is
+        e.kind = if code == 2 then "mouse_down" else "mouse_up"
+        e.x = field(parts, 0)
+        e.y = field(parts, 1)
+        e.code = field(parts, 2)
+        e.clicks = field(parts, 3)
+        e.mods = field(parts, 4)
+    elsif code == 4 is
+        e.kind = "mouse_move"
+        e.x = field(parts, 0)
+        e.y = field(parts, 1)
+        e.code = field(parts, 2)
+        e.mods = field(parts, 3)
+    elsif code == 5 || code == 11 is
+        e.kind = if code == 5 then "key_down" else "key_up"
+        e.mods = field(parts, 0)
+        e.repeat = field(parts, 1) != 0
+        e.code = field(parts, 2)
+    elsif code == 6 is
+        e.kind = "resize"
+        e.x = field(parts, 0)
+        e.y = field(parts, 1)
+        e.code = field(parts, 2)
+    elsif code == 7 is
+        e.kind = "text"
+        e.text = tail_after_bars(payload, 2)
+    elsif code == 13 is
+        e.kind = "text_edit"
+        e.x = field(parts, 0)
+        e.y = field(parts, 1)
+        e.text = tail_after_bars(payload, 2)
+    elsif code == 8 is
+        e.kind = "scroll"
+        e.dx = field(parts, 0)
+        e.y = field(parts, 1)
+        e.mods = field(parts, 2)
+        e.x = field(parts, 3)
+        e.code = field(parts, 4)
+    elsif code == 9 is
+        e.kind = "focus_gained"
+    elsif code == 10 is
+        e.kind = "focus_lost"
+    elsif code == 12 is
+        e.kind = "drop_file"
+        e.text = tail_after_bars(payload, 2)
+    elsif code == 14 is
+        e.kind = "drop_text"
+        e.text = tail_after_bars(payload, 2)
+    elsif code == 15 is
+        e.kind = "expose"
+    elsif code == 16 is
+        e.kind = "mouse_leave"
+    end
+    return e
+end
+
 pub fn poll(win: Window) -> InputEvent is
     let code: int = ffi_shim::silver_poll_event(win.handle)
-    if code == 0 is
-        return InputEvent { kind: "none", x: 0, y: 0, code: 0, text: "" }
-    end
-
-    let payload: string = ffi_shim::silver_event_payload(win.handle)
-    let parts: [string] = payload.split("|")
-    let px: int = if parts.len() > 0 then str_to_int(parts[0]) else 0
-    let py: int = if parts.len() > 1 then str_to_int(parts[1]) else 0
-    let extra: string = if parts.len() > 2 then parts[2] else ""
-
-    match code is
-        1 => return InputEvent { kind: "quit",       x: 0,  y: 0,  code: 0, text: "" }
-        2 => return InputEvent { kind: "mouse_down",  x: px, y: py, code: str_to_int(extra), text: "" }
-        3 => return InputEvent { kind: "mouse_up",    x: px, y: py, code: str_to_int(extra), text: "" }
-        4 => return InputEvent { kind: "mouse_move",  x: px, y: py, code: 0, text: "" }
-        5 => return InputEvent { kind: "key_down",    x: 0,  y: 0,  code: str_to_int(extra), text: "" }
-        6 => return InputEvent { kind: "resize",      x: px, y: py, code: 0, text: "" }
-        7 => return InputEvent { kind: "text",        x: 0,  y: 0,  code: 0, text: extra }
-        8 => return InputEvent { kind: "scroll",      x: 0,  y: py, code: 0, text: "" }
-        9 => return InputEvent { kind: "focus_gained", x: 0, y: 0,  code: 0, text: "" }
-        10 => return InputEvent { kind: "focus_lost",  x: 0, y: 0,  code: 0, text: "" }
-        11 => return InputEvent { kind: "key_up",      x: 0, y: 0,  code: str_to_int(extra), text: "" }
-    end
-    return InputEvent { kind: "none", x: 0, y: 0, code: 0, text: "" }
+    if code == 0 is return ev("none") end
+    return decode(code, ffi_shim::silver_event_payload(win.handle))
 end
 
-;; Aktualna szerokość okna wg SDL (może się różnić od win.width po
-;; resize — window::poll aktualizuje win.width/height dopiero gdy
-;; dostaniesz event "resize"; to jest zawsze świeże).
-pub fn ffi_width(win: Window) -> int is
-    return ffi_shim::silver_get_width(win.handle)
+;; Czeka maks. `ms` na zdarzenie (nie zżera CPU, gdy nic się nie dzieje).
+pub fn wait(ms: int) -> bool is
+    return ffi_shim::silver_wait_event(ms)
 end
 
-pub fn ffi_height(win: Window) -> int is
-    return ffi_shim::silver_get_height(win.handle)
+pub fn ffi_width(win: Window) -> int is return ffi_shim::silver_get_width(win.handle) end
+pub fn ffi_height(win: Window) -> int is return ffi_shim::silver_get_height(win.handle) end
+pub fn scale_percent(win: Window) -> int is return ffi_shim::silver_get_scale(win.handle) end
+
+pub fn set_title(win: Window, title: string) -> bool is return ffi_shim::silver_set_title(win.handle, title) end
+pub fn present(win: Window) -> bool is return ffi_shim::silver_present(win.handle) end
+pub fn close(win: Window) -> bool is return ffi_shim::silver_window_close(win.handle) end
+
+pub fn start_text_input(win: Window) -> bool is return ffi_shim::silver_start_text_input(win.handle) end
+pub fn stop_text_input(win: Window) -> bool is return ffi_shim::silver_stop_text_input(win.handle) end
+pub fn set_ime_rect(win: Window, x: int, y: int, w: int, h: int) -> bool is
+    return ffi_shim::silver_set_text_input_rect(win.handle, x, y, w, h)
 end
 
-pub fn set_title(win: Window, title: string) -> bool is
-    return ffi_shim::silver_set_title(win.handle, title)
+;; ---- API okna ----
+pub fn set_min_size(win: Window, w: int, h: int) -> bool is return ffi_shim::silver_set_min_size(win.handle, w, h) end
+pub fn set_max_size(win: Window, w: int, h: int) -> bool is return ffi_shim::silver_set_max_size(win.handle, w, h) end
+pub fn set_size(win: Window, w: int, h: int) -> bool is return ffi_shim::silver_set_size(win.handle, w, h) end
+pub fn set_position(win: Window, x: int, y: int) -> bool is return ffi_shim::silver_set_position(win.handle, x, y) end
+pub fn set_fullscreen(win: Window, on: bool) -> bool is return ffi_shim::silver_set_fullscreen(win.handle, if on then 1 else 0) end
+pub fn is_fullscreen(win: Window) -> bool is return ffi_shim::silver_is_fullscreen(win.handle) end
+pub fn set_resizable(win: Window, on: bool) -> bool is return ffi_shim::silver_set_resizable(win.handle, if on then 1 else 0) end
+pub fn set_decorations(win: Window, on: bool) -> bool is return ffi_shim::silver_set_bordered(win.handle, if on then 1 else 0) end
+pub fn set_always_on_top(win: Window, on: bool) -> bool is return ffi_shim::silver_set_always_on_top(win.handle, if on then 1 else 0) end
+pub fn set_opacity(win: Window, pct: int) -> bool is return ffi_shim::silver_set_opacity(win.handle, pct) end
+pub fn maximize(win: Window) -> bool is return ffi_shim::silver_maximize(win.handle) end
+pub fn minimize(win: Window) -> bool is return ffi_shim::silver_minimize(win.handle) end
+pub fn restore(win: Window) -> bool is return ffi_shim::silver_restore(win.handle) end
+pub fn raise(win: Window) -> bool is return ffi_shim::silver_raise(win.handle) end
+pub fn show(win: Window) -> bool is return ffi_shim::silver_show(win.handle) end
+pub fn hide(win: Window) -> bool is return ffi_shim::silver_hide(win.handle) end
+pub fn set_icon(win: Window, path: string) -> bool is return ffi_shim::silver_set_icon(win.handle, path) end
+
+;; kursor: arrow | pointer | text | crosshair | wait | move | ns-resize | ew-resize | not-allowed
+pub fn set_cursor(win: Window, css_cursor: string) -> bool is
+    let kind: int = if css_cursor == "pointer" then 1 elsif css_cursor == "text" then 2
+                    elsif css_cursor == "crosshair" then 3 elsif css_cursor == "wait" || css_cursor == "progress" then 4
+                    elsif css_cursor == "move" || css_cursor == "grab" then 5
+                    elsif css_cursor == "ns-resize" || css_cursor == "row-resize" then 6
+                    elsif css_cursor == "ew-resize" || css_cursor == "col-resize" then 7
+                    elsif css_cursor == "not-allowed" then 8 else 0
+    return ffi_shim::silver_set_cursor(win.handle, kind)
 end
 
-pub fn present(win: Window) -> bool is
-    return ffi_shim::silver_present(win.handle)
-end
-
-pub fn close(win: Window) -> bool is
-    return ffi_shim::silver_window_close(win.handle)
-end
-
-;; Włącza/wyłącza przechwytywanie tekstu (SDL_StartTextInput) — wołaj
-;; przy focusowaniu/blurowaniu edytowalnego <input>, patrz app.h#.
-pub fn start_text_input(win: Window) -> bool is
-    return ffi_shim::silver_start_text_input(win.handle)
-end
-
-pub fn stop_text_input(win: Window) -> bool is
-    return ffi_shim::silver_stop_text_input(win.handle)
-end
-
-;; "dark" | "light" — best-effort, patrz native/silver_shim.c (na dziś
-;; tylko Linux/GNOME; inne platformy zawsze "light").
-pub fn system_theme() -> string is
-    return ffi_shim::silver_system_theme()
-end
+;; ---- schowek, powiadomienia, motyw ----
+pub fn clipboard_get() -> string is return ffi_shim::silver_clipboard_get() end
+pub fn clipboard_set(text: string) -> bool is return ffi_shim::silver_clipboard_set(text) end
+pub fn notify(title: string, body: string) -> bool is return ffi_shim::silver_notify(title, body) end
+pub fn system_theme() -> string is return ffi_shim::silver_system_theme() end
