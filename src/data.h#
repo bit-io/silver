@@ -1,0 +1,22 @@
+mod engine
+
+pub fn object() -> string is return jsonlite::object() end
+pub fn get_str(obj: string, key: string) -> string is return jsonlite::get_str(obj, key) end
+pub fn get_int(obj: string, key: string) -> int is return jsonlite::get_int(obj, key) end
+pub fn get_bool(obj: string, key: string) -> bool is return jsonlite::get_bool(obj, key) end
+pub fn get_raw(obj: string, key: string) -> string is return jsonlite::get_raw(obj, key) end
+pub fn has_key(obj: string, key: string) -> bool is return jsonlite::has_key(obj, key) end
+pub fn keys(obj: string) -> [string] is return jsonlite::keys(obj) end
+pub fn set_str(obj: string, key: string, val: string) -> string is return jsonlite::set_str(obj, key, val) end
+pub fn set_int(obj: string, key: string, val: int) -> string is return jsonlite::set_int(obj, key, val) end
+pub fn set_bool(obj: string, key: string, val: bool) -> string is return jsonlite::set_bool(obj, key, val) end
+pub fn set_raw(obj: string, key: string, raw: string) -> string is return jsonlite::set_raw(obj, key, raw) end
+pub fn remove_key(obj: string, key: string) -> string is return jsonlite::remove_key(obj, key) end
+pub fn quote(s: string) -> string is return jsonlite::quote(s) end
+pub fn str_array(vals: [string]) -> string is return jsonlite::str_array(vals) end
+
+;; Elementy tablicy JSON jako surowe teksty ("a", 1, {...}).
+pub fn items(arr: string) -> [string] is return jsonlite::array_items(arr) end
+
+;; Surowa wartość -> tekst (cudzysłowy zdjęte).
+pub fn text(raw: string) -> string is return jsonlite::raw_to_str(raw) end
