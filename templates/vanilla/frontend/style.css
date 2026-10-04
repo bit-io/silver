@@ -1,20 +1,7 @@
-.page {
-    background: #f2f2f5;
-    padding: 24px;
-}
-
-.card {
-    background: white;
-    padding: 20px;
-    border: 1px;
-    border-color: #dddddd;
-}
-
+.page { background: #f2f2f5; padding: 24px; }
+.card { background: white; padding: 20px; border: 1px solid #dddddd; border-radius: 10px; }
 h1 { color: #202020; font-size: 28px; }
 p  { color: #555555; font-size: 16px; }
-
-.button {
-    background: #3a5edc;
-    padding: 12px;
-}
-.button span { color: white; font-size: 16px; }
+button { background: #3a5edc; color: white; border-color: #3a5edc; }
+button:hover { background: #2f4ec0; }
+.out { color: #0a7a3a; font-weight: bold; }
