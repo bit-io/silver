@@ -1,0 +1,30 @@
+* { box-sizing: border-box; }
+:root { --bg: #f1f3f9; --panel: #ffffff; --side: #20233a; --text: #1e2130; --accent: #4f6bf0; --muted: #7a8099; }
+body { background: var(--bg); color: var(--text); font-size: 14px; }
+.shell { display: flex; min-height: 100vh; }
+.side { width: 190px; background: var(--side); color: #cfd3ee; padding: 18px 12px; }
+.side h2 { color: white; margin: 0 0 16px 8px; font-size: 20px; }
+.nav { display: block; padding: 9px 12px; border-radius: 8px; margin-bottom: 4px; cursor: pointer; transition: 150ms; color: #cfd3ee; }
+.nav:hover { background: #2d3150; }
+.nav.active { background: var(--accent); color: white; }
+.clock { margin: 24px 8px 0 8px; font-size: 22px; color: white; }
+.main { flex: 1; padding: 22px; }
+.hidden { display: none; }
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 16px; }
+.card { background: var(--panel); border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(20,30,70,0.1); }
+.card .label { color: var(--muted); display: block; margin-bottom: 6px; }
+.card b { font-size: 30px; }
+.panel { background: var(--panel); border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(20,30,70,0.1); }
+.panel h3 { margin: 0 0 10px 0; }
+.panel small { color: var(--muted); font-weight: normal; margin-left: 8px; }
+.chart { display: flex; align-items: flex-end; gap: 8px; height: 160px; border-bottom: 1px solid #dde; padding-bottom: 4px; margin-bottom: 12px; }
+.bar { flex: 1; background: var(--accent); border-radius: 5px 5px 0 0; transition: 300ms; }
+.bar:hover { background: #3550d8; }
+button { background: var(--accent); color: white; border-color: var(--accent); transition: 140ms; }
+button:hover { background: #3a54d6; }
+.out { background: #f5f6fb; border-radius: 8px; padding: 10px; margin-top: 10px; color: #333; }
+@media (prefers-color-scheme: dark) {
+    :root { --bg: #14151c; --panel: #1f2130; --text: #e8eaf5; --muted: #8f95b2; }
+    .out { background: #171824; color: #ddd; }
+    .chart { border-bottom-color: #34374d; }
+}
