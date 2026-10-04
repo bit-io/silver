@@ -1,4 +1,4 @@
-use "std -> json" from "json"
+mod engine
 
 pub enum Origin is
     Both
@@ -7,68 +7,159 @@ pub enum Origin is
 end
 
 pub struct Command is
-    pub name:    string
-    pub handler: fn(string) -> string   ;; (json args) -> (json result)
-    pub origin:  Origin
+    pub name:       string
+    pub handler:    fn(string) -> string   ;; (json args) -> (json result)
+    pub origin:     Origin
+    pub origin_code: int                    ;; 0 Both, 1 HtmlOnly, 2 JsOnly (wyliczone przy rejestracji)
+    pub capability: string                  ;; "" = bez wymagań
+    pub required:   [string]                ;; wymagane klucze JSON w args
 end
 
 pub struct Router is
-    pub commands: [Command]
+    pub commands: [Command]                 ;; posortowane po `name`
+    pub grants:   [string]                  ;; "js:fs", "html:*" …
 end
 
 pub fn new_router() -> Router is
-    return Router { commands: [] }
+    return Router { commands: [], grants: [] }
 end
 
-pub fn register(router: Router, name: string, handler: fn(string) -> string) -> Router is
-    return register_scoped(router, name, handler, Origin::Both)
-end
-
-pub fn register_scoped(router: Router, name: string, handler: fn(string) -> string, origin: Origin) -> Router is
-    return Router { commands: array_push(router.commands, Command { name: name, handler: handler, origin: origin }) }
-end
-
-;; Zwraca JSON wynik komendy, albo `{"error": "..."}` gdy komenda nie
-;; istnieje LUB nie wolno jej wołać z danego pochodzenia (`caller`:
-;; "html" | "js").
-pub fn dispatch_from(router: Router, name: string, args_json: string, caller: string) -> string is
-    let count: int = array_len(router.commands)
-    let mut i: int = 0
-    while i < count is
-        let cmd: Command = router.commands[i]
-        i += 1
-        if cmd.name != name is continue end
-
-        let allowed: bool =
-            match cmd.origin is
-                Origin::Both     => true
-                Origin::HtmlOnly => caller == "html"
-                Origin::JsOnly   => caller == "js"
-            end
-        if !allowed is
-            let mut err: string = json::object()
-            err = json::set_str(err, "error", "command '" + name + "' not allowed from " + caller)
-            return err
-        end
-        return cmd.handler(args_json)
-    end
-    let mut err: string = json::object()
-    err = json::set_str(err, "error", "unknown command: " + name)
+pub fn error_json(code: string, message: string) -> string is
+    let mut err: string = jsonlite::object()
+    err = jsonlite::set_str(err, "error", message)
+    err = jsonlite::set_str(err, "code", code)
     return err
 end
 
-;; Wygodny skrót dla wywołań, którym pochodzenie jest obojętne
-;; (wewnętrzne testy, on_tick itp.) — zawsze przechodzi jak "html".
+;; Wstawia komendę z zachowaniem sortowania; ta sama nazwa = zastąpienie.
+fn insert_sorted(cmds: [Command], c: Command) -> [Command] is
+    let mut out: [Command] = []
+    let mut placed: bool = false
+    let mut i: int = 0
+    while i < array_len(cmds) is
+        if !placed && cmds[i].name == c.name is
+            out = array_push(out, c)
+            placed = true
+        elsif !placed && cmds[i].name > c.name is
+            out = array_push(out, c)
+            out = array_push(out, cmds[i])
+            placed = true
+        else is
+            out = array_push(out, cmds[i])
+        end
+        i += 1
+    end
+    if !placed is out = array_push(out, c) end
+    return out
+end
+
+fn origin_to_code(o: Origin) -> int is
+    return match o is
+        Origin::Both     => 0
+        Origin::HtmlOnly => 1
+        Origin::JsOnly   => 2
+    end
+end
+
+pub fn register_full(router: Router, name: string, handler: fn(string) -> string, origin: Origin,
+                     capability: string, required: [string]) -> Router is
+    let c: Command = Command { name: name, handler: handler, origin: origin, origin_code: origin_to_code(origin),
+                               capability: capability, required: required }
+    return Router { commands: insert_sorted(router.commands, c), grants: router.grants }
+end
+
+pub fn register(router: Router, name: string, handler: fn(string) -> string) -> Router is
+    return register_full(router, name, handler, Origin::Both, "", [])
+end
+
+pub fn register_scoped(router: Router, name: string, handler: fn(string) -> string, origin: Origin) -> Router is
+    return register_full(router, name, handler, origin, "", [])
+end
+
+;; Komenda wymagająca uprawnienia (np. "fs", "dialog", "net").
+pub fn register_cap(router: Router, name: string, handler: fn(string) -> string, origin: Origin, capability: string) -> Router is
+    return register_full(router, name, handler, origin, capability, [])
+end
+
+;; Nadaje wywołującemu ("html" | "js") uprawnienie ("*" = wszystkie).
+pub fn grant(router: Router, caller: string, capability: string) -> Router is
+    return Router { commands: router.commands, grants: array_push(router.grants, caller + ":" + capability) }
+end
+
+pub fn revoke(router: Router, caller: string, capability: string) -> Router is
+    let key: string = caller + ":" + capability
+    let mut keep: [string] = []
+    let mut i: int = 0
+    while i < array_len(router.grants) is
+        if router.grants[i] != key is keep = array_push(keep, router.grants[i]) end
+        i += 1
+    end
+    return Router { commands: router.commands, grants: keep }
+end
+
+pub fn has_grant(router: Router, caller: string, capability: string) -> bool is
+    if capability == "" is return true end
+    let mut i: int = 0
+    while i < array_len(router.grants) is
+        let g: string = router.grants[i]
+        if g == caller + ":" + capability || g == caller + ":*" is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Wyszukiwanie binarne; zwraca indeks lub -1.
+pub fn find_index(router: Router, name: string) -> int is
+    let mut lo: int = 0
+    let mut hi: int = array_len(router.commands) - 1
+    while lo <= hi is
+        let mid: int = (lo + hi) / 2
+        let cur: string = router.commands[mid].name
+        if cur == name is return mid end
+        if cur < name is
+            lo = mid + 1
+        else is
+            hi = mid - 1
+        end
+    end
+    return -1
+end
+
+pub fn has(router: Router, name: string) -> bool is
+    return find_index(router, name) >= 0
+end
+
+;; Czy `caller` może wywołać komendę (origin + capability).
+pub fn allowed(router: Router, cmd: Command, caller: string) -> bool is
+    let origin_ok: bool = cmd.origin_code == 0 || (cmd.origin_code == 1 && caller == "html") || (cmd.origin_code == 2 && caller == "js")
+    if !origin_ok is return false end
+    if cmd.capability == "" is return true end
+    if caller == "html" is return true end
+    return has_grant(router, caller, cmd.capability)
+end
+
+pub fn dispatch_from(router: Router, name: string, args_json: string, caller: string) -> string is
+    let idx: int = find_index(router, name)
+    if idx < 0 is return error_json("not_found", "unknown command: " + name) end
+    let cmd: Command = router.commands[idx]
+    if !allowed(router, cmd, caller) is
+        return error_json("forbidden", "command '" + name + "' not allowed from " + caller)
+    end
+    let mut i: int = 0
+    while i < array_len(cmd.required) is
+        if !jsonlite::has_key(args_json, cmd.required[i]) is
+            return error_json("invalid_args", "command '" + name + "' requires argument '" + cmd.required[i] + "'")
+        end
+        i += 1
+    end
+    return cmd.handler(args_json)
+end
+
 pub fn dispatch(router: Router, name: string, args_json: string) -> string is
     return dispatch_from(router, name, args_json, "html")
 end
 
-pub fn has(router: Router, name: string) -> bool is
-    let count: int = array_len(router.commands)
-    let mut i: int = 0
-    while i < count is
-        if router.commands[i].name == name is return true end
-        i += 1
-    end
-    return false
+;; Czy wynik jest błędem routera (do reject w Promise)
+pub fn is_error(result_json: string) -> bool is
+    return jsonlite::has_key(result_json, "error") && jsonlite::has_key(result_json, "code")
 end
