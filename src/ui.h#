@@ -1,0 +1,79 @@
+mod engine
+
+fn dir(op: string) -> string is
+    return jsonlite::set_str(jsonlite::object(), "op", op)
+end
+
+pub fn set_text(attr_id: string, text: string) -> string is
+    return jsonlite::set_str(jsonlite::set_str(dir("set_text"), "id", attr_id), "text", text)
+end
+
+pub fn set_value(attr_id: string, value: string) -> string is
+    return jsonlite::set_str(jsonlite::set_str(dir("set_value"), "id", attr_id), "value", value)
+end
+
+pub fn set_html(attr_id: string, html: string) -> string is
+    return jsonlite::set_str(jsonlite::set_str(dir("set_html"), "id", attr_id), "html", html)
+end
+
+pub fn set_attr(attr_id: string, name: string, value: string) -> string is
+    return jsonlite::set_str(jsonlite::set_str(jsonlite::set_str(dir("set_attr"), "id", attr_id), "name", name), "value", value)
+end
+
+pub fn add_class(attr_id: string, cls: string) -> string is
+    return jsonlite::set_str(jsonlite::set_str(dir("add_class"), "id", attr_id), "cls", cls)
+end
+
+pub fn remove_class(attr_id: string, cls: string) -> string is
+    return jsonlite::set_str(jsonlite::set_str(dir("remove_class"), "id", attr_id), "cls", cls)
+end
+
+pub fn set_checked(attr_id: string, checked: bool) -> string is
+    return jsonlite::set_bool(jsonlite::set_str(dir("set_checked"), "id", attr_id), "checked", checked)
+end
+
+pub fn set_state(key: string, value: string) -> string is
+    return jsonlite::set_str(jsonlite::set_str(dir("set_state"), "key", key), "value", value)
+end
+
+pub fn set_title(title: string) -> string is
+    return jsonlite::set_str(dir("title"), "title", title)
+end
+
+pub fn focus(attr_id: string) -> string is
+    return jsonlite::set_str(dir("focus"), "id", attr_id)
+end
+
+pub fn scroll_top(y: int) -> string is
+    return jsonlite::set_int(dir("scroll"), "y", y)
+end
+
+pub fn notify(title: string, body: string) -> string is
+    return jsonlite::set_str(jsonlite::set_str(dir("notify"), "title", title), "body", body)
+end
+
+pub fn reload() -> string is return dir("reload") end
+pub fn close() -> string is return dir("close") end
+
+;; Dokłada dyrektywę do wyniku handlera (tworzy/uzupełnia tablicę "__ui").
+pub fn with(result_json: string, directive: string) -> string is
+    let base: string = if string_trim(result_json) == "" then jsonlite::object() else result_json
+    let cur: string = jsonlite::get_raw(base, "__ui")
+    let list: string = if cur == "" then "[" + directive + "]" else string_slice(cur, 0, string_len(cur) - 1) + "," + directive + "]"
+    return jsonlite::set_raw(base, "__ui", list)
+end
+
+;; Wynik zawierający tylko dyrektywy
+pub fn only(directive: string) -> string is
+    return with(jsonlite::object(), directive)
+end
+
+;; Lista dyrektyw z wyniku handlera ([] gdy brak)
+pub fn directives(result_json: string) -> [string] is
+    return jsonlite::array_items(jsonlite::get_raw(result_json, "__ui"))
+end
+
+pub fn strip(result_json: string) -> string is
+    if !jsonlite::has_key(result_json, "__ui") is return result_json end
+    return jsonlite::remove_key(result_json, "__ui")
+end
