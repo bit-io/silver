@@ -60,4 +60,28 @@ if [ -f "$QJS/quickjs.c" ]; then
 fi
 # shellcheck disable=SC2086
 $AR rcs "$OUT/libsilverjs.a" $OBJS
+# --- pliki pkg-config (*.pc) --------------------------------------------------
+# Kompilator H# dla `extern static [c, "nazwa"]` najpierw pyta pkg-config.
+# Dzieki plikom .pc linker dostaje od razu KOMPLET bibliotek we wlasciwej
+# kolejnosci (SDL2/SDL2_ttf/SDL2_image/libm ZA archiwum .a) - bez tego link
+# konczyl sie "undefined reference to SDL_* / trunc / fmod ...".
+# Uzycie:  . native/env.sh   (ustawia PKG_CONFIG_PATH i LIBRARY_PATH)
+ABS_OUT="$(cd "$OUT" && pwd)"
+PC="$OUT/pkgconfig"
+mkdir -p "$PC"
+write_pc() { # nazwa opis libs
+    {
+        echo "prefix=$ABS_OUT"
+        echo "libdir=$ABS_OUT"
+        echo "Name: $1"
+        echo "Description: $2"
+        echo "Version: 0.2.0"
+        echo "Libs: -L\${libdir} -l$1 $3"
+    } > "$PC/$1.pc"
+}
+write_pc silvershim    "Silver: warstwa okienna SDL2" "-lSDL2_image -lSDL2_ttf -lSDL2 -lm"
+write_pc silverjs      "Silver: QuickJS + mostek JS"  "-lm -lpthread"
+write_pc silverdialogs "Silver: natywne dialogi"      ""
+
 echo "[silver] gotowe: $(ls $OUT/*.a | tr '\n' ' ')"
+echo "[silver] pkg-config: . native/env.sh  (albo export PKG_CONFIG_PATH=$ABS_OUT/pkgconfig)"
