@@ -88,8 +88,12 @@ static void report_exception(SilverJsCtx *sc, const char *where) {
     JS_FreeValue(ctx, exc);
 }
 
-static int interrupt_cb(JSRuntime *rt, void *opaque) {
-    (void)rt;
+/* quickjs (klasyczny) przekazuje tu JSRuntime*, nowszy quickjs-ng - JSContext*.
+ * Pierwszy argument i tak nie jest uzywany, wiec deklarujemy go jako void*
+ * (ten sam ABI w obu wariantach) i rzutujemy przy rejestracji - dzieki temu
+ * kod buduje sie z OBOMA wersjami biblioteki (bez -Wincompatible-pointer-types). */
+static int interrupt_cb(void *unused_rt_or_ctx, void *opaque) {
+    (void)unused_rt_or_ctx;
     SilverJsCtx *sc = (SilverJsCtx *)opaque;
     if (sc->deadline && now_ms() > sc->deadline) { sc->interrupted = 1; return 1; }
     return 0;
@@ -226,7 +230,7 @@ int js_init(int win_handle) {
     memset(sc, 0, sizeof(*sc));
     sc->used = 1; sc->rt = rt; sc->ctx = ctx;
     sc->budget_ms = SILVER_DEFAULT_BUDGET;
-    JS_SetInterruptHandler(rt, interrupt_cb, sc);
+    JS_SetInterruptHandler(rt, (JSInterruptHandler *)interrupt_cb, sc);
 
     sc->global = JS_GetGlobalObject(ctx);
     set_fn(ctx, sc->global, "__silver_native_invoke", native_invoke, 3);
