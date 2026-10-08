@@ -17,12 +17,29 @@ CC="${CC:-cc}"
 AR="${AR:-ar}"
 CFLAGS="${CFLAGS:--O2 -fPIC -Wall -Wextra -Wno-unused-parameter}"
 
+# SILVER_STATIC=1 → przy braku statycznych SDL2/SDL2_ttf/SDL2_image zbuduj je (native/build/deps)
+if [ "${SILVER_STATIC:-0}" = "1" ] && [ ! -f "$OUT/deps/lib/libSDL2.a" ]; then
+    sh ./build-static-deps.sh
+fi
+
+# nagłówki: preferuj statyczny SDL2 z native/build/deps (jeśli zbudowany), inaczej systemowy
+if [ -x "$OUT/deps/bin/sdl2-config" ]; then
+    SDL_CFLAGS="-I$OUT/deps/include $("$OUT/deps/bin/sdl2-config" --cflags)"
+else
 SDL_CFLAGS=$(sdl2-config --cflags 2>/dev/null || pkg-config --cflags sdl2 SDL2_ttf SDL2_image 2>/dev/null || echo "")
+fi
 
 echo "[silver] libsilvershim.a (SDL2)"
 # shellcheck disable=SC2086
 $CC $CFLAGS $SDL_CFLAGS -c silver_shim.c -o "$OUT/silver_shim.o"
 $AR rcs "$OUT/libsilvershim.a" "$OUT/silver_shim.o"
+# wariant dla linkowania w pełni statycznego: domyślnie renderer programowy (patrz silver_shim.c)
+if [ -x "$OUT/deps/bin/sdl2-config" ]; then
+    echo "[silver] libsilvershim_static.a (SDL2, domyślnie renderer programowy)"
+    # shellcheck disable=SC2086
+    $CC $CFLAGS $SDL_CFLAGS -DSILVER_STATIC_BUILD=1 -c silver_shim.c -o "$OUT/silver_shim_static.o"
+    $AR rcs "$OUT/libsilvershim_static.a" "$OUT/silver_shim_static.o"
+fi
 
 echo "[silver] libsilverdialogs.a"
 # shellcheck disable=SC2086
@@ -82,6 +99,31 @@ write_pc() { # nazwa opis libs
 write_pc silvershim    "Silver: warstwa okienna SDL2" "-lSDL2_image -lSDL2_ttf -lSDL2 -lm"
 write_pc silverjs      "Silver: QuickJS + mostek JS"  "-lm -lpthread"
 write_pc silverdialogs "Silver: natywne dialogi"      ""
+
+# --- pkg-config dla linkowania W PEŁNI STATYCZNEGO (h# compile bez --dynamic) -----
+# Osobny katalog: pkgconfig-static/. Zawiera komplet zależności SDL2 (freetype, png, X11, libc…)
+# z native/build/static-libs.txt (tworzy go build-static-deps.sh). Aktywuje: . native/env.sh static
+if [ -f "$OUT/static-libs.txt" ]; then
+    PCS="$OUT/pkgconfig-static"
+    mkdir -p "$PCS"
+    STATIC_LIBS="$(cat "$OUT/static-libs.txt")"
+    write_pc_static() { # nazwa_pc nazwa_biblioteki opis libs
+        {
+            echo "prefix=$ABS_OUT"
+            echo "libdir=$ABS_OUT"
+            echo "Name: $1"
+            echo "Description: $3 (static)"
+            echo "Version: 0.2.0"
+            echo "Libs: -L\${libdir} -L$ABS_OUT/deps/lib -l$2 $4"
+        } > "$PCS/$1.pc"
+    }
+    write_pc_static silvershim    silvershim_static "Silver: warstwa okienna SDL2" "$STATIC_LIBS"
+    write_pc_static silverjs      silverjs          "Silver: QuickJS + mostek JS"  "-lm -lpthread"
+    write_pc_static silverdialogs silverdialogs     "Silver: natywne dialogi"      ""
+    echo "[silver] pkg-config (static): $PCS"
+else
+    echo "[silver] (statyczny SDL2 niezbudowany: sh native/build-static-deps.sh — wymagane do h# compile bez --dynamic)"
+fi
 
 echo "[silver] gotowe: $(ls $OUT/*.a | tr '\n' ' ')"
 echo "[silver] pkg-config: . native/env.sh  (albo export PKG_CONFIG_PATH=$ABS_OUT/pkgconfig)"
