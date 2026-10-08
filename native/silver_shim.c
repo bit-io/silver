@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <math.h>
 #include <stdarg.h>
@@ -109,6 +111,19 @@ int silver_utf8_offset(const char *s, int nchars) {
     return pos;
 }
 
+/* Czy proces jest zlinkowany w pełni statycznie? W statycznym (nie-PIE) wykonywalnym nie ma
+ * sekcji dynamicznej, więc słaby symbol _DYNAMIC jest NULL. Dzięki temu wybór renderera nie
+ * zależy od tego, którą wersję libsilvershim.a linker faktycznie wziął. */
+extern char _DYNAMIC[] __attribute__((weak));
+static int silver_is_static_exe(void) {
+#ifdef SILVER_STATIC_BUILD
+    return 1;
+#else
+    char *volatile dyn = _DYNAMIC;   /* volatile: kompilator nie może założyć, że adres != NULL */
+    return dyn == NULL;
+#endif
+}
+
 /* ====================================================================
  *  Fonty i skala
  * ==================================================================== */
@@ -129,10 +144,72 @@ static const char *k_font_candidates[] = {
     NULL
 };
 
+/* Fallback: przeszukaj katalogi z fontami (Fedora/Bazzite/Arch/NixOS… mają inne ścieżki niż
+ * Debian). Szukamy po kolei znanych nazw plików, na końcu dowolnego *.ttf z "Sans" w nazwie. */
+static char g_font_found[1024];
+
+static int has_ext_ttf(const char *n) {
+    size_t l = strlen(n);
+    return l > 4 && (strcmp(n + l - 4, ".ttf") == 0 || strcmp(n + l - 4, ".otf") == 0 ||
+                     strcmp(n + l - 4, ".TTF") == 0);
+}
+
+/* depth-limited DFS; pass 0 = dokładne nazwy preferowane, pass 1 = dowolny *Sans*.ttf */
+static int scan_fonts(const char *dir, int depth, int pass) {
+    static const char *prefer[] = { "DejaVuSans.ttf", "LiberationSans-Regular.ttf",
+                                    "NotoSans-Regular.ttf", "Roboto-Regular.ttf",
+                                    "Cantarell-Regular.otf", "Ubuntu-R.ttf", NULL };
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *de;
+    int found = 0;
+    while (!found && (de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char path[1024];
+        if (snprintf(path, sizeof path, "%s/%s", dir, de->d_name) >= (int)sizeof path) continue;
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth > 0 && scan_fonts(path, depth - 1, pass)) found = 1;
+        } else if (S_ISREG(st.st_mode)) {
+            if (pass == 0) {
+                for (int i = 0; prefer[i]; i++)
+                    if (strcmp(de->d_name, prefer[i]) == 0) { found = 1; break; }
+            } else if (has_ext_ttf(de->d_name) && strstr(de->d_name, "Sans") &&
+                       !strstr(de->d_name, "Mono") && !strstr(de->d_name, "Bold") &&
+                       !strstr(de->d_name, "Italic") && !strstr(de->d_name, "Oblique")) {
+                found = 1;
+            }
+            if (found) { snprintf(g_font_found, sizeof g_font_found, "%s", path); }
+        }
+    }
+    closedir(d);
+    return found;
+}
+
 const char *silver_find_system_font(void) {
+    const char *env = getenv("SILVER_FONT");
+    if (env && env[0]) {
+        FILE *f = fopen(env, "rb");
+        if (f) { fclose(f); snprintf(g_font_found, sizeof g_font_found, "%s", env); return g_font_found; }
+    }
     for (int i = 0; k_font_candidates[i]; i++) {
         FILE *f = fopen(k_font_candidates[i], "rb");
         if (f) { fclose(f); return k_font_candidates[i]; }
+    }
+    static const char *roots[] = { "/usr/share/fonts", "/usr/local/share/fonts",
+                                   "/run/host/usr/share/fonts", "/run/host/fonts", NULL };
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; roots[i]; i++)
+            if (scan_fonts(roots[i], 4, pass)) return g_font_found;
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            char hp[900];
+            snprintf(hp, sizeof hp, "%s/.local/share/fonts", home);
+            if (scan_fonts(hp, 4, pass)) return g_font_found;
+            snprintf(hp, sizeof hp, "%s/.fonts", home);
+            if (scan_fonts(hp, 4, pass)) return g_font_found;
+        }
     }
     return "";
 }
@@ -196,16 +273,65 @@ int silver_window_create(const char *title, int w, int h) {
         if (!g_windows[i].used) { slot = i; break; }
     if (slot < 0) return -1;
 
+    /* Ostrzeż, gdy SDL cicho wybrał sterownik bez widocznego okna (np. brak DISPLAY → dummy). */
+    {
+        const char *vd = SDL_GetCurrentVideoDriver();
+        if (vd && (strcmp(vd, "dummy") == 0 || strcmp(vd, "offscreen") == 0) &&
+            !getenv("SDL_VIDEODRIVER"))
+            fprintf(stderr, "[silver] UWAGA: wybrano sterownik '%s' — okno nie będzie widoczne "
+                            "(X11 niedostępne? DISPLAY='%s')\n", vd,
+                    getenv("DISPLAY") ? getenv("DISPLAY") : "");
+        /* 'offscreen' w SDL 2.30 nie ma framebufferu dla renderera programowego (segfault
+         * w SDL_CreateRenderer) — działa tylko z GL/EGL, którego statyczny glibc nie obsłuży. */
+        if (vd && strcmp(vd, "offscreen") == 0) {
+            const char *rp = getenv("SILVER_RENDERER");
+            if (silver_is_static_exe() && !(rp && strcmp(rp, "accelerated") == 0)) {
+                fprintf(stderr, "[silver] BŁĄD: sterownik 'offscreen' wymaga OpenGL/EGL "
+                                "(SILVER_RENDERER=accelerated), a w buildzie statycznym domyślnie "
+                                "renderujemy programowo. Użyj SDL_VIDEODRIVER=dummy lub x11.\n");
+                return -1;
+            }
+        }
+    }
+
+    if (getenv("SILVER_DEBUG"))
+        fprintf(stderr, "[silver] okno: video=%s static=%d renderer-pref=%s\n",
+                SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?",
+                silver_is_static_exe(), getenv("SILVER_RENDERER") ? getenv("SILVER_RENDERER") : "(auto)");
     SDL_Window *win = SDL_CreateWindow(
         title ? title : "", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         w, h, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!win) return -1;
 
-    SDL_Renderer *ren = SDL_CreateRenderer(
-        win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    /* Wybór renderera. SILVER_RENDERER=software|accelerated nadpisuje domyślne zachowanie.
+     * Domyślnie: akcelerowany (GL), a w buildzie W PEŁNI STATYCZNYM (-DSILVER_STATIC_BUILD)
+     * programowy — statyczny glibc nie potrafi dlopen-ować sterowników GL hosta (Mesa/libLLVM)
+     * i kończy się to SIGSEGV / "double free or corruption". */
+    const char *rpref = getenv("SILVER_RENDERER");
+    int want_sw = 0;
+    if (silver_is_static_exe()) want_sw = 1;
+    if (rpref && strcmp(rpref, "software") == 0) want_sw = 1;
+    if (rpref && strcmp(rpref, "accelerated") == 0) want_sw = 0;
+
+    /* Renderer programowy: wyłącz też framebuffer z akcelerowanej tekstury. Domyślnie SDL przy
+     * SDL_GetWindowSurface próbuje najpierw renderera GL (dlopen sterowników hosta) — w buildzie
+     * statycznym to SIGSEGV w SDL_CreateRenderer. */
+    if (want_sw) {
+        SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+    }
+
+    SDL_Renderer *ren = NULL;
+    if (!want_sw)
+        ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     if (!ren) { SDL_DestroyWindow(win); return -1; }
 
+    if (getenv("SILVER_DEBUG")) {
+        SDL_RendererInfo ri; const char *rn = "?";
+        if (SDL_GetRendererInfo(ren, &ri) == 0) rn = ri.name;
+        fprintf(stderr, "[silver] video=%s renderer=%s\n", SDL_GetCurrentVideoDriver(), rn);
+    }
     SilverWindow *sw = &g_windows[slot];
     memset(sw, 0, sizeof(*sw));
     sw->used = 1; sw->open = 1; sw->win = win; sw->ren = ren;
@@ -221,6 +347,10 @@ int silver_load_font(int h, const char *path, int size) {
     if (!VALID(h)) return 0;
     SilverWindow *w = &g_windows[h];
     const char *p = (path && path[0]) ? path : silver_find_system_font();
+    if (getenv("SILVER_DEBUG"))
+        fprintf(stderr, "[silver] font: %s (zadany: '%s', rozmiar %d)\n",
+                p[0] ? p : "BRAK CZCIONKI — ustaw SILVER_FONT=/sciezka/do/font.ttf",
+                path ? path : "", size);
     if (!p[0]) return 0;
     char *copy = strdup(p);
     if (!copy) return 0;
