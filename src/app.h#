@@ -8,6 +8,7 @@ mod edit
 mod engine
 use "std -> fs"    from "fs"
 use "std -> log"   from "log"
+use "std -> env"   from "env"
 use "std -> time"  from "time"
 use "std -> http"  from "http"
 use "std -> async" from "async_"
@@ -89,6 +90,7 @@ pub struct App is
     pub js_map:       [int]
     pub js_loaded:    int          ;; ile z js_files już załadowano
     pub js_inline_done: bool
+    pub js_ready:     bool         ;; DOMContentLoaded/load już wysłane do JS (raz na kontekst)
     pub js_pending:   int          ;; liczba niedokończonych operacji DOM z JS
     pub tasks:        [Task]
 
@@ -125,7 +127,7 @@ pub fn new(title: string, width: int, height: int) -> App is
         cur_cursor: "default", has_focus: true, text_input_on: false,
         prev_bg: [], prev_fg: [], prev_op: [], anims: [],
         dev_mode: false, mtimes: [], last_dev: 0, tick_ms: 100, last_tick: 0, last_theme: 0,
-        running: false, title_set: false, js_map: [], js_loaded: 0, js_inline_done: false, js_pending: 0, tasks: [],
+        running: false, title_set: false, js_map: [], js_loaded: 0, js_inline_done: false, js_ready: false, js_pending: 0, tasks: [],
         on_tick: identity_tick, on_event: identity_event
     }
 end
@@ -328,6 +330,60 @@ fn read_file_or_empty(path: string) -> string is
     return fs::read(path)
 end
 
+;; Diagnostyka: SILVER_DEBUG=<cokolwiek> → app::load_html / relayout wypisują liczniki (stdout).
+fn debug_on() -> bool is
+    return env::get("SILVER_DEBUG") != ""
+end
+
+;; SILVER_DEBUG=3 → dodatkowo zrzut pierwszych pudełek layoutu i węzłów DOM (stderr, przez js_debug).
+fn debug_boxes() -> bool is
+    return env::get("SILVER_DEBUG") == "3"
+end
+
+fn dump_layout(a: App, res: layout::LayoutResult) is
+    let nb: int = array_len(res.boxes)
+    let nn: int = array_len(a.dom.nodes)
+    js::js_debug("== zrzut layoutu: boxes=" + to_string(nb) + " dom=" + to_string(nn))
+    let mut i: int = 0
+    while i < nb && i < 14 is
+        let bx: layout::LayoutBox = res.boxes[i]
+        let mut tag: string = "?"
+        let mut cls: string = ""
+        if bx.node_id >= 0 && bx.node_id < nn is
+            tag = a.dom.nodes[bx.node_id].tag
+            cls = a.dom.nodes[bx.node_id].attr_class
+        end
+        let tl: int = string_len(bx.text)
+        let cut: int = (if tl > 24 then 24 else tl)
+        js::js_debug("  box " + to_string(i) + ": n=" + to_string(bx.node_id) + " <" + tag + " ." + cls + "> " + bx.kind + " @" + to_string(bx.x) + "," + to_string(bx.y) + " " + to_string(bx.w) + "x" + to_string(bx.h) + " disp=" + bx.st.display + " txt='" + string_slice(bx.text, 0, cut) + "'")
+        i += 1
+    end
+    let mut j: int = 0
+    while j < nn && j < 40 is
+        let nd: dom::DomNode = a.dom.nodes[j]
+        js::js_debug("  dom " + to_string(j) + ": parent=" + to_string(nd.parent) + " <" + nd.tag + " ." + nd.attr_class + ">")
+        j += 1
+    end
+    ;; arkusz: pierwsze reguły + dopasowania dla body (węzeł 4) — czy deklaracje w ogóle istnieją?
+    let nr: int = array_len(a.sheet.rules)
+    let mut r: int = 0
+    while r < nr && r < 8 is
+        let ru: css::CssRule = a.sheet.rules[r]
+        js::js_debug("  rule " + to_string(r) + ": sel='" + ru.selector + "' decls=" + to_string(array_len(ru.decls)) + " media='" + ru.media + "' spec=" + to_string(ru.spec) + " pelem='" + ru.pelem + "'")
+        r += 1
+    end
+    if nn > 4 is
+        let md: [css::CssDecl] = css::matching_decls_ctx(a.sheet, a.dom, 4, interaction_state(a))
+        js::js_debug("  body(4): dopasowanych deklaracji=" + to_string(array_len(md)))
+        let mut k: int = 0
+        while k < array_len(md) && k < 5 is
+            let dc: css::CssDecl = md[k]
+            js::js_debug("    " + dc.prop + ": " + dc.val)
+            k += 1
+        end
+    end
+end
+
 fn mtime_or_zero(path: string) -> int is
     if path == "" || !fs::exists(path) is return 0 end
     return fs::modified_time(path)
@@ -395,6 +451,10 @@ pub fn load_html_str(app: App, html: string) -> App is
     a.dom = template::expand(parsed, a.store)
     a = rebuild_sheet(a)
     a = sanitize_dom_after_load(a)
+    if debug_on() is
+        log::info("silver[debug]: html=" + to_string(string_len(html)) + "B dom(po parse)=" + to_string(array_len(parsed.nodes)) + " dom(po template)=" + to_string(array_len(a.dom.nodes)) + " css_rules=" + to_string(array_len(a.sheet.rules)) + " title='" + a.dom.title + "'")
+        log::info("silver[debug]: html: " + html)
+    end
     if a.dom.title != "" && a.win.open is
         window::set_title(a.win, a.dom.title)
     end
@@ -951,7 +1011,11 @@ fn ensure_js(a0: App) -> App is
     while a.js_loaded < array_len(a.js_files) is
         let p: string = a.js_files[a.js_loaded]
         a.js_loaded += 1
-        if !js::js_load_file(a.js_handle, p) is
+        let load_ok: bool = js::js_load_file(a.js_handle, p)
+        if debug_on() is
+            log::info("silver[debug]: js_load_file('" + p + "') -> " + (if load_ok then "ok" else "BLAD") + " pending_invokes=" + to_string(js::js_pending_invokes(a.js_handle)))
+        end
+        if !load_ok is
             log::error("silver: błąd JS w " + p + ": " + js::js_last_error(a.js_handle))
         end
     end
@@ -973,13 +1037,22 @@ end
 ;; Uruchamia skrypty z HTML (<script>) nawet bez load_js.
 fn start_js_if_needed(a0: App) -> App is
     let mut a: App = a0
-    if a.js_handle >= 0 is return a end
-    if array_len(a.dom.scripts) > 0 || a.dom.inline_js != "" || array_len(a.js_files) > 0 is
-        a = ensure_js(a)
-        if a.js_handle >= 0 is
-            dom_event(a, "DOMContentLoaded", 0, "")
-            dom_event(a, "load", 0, "")
+    if debug_on() is
+        log::info("silver[debug]: js <script src>=" + to_string(array_len(a.dom.scripts)) + " inline=" + to_string(string_len(a.dom.inline_js)) + "B load_js=" + to_string(array_len(a.js_files)) + " handle=" + to_string(a.js_handle) + " ready_sent=" + (if a.js_ready then "1" else "0"))
+    end
+    if a.js_handle < 0 is
+        if array_len(a.dom.scripts) > 0 || a.dom.inline_js != "" || array_len(a.js_files) > 0 is
+            a = ensure_js(a)
         end
+    end
+    ;; BUGFIX: kontekst JS mógł powstać wcześniej (app::load_js → ensure_js), a poprzednia wersja
+    ;; kończyła się wtedy od razu i NIGDY nie wysyłała DOMContentLoaded/load. document.readyState
+    ;; zostawał "loading", więc bundle (Svelte/Vite/React…) czekający na te zdarzenia się nie montował
+    ;; (pusty ekran). Zdarzenia wysyłamy teraz zawsze, dokładnie raz na kontekst.
+    if a.js_handle >= 0 && !a.js_ready is
+        a.js_ready = true
+        dom_event(a, "DOMContentLoaded", 0, "")
+        dom_event(a, "load", 0, "")
     end
     return a
 end
@@ -991,8 +1064,10 @@ fn restart_js(a0: App) -> App is
         a.js_handle = -1
     end
     a.js_map = []
+    a.js_ready = false
     a = ensure_js(a)
     if a.js_handle >= 0 is
+        a.js_ready = true
         dom_event(a, "DOMContentLoaded", 0, "")
         dom_event(a, "load", 0, "")
     end
@@ -1019,6 +1094,7 @@ end
 fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
     let mut a: App = a0
     let ops: [string] = jsonlite::array_items(ops_raw)
+    if debug_on() is js::js_debug("apply_dom_ops: ops=" + to_string(array_len(ops)) + " raw=" + to_string(string_len(ops_raw)) + "B") end
     let mut remap: string = ""
     let mut subtrees: [int] = []
     let mut i: int = 0
@@ -1026,6 +1102,7 @@ fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
         let op: string = ops[i]
         i += 1
         let kind: string = jsonlite::get_str(op, "o")
+        if debug_on() is js::js_debug("op " + to_string(i) + "/" + to_string(array_len(ops)) + " " + kind) end
         let n: int = js_node(a, jsonlite::get_int(op, "n"))
         if kind == "create" is
             a.dom = dom::create_element(a.dom, jsonlite::get_str(op, "t"))
@@ -1226,15 +1303,25 @@ end
 ;; Obsługa jednego wywołania silver.invoke() z JS.
 fn handle_js_invoke(a0: App, raw: string) -> App is
     let parts: [string] = string_split(raw, "\u0001")
+    if debug_on() is
+        log::info("silver[debug]: invoke raw=" + to_string(string_len(raw)) + "B części=" + to_string(array_len(parts)))
+    end
     if array_len(parts) < 3 is return a0 end
     let call_id: string = parts[0]
     let cmd: string = parts[1]
     let args: string = parts[2]
     let mut a: App = a0
     let h: int = a.js_handle
+    if debug_on() is
+        log::info("silver[debug]: JS -> H# invoke '" + cmd + "' (" + to_string(string_len(args)) + "B)")
+        js::js_debug("handle_js_invoke cmd=" + cmd + " id=" + call_id + " args=" + to_string(string_len(args)) + "B")
+    end
     if cmd == "__dom" is
         let res: DomOpsRes = apply_dom_ops(a, jsonlite::get_raw(args, "ops"))
         a = res.app
+        if debug_on() is
+            js::js_debug("apply_dom_ops zakończone: węzłów=" + to_string(array_len(a.dom.nodes)) + " subtree=" + to_string(array_len(res.subtrees)))
+        end
         if res.remap != "" is
             js::js_emit(h, "__dom_remap", "{\"map\":[" + res.remap + "]}")
         end
@@ -1268,8 +1355,12 @@ fn handle_js_invoke(a0: App, raw: string) -> App is
         end
         return a
     end
+    if debug_on() is js::js_debug("exec_command start: " + cmd) end
     let res: CmdRes = exec_command(a, cmd, args, "js")
     a = res.app
+    if debug_on() is
+        js::js_debug("exec_command koniec: " + cmd + " błąd=" + (if ipc::is_error(res.result) then "tak" else "nie") + " wynik=" + to_string(string_len(res.result)) + "B")
+    end
     if ipc::is_error(res.result) is
         js::js_reject(h, call_id, jsonlite::get_str(res.result, "error"))
     else is
@@ -1283,14 +1374,22 @@ fn pump_js(a0: App) -> App is
     let mut a: App = a0
     if a.js_handle < 0 is return a end
     js::js_tick(a.js_handle)
+    ;; Pętla sterowana liczbą oczekujących wywołań (a nie „pusty napis = koniec”): odporna na to, jak
+    ;; skompilowany kod traktuje napis zwracany z FFI. Obsługa wywołania może dodać kolejne, więc
+    ;; po każdym odświeżamy licznik; guard chroni przed pętlą bez końca.
+    let mut left: int = js::js_pending_invokes(a.js_handle)
     let mut guard: int = 0
-    while guard < 128 is
+    if debug_on() && left > 0 is js::js_debug("pump_js: start, w kolejce=" + to_string(left)) end
+    while left > 0 && guard < 128 is
         guard += 1
         let raw: string = js::js_poll_invoke(a.js_handle)
-        if raw == "" is break end
+        if debug_on() is js::js_debug("pump_js: poll #" + to_string(guard) + " -> " + to_string(string_len(raw)) + "B") end
+        if string_len(raw) == 0 is break end
         a = handle_js_invoke(a, raw)
         js::js_tick(a.js_handle)
+        left = js::js_pending_invokes(a.js_handle)
     end
+    if debug_on() && guard > 0 is js::js_debug("pump_js: koniec, iteracji=" + to_string(guard)) end
     return a
 end
 
@@ -2070,6 +2169,10 @@ fn relayout(a0: App, now: int) -> App is
                                                         interaction_state(a), a.elem_scroll)
     a.boxes = res.boxes
     a.doc_h = res.height
+    if debug_on() is
+        log::info("silver[debug]: layout viewport=" + to_string(a.viewport_w) + "x" + to_string(a.viewport_h) + " dom=" + to_string(array_len(a.dom.nodes)) + " boxes=" + to_string(array_len(res.boxes)) + " doc_h=" + to_string(res.height) + " css_rules=" + to_string(array_len(a.sheet.rules)))
+    end
+    if debug_boxes() is dump_layout(a, res) end
     let mx: int = max_page_scroll(a)
     if a.scroll_y > mx is a.scroll_y = mx end
     a.dirty_layout = false
