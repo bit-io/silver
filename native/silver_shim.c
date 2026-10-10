@@ -632,10 +632,22 @@ const char *silver_event_payload(int h) {
     return VALID(h) ? g_windows[h].cur.payload : "";
 }
 
+/* Diagnostyka: SILVER_DEBUG=2 → na stderr liczba wywołań rysowania na klatkę (pierwsze klatki
+ * i co 120.). Pokazuje, czy silnik w ogóle zleca rysowanie (pusty ekran = 0 prostokątów/tekstów). */
+static int g_dbg_level = -1;
+static long g_dbg_frame = 0;
+static int g_cnt_clear, g_cnt_rect, g_cnt_text, g_cnt_image, g_cnt_other;
+static int dbg_level(void) {
+    if (g_dbg_level < 0) { const char *e = getenv("SILVER_DEBUG"); g_dbg_level = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0; }
+    return g_dbg_level;
+}
+#define CNT(x) do { x++; } while (0)
+
 /* ====================================================================
  *  Rysowanie (współrzędne logiczne)
  * ==================================================================== */
 int silver_clear(int h, int r, int g, int b) {
+    CNT(g_cnt_clear);
     if (!VALID(h)) return 0;
     SDL_SetRenderDrawColor(g_windows[h].ren, r, g, b, 255);
     SDL_RenderClear(g_windows[h].ren);
@@ -648,6 +660,7 @@ static void set_col(SilverWindow *w, int r, int g, int b, int a) {
 }
 
 int silver_fill_rect(int h, int x, int y, int w, int rh, int r, int g, int b, int a) {
+    CNT(g_cnt_rect);
     if (!VALID(h) || w <= 0 || rh <= 0) return 0;
     set_col(&g_windows[h], r, g, b, a);
     SDL_Rect rect = { x, y, w, rh };
@@ -656,6 +669,7 @@ int silver_fill_rect(int h, int x, int y, int w, int rh, int r, int g, int b, in
 }
 
 int silver_stroke_rect(int h, int x, int y, int w, int rh, int r, int g, int b, int a) {
+    CNT(g_cnt_other);
     if (!VALID(h) || w <= 0 || rh <= 0) return 0;
     set_col(&g_windows[h], r, g, b, a);
     SDL_Rect rect = { x, y, w, rh };
@@ -684,6 +698,7 @@ static int clamp_radius(int rad, int w, int hh) {
 
 int silver_fill_round_rect(int h, int x, int y, int w, int hh, int rad,
                            int r, int g, int b, int a) {
+    CNT(g_cnt_rect);
     if (!VALID(h) || w <= 0 || hh <= 0) return 0;
     SilverWindow *sw = &g_windows[h];
     rad = clamp_radius(rad, w, hh);
@@ -713,6 +728,7 @@ int silver_fill_round_rect(int h, int x, int y, int w, int hh, int rad,
 /* obramowanie o grubości bw; bez nakładania się pikseli (poprawna alfa) */
 int silver_stroke_round_rect(int h, int x, int y, int w, int hh, int rad, int bw,
                              int r, int g, int b, int a) {
+    CNT(g_cnt_other);
     if (!VALID(h) || w <= 0 || hh <= 0 || bw <= 0) return 0;
     SilverWindow *sw = &g_windows[h];
     rad = clamp_radius(rad, w, hh);
@@ -756,6 +772,7 @@ int silver_stroke_round_rect(int h, int x, int y, int w, int hh, int rad, int bw
 int silver_fill_gradient(int h, int x, int y, int w, int hh,
                          int r1, int g1, int b1, int a1,
                          int r2, int g2, int b2, int a2, int vertical) {
+    CNT(g_cnt_rect);
     if (!VALID(h) || w <= 0 || hh <= 0) return 0;
     SilverWindow *sw = &g_windows[h];
     int n = vertical ? hh : w;
@@ -825,6 +842,7 @@ static SilverTextEntry *text_entry(SilverWindow *w, TTF_Font *font, const char *
  * Zwraca wysokość tekstu (px logiczne). */
 int silver_draw_text_ex(int h, int x, int y, const char *text, int r, int g, int b, int a,
                         int size, int style) {
+    CNT(g_cnt_text);
     if (!VALID(h) || !text || !text[0]) return 0;
     SilverWindow *w = &g_windows[h];
     TTF_Font *font = get_font(w, size);
@@ -887,6 +905,15 @@ int silver_text_fit(int h, const char *text, int size, int style, int max_w) {
 
 int silver_present(int h) {
     if (!VALID(h)) return 0;
+    if (dbg_level() >= 2 && (g_dbg_frame < 6 || g_dbg_frame % 120 == 0)) {
+        int ww = 0, wh = 0, ow = 0, oh = 0;
+        SDL_GetWindowSize(g_windows[h].win, &ww, &wh);
+        SDL_GetRendererOutputSize(g_windows[h].ren, &ow, &oh);
+        fprintf(stderr, "[silver] klatka %ld: clear=%d rect=%d text=%d image=%d inne=%d | okno=%dx%d render=%dx%d\n",
+                g_dbg_frame, g_cnt_clear, g_cnt_rect, g_cnt_text, g_cnt_image, g_cnt_other, ww, wh, ow, oh);
+    }
+    g_dbg_frame++;
+    g_cnt_clear = g_cnt_rect = g_cnt_text = g_cnt_image = g_cnt_other = 0;
     SDL_RenderPresent(g_windows[h].ren);
     return 1;
 }
@@ -953,6 +980,7 @@ int silver_image_forget(int h, const char *path) {
 }
 
 int silver_draw_image(int h, const char *path, int x, int y, int w, int rh, int a) {
+    CNT(g_cnt_image);
     if (!VALID(h) || !path) return 0;
     SilverImage *im = find_or_load_image(h, path);
     if (!im) return 0;
