@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+- `SILVER_DEBUG=3`: zrzut pierwszych 14 pudełek layoutu (węzeł, tag, klasa, rodzaj, rozmiar, `display`, tekst) i
+  pierwszych 40 węzłów DOM, pierwszych 8 reguł arkusza (selektor, liczba deklaracji) i deklaracji dopasowanych do `body` na stderr — do diagnozy „DOM urósł, a layout niemal pusty”.
+- `src/app.h#` (`pump_js`): pętla odbioru wywołań JS sterowana liczbą oczekujących wywołań
+  (`js_pending_invokes`) zamiast porównania napisu z `""`; ślady `pump_js: poll #N` na stderr (SILVER_DEBUG>=2).
+  Powód: w skompilowanym programie `js_poll_invoke` nie był w ogóle wołany, mimo trzech oczekujących wywołań.
+- Diagnostyka (`SILVER_DEBUG>=2`): ślad `[silver-js] tick #N` w `js_tick` i `h#: pump_js: …` przy niepustej kolejce
+  wywołań JS — rozróżnia „pump_js się nie wykonuje” od „wykonuje się, ale nie odbiera”.
+- `js_debug` (FFI C + `js_bridge.h#`): ślad z kodu H# na niebuforowany stderr (SILVER_DEBUG>=2); użyty w
+  `handle_js_invoke` i `apply_dom_ops`. Dodany też ślad `js_reject` w shimie QuickJS.
+- `native/silver_quickjs_shim.c`: przy `SILVER_DEBUG>=2` ślad komunikacji H# <-> JS na niebuforowanym stderr
+  (`[silver-js] emit/poll_invoke/resolve`). Stdout z `h#` jest buforowany, więc logi `log::info` przychodzą późno.
+- `native/silver_quickjs_shim.c`: raportowanie nieobsłużonych odrzuceń Promise na stderr
+  (`[silver-js] nieobsłużone odrzucenie Promise: …`). Wcześniej wyjątek w `async` (np. start Svelte/React)
+  znikał bez śladu i aplikacja po prostu się nie montowała. Raport po opróżnieniu kolejki zadań, więc
+  `.catch()` podpięte w tej samej turze nie daje fałszywych alarmów.
+- `src/app.h#` (`SILVER_DEBUG`): wynik `js_load_file`, kolejka wywołań JS przy pustym `js_poll_invoke`,
+  liczba części rozdzielonego wywołania (przed wczesnym wyjściem).
+- `src/app.h#` (`SILVER_DEBUG`): log każdej komendy JS → H# (`silver[debug]: JS -> H# invoke '<cmd>'`).
+- **Naprawa (poważna): pusty ekran przy `app::load_js` bez `<script>` w HTML.** `start_js_if_needed` kończyła się
+  od razu, gdy kontekst JS już istniał (a `load_js` tworzy go wcześniej), więc `DOMContentLoaded`/`load` nigdy
+  nie trafiały do JS, a `document.readyState` zostawał `"loading"`. Bundle czekający na te zdarzenia
+  (Svelte/Vite/React) nie montował interfejsu. Nowe pole `App.js_ready`; zdarzenia idą raz na kontekst.
+- `src/app.h#`: diagnostyka silnika pod `SILVER_DEBUG` (stdout): po `load_html` liczba bajtów HTML, węzłów DOM
+  (po parse / po template), reguł CSS i tytuł; po `relayout` viewport, węzły DOM i liczba pudełek layoutu.
+  Dodatkowo stan JS (`<script src>`, inline, `load_js`, handle), treść HTML i liczba reguł CSS przy layoucie.
+  Służy do ustalenia, na którym etapie znika zawartość przy pustym oknie.
+- `src/engine/jsonval.h#` (`stringify`, `get`, `obj_set`): typowane zmienne `let e: JsonEntry = entries[i]`.
+  Wcześniej kompilator h# nie znał typu `entries[i]` (element wariantu enum) i zgadywał strukturę po nazwie
+  pola `.val` iterując po HashMap (losowa kolejność). `.val` jest też w `CssDecl`, `AttrSel` (inny indeks!)
+  i `Track`, więc odczyt mógł trafić w złe pole → śmieci/crash zależnie od kompilacji.
+- `SILVER_DEBUG=2`: licznik wywołań rysowania na klatkę (diagnostyka pustego ekranu).
+- Naprawa SIGSEGV w `SDL_CreateRenderer` w buildzie statycznym na X11: SDL próbował framebuffera z
+  akcelerowanej tekstury (dlopen GL); shim ustawia teraz `SDL_FRAMEBUFFER_ACCELERATION=0` i renderer `software`.
+  Dodano `native/selftest.c` + `native/selftest.sh` (samodzielny test okna/czcionki/rysowania).
+- `silver_shim.c`: odnajdywanie czcionek także poza Debianem (Fedora/Bazzite/Arch: rekurencyjny skan
+  `/usr/share/fonts`, `~/.local/share/fonts`), `SILVER_FONT`, `SILVER_RENDERER`, `SILVER_DEBUG`; ostrzeżenie przy cichym
+  fallbacku na `dummy`/`offscreen`; build statyczny domyślnie renderuje programowo — wykrywane w czasie działania (słaby symbol `_DYNAMIC`),
+  więc działa też gdy linker weźmie zwykły `libsilvershim.a` (np. brak pkg-config).
+- Linkowanie w pełni statyczne: `native/build-static-deps.sh` (statyczne SDL2/SDL2_ttf/SDL2_image),
+  `. native/env.sh static`, `pkgconfig-static/`, komenda `bit native-static`. Naprawia
+  `cannot find -lSDL2 / -lSDL2_ttf / -lSDL2_image` przy `h# compile` bez `--dynamic`.
+
 ## 0.2.0
 
 Wydanie rozbudowujące silnik, warstwę natywną, narzędzia i dokumentację. Nic z 0.1 nie
