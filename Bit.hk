@@ -19,15 +19,15 @@
 -> output => hlib
 
 [commands]
-! `bit test` — wykonuje testy dostępne bez okna: sprawdzenie typów całej biblioteki + CLI + testów,
-! test dymny warstwy natywnej. Testy #[test] z src/engine_tests.h# uruchamia runner H# (h# test lub odpowiednik,
-! zależnie od wersji toolchaina) — tu sprawdzamy ich składnię i typy.
 -> test
 --> run => sh native/tests/run-all.sh
 --> description => Typy H# + test natywny (SDL2/QuickJS/DOM) [+ run-js.sh gdy jest node]
 -> native
 --> run => sh native/build.sh
 --> description => Zbuduj biblioteki natywne (libsilvershim.a, libsilverjs.a, libsilverdialogs.a)
+-> native-static
+--> run => sh native/build-static-deps.sh
+--> description => Zbuduj statyczne SDL2/SDL2_ttf/SDL2_image (native/build/deps) do linkowania bez --dynamic
 -> native-test
 --> run => sh native/tests/run.sh
 --> description => Test dymny warstwy natywnej (SDL2 + QuickJS, wymaga Xvfb bez ekranu)
