@@ -203,7 +203,10 @@ pub fn stringify(v: JsonValue) -> string is
             let mut i: int = 0
             while i < count is
                 if i > 0 is out = out + "," end
-                out = out + "\"" + escape_str(entries[i].key) + "\":" + stringify(entries[i].val)
+                ;; typowana zmienna: bez niej kompilator zgaduje strukturę po nazwie pola (.val
+                ;; istnieje też w CssDecl/AttrSel/Track, AttrSel ma je pod innym indeksem)
+                let e: JsonEntry = entries[i]
+                out = out + "\"" + escape_str(e.key) + "\":" + stringify(e.val)
                 i += 1
             end
             return out + "}"
@@ -247,7 +250,8 @@ pub fn get(v: JsonValue, key: string) -> JsonValue is
             let count: int = array_len(entries)
             let mut i: int = 0
             while i < count is
-                if entries[i].key == key is return entries[i].val end
+                let e: JsonEntry = entries[i]
+                if e.key == key is return e.val end
                 i += 1
             end
         end
@@ -296,11 +300,12 @@ pub fn obj_set(o: JsonValue, key: string, val: JsonValue) -> JsonValue is
             let mut i: int = 0
             let mut replaced: bool = false
             while i < count is
-                if entries[i].key == key is
+                let e: JsonEntry = entries[i]
+                if e.key == key is
                     out = array_push(out, JsonEntry { key: key, val: val })
                     replaced = true
                 else is
-                    out = array_push(out, entries[i])
+                    out = array_push(out, e)
                 end
                 i += 1
             end
