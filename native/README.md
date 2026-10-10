@@ -40,7 +40,7 @@ uruchom go na docelowej maszynie: `SILVER_DEBUG=1 native/build/silver_selftest` 
 font, 120 klatek, zamknięcie), więc widać, na którym ewentualnie pada proces.
 Zmienne środowiskowe shima: `SILVER_FONT=/ścieżka/font.ttf` (własna czcionka; domyślnie szukanie w
 `/usr/share/fonts`, `~/.local/share/fonts` rekurencyjnie), `SILVER_RENDERER=software|accelerated`,
-`SILVER_DEBUG=1` (na stderr: sterownik wideo, renderer, użyta czcionka). `offscreen` w SDL 2.30 działa tylko z GL/EGL,
+`SILVER_DEBUG=1` (na stderr: sterownik wideo, renderer, użyta czcionka), `SILVER_DEBUG=2` (dodatkowo: liczba wywołań rysowania na klatkę — `rect/text/image` — oraz rozmiar okna i renderera; pusty ekran przy `rect=0 text=0` oznacza, że silnik nic nie zleca do rysowania; do tego ślad `[silver-js] emit/poll_invoke/resolve` — komunikacja H# <-> JS na niebuforowanym stderr). `offscreen` w SDL 2.30 działa tylko z GL/EGL,
 więc w buildzie statycznym shim odmawia go z czytelnym błędem (zamiast segfaulta SDL); `dummy` działa.
 Ostrzeżenia linkera o `getaddrinfo`/`getpwuid` są nieszkodliwe, jeśli uruchamiasz na tej samej wersji glibc.
 
