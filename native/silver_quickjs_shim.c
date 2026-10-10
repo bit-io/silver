@@ -212,6 +212,80 @@ static void set_fn(JSContext *ctx, JSValue global, const char *name, JSCFunction
 }
 
 /* ---- js_init(win_handle) -> uchwyt kontekstu (>=0) lub -1 ---- */
+/* Nieobsłużone odrzucenia Promise (np. wyjątek w async function przy starcie Svelte/React) były
+ * w QuickJS całkowicie ciche — aplikacja po prostu się nie montowała. Raportujemy je na stderr. */
+#ifdef JS_BOOL
+typedef JS_BOOL silver_js_bool;
+#else
+#include <stdbool.h>
+typedef bool silver_js_bool;
+#endif
+/* SILVER_DEBUG>=2 → ślad komunikacji H# <-> JS na niebuforowanym stderr. */
+static int jsdbg(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("SILVER_DEBUG"); v = (e && atoi(e) >= 2) ? 1 : 0; }
+    return v;
+}
+
+/* Wywoływane z H# (extern js_debug): niebuforowany ślad na stderr, tylko przy SILVER_DEBUG>=2. */
+int js_debug(const char *msg) {
+    if (jsdbg()) fprintf(stderr, "[silver-js] h#: %s\n", msg ? msg : "");
+    return 1;
+}
+
+#define SILVER_MAX_REJ 16
+static struct { int used; JSContext *ctx; JSValue promise; JSValue reason; } g_rej[SILVER_MAX_REJ];
+
+/* QuickJS woła callback przy odrzuceniu (is_handled=0) i ponownie, gdy ktoś podepnie obsługę
+ * (is_handled=1). Odkładamy więc odrzucenia na listę i raportujemy dopiero po opróżnieniu kolejki
+ * zadań (js_tick), jeśli wciąż nikt ich nie obsłużył — bez fałszywych alarmów dla .catch(). */
+static void promise_rejection_cb(JSContext *ctx, JSValueConst promise, JSValueConst reason,
+                                 silver_js_bool is_handled, void *opaque) {
+    (void)opaque;
+    if (is_handled) {
+        for (int i = 0; i < SILVER_MAX_REJ; i++)
+            if (g_rej[i].used && g_rej[i].ctx == ctx &&
+                JS_VALUE_GET_PTR(g_rej[i].promise) == JS_VALUE_GET_PTR(promise)) {
+                JS_FreeValue(ctx, g_rej[i].promise);
+                JS_FreeValue(ctx, g_rej[i].reason);
+                g_rej[i].used = 0;
+            }
+        return;
+    }
+    for (int i = 0; i < SILVER_MAX_REJ; i++)
+        if (!g_rej[i].used) {
+            g_rej[i].used = 1; g_rej[i].ctx = ctx;
+            g_rej[i].promise = JS_DupValue(ctx, promise);
+            g_rej[i].reason = JS_DupValue(ctx, reason);
+            return;
+        }
+}
+
+/* drop=1: tylko zwolnij (zamykanie kontekstu), drop=0: wypisz i zwolnij */
+static void flush_rejections(JSContext *ctx, int drop) {
+    for (int i = 0; i < SILVER_MAX_REJ; i++) {
+        if (!g_rej[i].used || g_rej[i].ctx != ctx) continue;
+        if (!drop) {
+            JSValue reason = g_rej[i].reason;
+            const char *msg = JS_ToCString(ctx, reason);
+            const char *stack = NULL;
+            JSValue st = JS_UNDEFINED;
+            if (JS_IsObject(reason)) {
+                st = JS_GetPropertyStr(ctx, reason, "stack");
+                if (!JS_IsUndefined(st)) stack = JS_ToCString(ctx, st);
+            }
+            fprintf(stderr, "[silver-js] nieobsłużone odrzucenie Promise: %s%s%s\n",
+                    msg ? msg : "(brak komunikatu)", stack ? "\n" : "", stack ? stack : "");
+            if (msg) JS_FreeCString(ctx, msg);
+            if (stack) JS_FreeCString(ctx, stack);
+            JS_FreeValue(ctx, st);
+        }
+        JS_FreeValue(ctx, g_rej[i].promise);
+        JS_FreeValue(ctx, g_rej[i].reason);
+        g_rej[i].used = 0;
+    }
+}
+
 int js_init(int win_handle) {
     (void)win_handle;
     int slot = -1;
@@ -231,6 +305,7 @@ int js_init(int win_handle) {
     sc->used = 1; sc->rt = rt; sc->ctx = ctx;
     sc->budget_ms = SILVER_DEFAULT_BUDGET;
     JS_SetInterruptHandler(rt, (JSInterruptHandler *)interrupt_cb, sc);
+    JS_SetHostPromiseRejectionTracker(rt, promise_rejection_cb, NULL);
 
     sc->global = JS_GetGlobalObject(ctx);
     set_fn(ctx, sc->global, "__silver_native_invoke", native_invoke, 3);
@@ -316,6 +391,8 @@ const char *js_poll_invoke(int h) {
     SilverJsCtx *sc = &g_ctx[h];
     if (sc->count == 0) return "";
     PendingInvoke *slot = &sc->queue[sc->head];
+    if (jsdbg()) fprintf(stderr, "[silver-js] poll_invoke: wydaję '%s' (id=%s, %zuB), w kolejce %d\n",
+                         slot->cmd, slot->call_id, strlen(slot->args_json), sc->count);
     size_t n = strlen(slot->call_id) + strlen(slot->cmd) + strlen(slot->args_json) + 3;
     free(sc->poll_buf);
     sc->poll_buf = (char *)malloc(n);
@@ -352,18 +429,21 @@ static int call_global2(SilverJsCtx *sc, const char *fname, const char *a, const
 /* js_resolve(handle, call_id, result_json) → rozwiązuje Promise w JS */
 int js_resolve(int h, const char *call_id, const char *result_json) {
     if (!VALID(h)) return 0;
+    if (jsdbg()) fprintf(stderr, "[silver-js] resolve: id=%s (%zuB)\n", call_id, strlen(result_json));
     return call_global2(&g_ctx[h], "__silver_resolve", call_id, result_json);
 }
 
 /* js_reject(handle, call_id, message) → odrzuca Promise w JS */
 int js_reject(int h, const char *call_id, const char *message) {
     if (!VALID(h)) return 0;
+    if (jsdbg()) fprintf(stderr, "[silver-js] reject: id=%s msg=%s\n", call_id, message ? message : "");
     return call_global2(&g_ctx[h], "__silver_reject", call_id, message);
 }
 
 /* js_emit(handle, event, payload_json) → silver.listen(...) */
 int js_emit(int h, const char *event_name, const char *payload_json) {
     if (!VALID(h)) return 0;
+    if (jsdbg()) fprintf(stderr, "[silver-js] emit: '%s' (%zuB)\n", event_name, strlen(payload_json));
     return call_global2(&g_ctx[h], "__silver_dispatch_event", event_name, payload_json);
 }
 
@@ -372,6 +452,12 @@ int js_emit(int h, const char *event_name, const char *payload_json) {
 int js_tick(int h) {
     if (!VALID(h)) return 0;
     SilverJsCtx *sc = &g_ctx[h];
+    if (jsdbg()) {
+        static int n_tick = 0;
+        n_tick++;
+        if (n_tick <= 5 || n_tick % 500 == 0)
+            fprintf(stderr, "[silver-js] tick #%d (h=%d, w kolejce wywołań: %d)\n", n_tick, h, sc->count);
+    }
     int64_t now = now_ms();
     int fired = 0;
     for (int i = 0; i < SILVER_MAX_TIMERS; i++) {
@@ -390,6 +476,7 @@ int js_tick(int h) {
     }
     enter_js(sc);
     leave_js(sc);
+    flush_rejections(sc->ctx, 0);
     return fired;
 }
 
@@ -417,6 +504,7 @@ int js_shutdown(int h) {
     while (sc->count > 0) js_poll_invoke(h);
     free(sc->poll_buf);
     JS_FreeValue(sc->ctx, sc->global);
+    flush_rejections(sc->ctx, 1);
     JS_FreeContext(sc->ctx);
     JS_FreeRuntime(sc->rt);
     memset(sc, 0, sizeof(*sc));
