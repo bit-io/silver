@@ -14,4 +14,5 @@ extern static [c, "silverjs"] is
     fn js_has_jobs(js_handle: int) -> bool
     fn js_last_error(js_handle: int) -> string
     fn js_shutdown(js_handle: int) -> bool
+    fn js_debug(msg: string) -> bool                  ;; ślad na stderr (SILVER_DEBUG>=2)
 end
