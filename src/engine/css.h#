@@ -882,40 +882,84 @@ end
 ;; kolejność) — kolejne nadpisują poprzednie. Węzły pseudo (before/after) dopasowują
 ;; reguły z ::before/::after do swojego rodzica. `inline_style` dodawany na końcu.
 pub fn matching_decls_ctx(sheet: Stylesheet, d: dom::Dom, node_id: int, ix: InteractionState) -> [CssDecl] is
+    ;; Przepisane bez insert_sorted/insert_key i bez `break` w pętli: w programie skompilowanym
+    ;; poprzednia wersja zwracała tylko deklaracje PIERWSZEJ pasującej reguły (reszta ginęła przy
+    ;; wstawianiu), przez co żaden styl poza pierwszą regułą nie działał. Semantyka bez zmian:
+    ;; zwykłe deklaracje wg (specyficzność, kolejność), potem inline, potem !important (reguły, inline).
     let node: dom::DomNode = d.nodes[node_id]
     let target: int = if node.pseudo != "" then node.parent else node_id
     let want_pelem: string = node.pseudo
     let mut decls: [CssDecl] = []
-    let mut keys: [int] = []
+    if target < 0 is return decls end
+
+    ;; 1) reguły pasujące do węzła: indeks reguły + klucz kaskady
     let count: int = array_len(sheet.rules)
+    let mut midx: [int] = []
+    let mut mkey: [int] = []
     let mut i: int = 0
     while i < count is
         let rule: CssRule = sheet.rules[i]
+        let this_i: int = i
         i += 1
-        if rule.pelem != want_pelem is continue end
-        if target < 0 is continue end
-        if rule.media != "" && !media_matches(rule.media, ix) is continue end
-        if !rule_matches(d, target, rule, ix) is continue end
-        let mut j: int = 0
-        while j < array_len(rule.decls) is
-            let dc: CssDecl = rule.decls[j]
-            let key: int = (if dc.important then 1000000000000 else 0) + rule.spec * 100000 + rule.order
-            decls = insert_sorted(decls, keys, dc, key)
-            keys = insert_key(keys, key)
-            j += 1
+        let mut ok: bool = rule.pelem == want_pelem
+        if ok && rule.media != "" && !media_matches(rule.media, ix) is ok = false end
+        if ok && !rule_matches(d, target, rule, ix) is ok = false end
+        if ok is
+            midx = array_push(midx, this_i)
+            mkey = array_push(mkey, rule.spec * 100000 + rule.order)
         end
-        if array_len(decls) > 4000 is break end
     end
-    if node.attr_style != "" && node.pseudo == "" is
-        let inline: [CssDecl] = parse_decls(node.attr_style)
-        let mut j: int = 0
-        while j < array_len(inline) is
-            let dc: CssDecl = inline[j]
-            let key: int = (if dc.important then 1000000000000 else 0) + 99999 * 100000
-            decls = insert_sorted(decls, keys, dc, key)
-            keys = insert_key(keys, key)
-            j += 1
+
+    ;; 2) pozycja reguły w kaskadzie = liczba reguł o mniejszym kluczu (remis: wcześniejsza pierwsza)
+    let m: int = array_len(midx)
+    let mut rank: [int] = []
+    let mut k: int = 0
+    while k < m is
+        let mut rk: int = 0
+        let mut q: int = 0
+        while q < m is
+            if mkey[q] < mkey[k] || (mkey[q] == mkey[k] && q < k) is rk += 1 end
+            q += 1
         end
+        rank = array_push(rank, rk)
+        k += 1
+    end
+
+    ;; 3) składanie: przebieg 0 = zwykłe deklaracje, przebieg 1 = !important
+    let mut pass: int = 0
+    while pass < 2 is
+        let want_imp: bool = pass == 1
+        let mut r: int = 0
+        while r < m is
+            let mut p: int = 0
+            while p < m is
+                if rank[p] == r is
+                    let rule2: CssRule = sheet.rules[midx[p]]
+                    let mut j: int = 0
+                    while j < array_len(rule2.decls) is
+                        let dc: CssDecl = rule2.decls[j]
+                        if (dc.important && want_imp) || (!dc.important && !want_imp) is
+                            decls = array_push(decls, dc)
+                        end
+                        j += 1
+                    end
+                end
+                p += 1
+            end
+            r += 1
+        end
+        if node.attr_style != "" && node.pseudo == "" is
+            let inline: [CssDecl] = parse_decls(node.attr_style)
+            let mut jj: int = 0
+            while jj < array_len(inline) is
+                let dc2: CssDecl = inline[jj]
+                if (dc2.important && want_imp) || (!dc2.important && !want_imp) is
+                    decls = array_push(decls, dc2)
+                end
+                jj += 1
+            end
+        end
+        pass += 1
     end
     return decls
 end
