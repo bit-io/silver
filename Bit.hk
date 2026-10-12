@@ -19,6 +19,9 @@
 -> output => hlib
 
 [commands]
+! `bit test` — wykonuje testy dostępne bez okna: sprawdzenie typów całej biblioteki + CLI + testów,
+! test dymny warstwy natywnej. Testy #[test] z src/engine_tests.h# uruchamia runner H# (h# test lub odpowiednik,
+! zależnie od wersji toolchaina) — tu sprawdzamy ich składnię i typy.
 -> test
 --> run => sh native/tests/run-all.sh
 --> description => Typy H# + test natywny (SDL2/QuickJS/DOM) [+ run-js.sh gdy jest node]
