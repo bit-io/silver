@@ -9,6 +9,7 @@ mod engine
 use "std -> fs"    from "fs"
 use "std -> log"   from "log"
 use "std -> env"   from "env"
+use "std -> conv" from "conv"
 use "std -> time"  from "time"
 use "std -> http"  from "http"
 use "std -> async" from "async_"
@@ -340,6 +341,92 @@ fn debug_boxes() -> bool is
     return env::get("SILVER_DEBUG") == "3"
 end
 
+;; Rozdziela etapy dopasowania stylów dla jednego węzła: rule_matches (bez sortowania/filtrów) vs matching_decls_ctx.
+fn dump_match(a: App, nid: int) is
+    let nn: int = array_len(a.dom.nodes)
+    if nid < 0 || nid >= nn is return end
+    let ix: css::InteractionState = interaction_state(a)
+    let nr: int = array_len(a.sheet.rules)
+    let mut m: int = 0
+    let mut dsum: int = 0
+    let mut skipped: int = 0
+    let mut r: int = 0
+    while r < nr is
+        let ru: css::CssRule = a.sheet.rules[r]
+        r += 1
+        if css::rule_matches(a.dom, nid, ru, ix) is
+            if ru.pelem == "" && ru.media == "" is
+                m += 1
+                dsum += array_len(ru.decls)
+            else is
+                skipped += 1
+            end
+        end
+    end
+    let md: [css::CssDecl] = css::matching_decls_ctx(a.sheet, a.dom, nid, ix)
+    let nd: dom::DomNode = a.dom.nodes[nid]
+    js::js_debug("  match node " + to_string(nid) + " <" + nd.tag + " ." + nd.attr_class + ">: rule_matches=" + to_string(m) + " (deklaracji " + to_string(dsum) + ", pominięte pelem/media=" + to_string(skipped) + ") | matching_decls_ctx=" + to_string(array_len(md)) + " | pseudo='" + nd.pseudo + "'(" + to_string(string_len(nd.pseudo)) + ") parent=" + to_string(nd.parent))
+end
+
+;; Test arytmetyki długości CSS i prymitywów f64 (czy 100vh/50%/12px dają oczekiwane px/pct).
+fn dump_len(label: string, v: string, env: cssval::LenEnv) is
+    let l: cssval::Len = cssval::parse_len(v, env)
+    js::js_debug("  len " + label + " '" + v + "': px=" + to_string(l.px) + " pct=" + to_string(l.pct) + " auto=" + (if l.auto then "1" else "0") + " ok=" + (if l.ok then "1" else "0"))
+end
+
+fn dump_lens(a: App) is
+    let env: cssval::LenEnv = cssval::LenEnv { em: 16, rem: 16, vw: a.viewport_w, vh: a.viewport_h }
+    js::js_debug("  len-env: vw=" + to_string(env.vw) + " vh=" + to_string(env.vh))
+    let f: f64 = conv::str_to_float("100")
+    js::js_debug("  f64: str_to_float('100')*10=" + to_string(conv::float_to_int(f * 10.0)) + " int_to_float(900)/100*100=" + to_string(conv::float_to_int(conv::int_to_float(900) / 100.0 * 100.0)) + " i2f(900)/100*100=" + to_string(conv::float_to_int(cssval::i2f(900) / 100.0 * 100.0)) + " 1.5*2*100=" + to_string(conv::float_to_int(1.5 * 2.0 * 100.0)))
+    let c1: cssval::Color = cssval::parse_color("rgba(255, 193, 7, 0.07)")
+    js::js_debug("  color rgba(255,193,7,0.07) => " + to_string(c1.r) + "," + to_string(c1.g) + "," + to_string(c1.b) + " a=" + to_string(c1.a))
+    let c2: cssval::Color = cssval::parse_color("#00e5ff")
+    js::js_debug("  color #00e5ff => " + to_string(c2.r) + "," + to_string(c2.g) + "," + to_string(c2.b) + " a=" + to_string(c2.a))
+    let c3: cssval::Color = cssval::parse_color("rgba(0, 229, 255, 0.12)")
+    js::js_debug("  color rgba(0,229,255,0.12) => " + to_string(c3.r) + "," + to_string(c3.g) + "," + to_string(c3.b) + " a=" + to_string(c3.a))
+    js::js_debug("  kanal: i2f(1)*1000=" + to_string(conv::float_to_int(cssval::i2f(1) * 1000.0)) + " | 229*i2f(1)+0.5=" + to_string(conv::float_to_int(conv::str_to_float("229") * cssval::i2f(1) + 0.5)) + " | 0.07*255+0.5=" + to_string(conv::float_to_int(conv::str_to_float("0.07") * 255.0 + 0.5)))
+    let c4: cssval::Color = cssval::parse_color("rgb(10, 20, 30)")
+    js::js_debug("  color rgb(10,20,30) => " + to_string(c4.r) + "," + to_string(c4.g) + "," + to_string(c4.b) + " a=" + to_string(c4.a))
+    let c5: cssval::Color = cssval::parse_color("rgb(10 20 30)")
+    js::js_debug("  color rgb(10 20 30) => " + to_string(c5.r) + "," + to_string(c5.g) + "," + to_string(c5.b) + " a=" + to_string(c5.a))
+    let c6: cssval::Color = cssval::parse_color("rgba(10,20,30,0.5)")
+    js::js_debug("  color rgba(10,20,30,0.5) => " + to_string(c6.r) + "," + to_string(c6.g) + "," + to_string(c6.b) + " a=" + to_string(c6.a))
+    dump_len("vh", "100vh", env)
+    dump_len("pct", "100%", env)
+    dump_len("px", "12px", env)
+    dump_len("half", "50%", env)
+    dump_len("vw", "50vw", env)
+    dump_len("rem", "2rem", env)
+end
+
+;; Drzewo węzłów przyłączonych do `body` (węzeł 4) do głębokości 4, z liczbą pudełek layoutu dla każdego węzła.
+fn box_count(res: layout::LayoutResult, nid: int) -> int is
+    let mut c: int = 0
+    let mut i: int = 0
+    while i < array_len(res.boxes) is
+        if res.boxes[i].node_id == nid is c += 1 end
+        i += 1
+    end
+    return c
+end
+
+fn dump_tree(a: App, res: layout::LayoutResult, sts: [style::ComputedStyle], nid: int, depth: int, budget: int) -> int is
+    let mut left: int = budget
+    if left <= 0 || depth > 4 || nid < 0 || nid >= array_len(a.dom.nodes) is return left end
+    let nd: dom::DomNode = a.dom.nodes[nid]
+    left -= 1
+    let mut disp: string = "?"
+    if nid < array_len(sts) is disp = sts[nid].display end
+    js::js_debug("  tree " + to_string(depth) + " n=" + to_string(nid) + " <" + nd.tag + " ." + nd.attr_class + "> disp=" + disp + " removed=" + (if nd.removed then "1" else "0") + " dzieci=" + to_string(array_len(nd.children)) + " pudełek=" + to_string(box_count(res, nid)))
+    let mut k: int = 0
+    while k < array_len(nd.children) && left > 0 is
+        left = dump_tree(a, res, sts, nd.children[k], depth + 1, left)
+        k += 1
+    end
+    return left
+end
+
 fn dump_layout(a: App, res: layout::LayoutResult) is
     let nb: int = array_len(res.boxes)
     let nn: int = array_len(a.dom.nodes)
@@ -372,6 +459,23 @@ fn dump_layout(a: App, res: layout::LayoutResult) is
         js::js_debug("  rule " + to_string(r) + ": sel='" + ru.selector + "' decls=" + to_string(array_len(ru.decls)) + " media='" + ru.media + "' spec=" + to_string(ru.spec) + " pelem='" + ru.pelem + "'")
         r += 1
     end
+    ;; bezpośredni test: reguła #2 ('html') kontra węzeł 1 (<html>)
+    if nr > 2 && nn > 1 is
+        let ru2: css::CssRule = a.sheet.rules[2]
+        if array_len(ru2.comps) > 0 is
+            let c0: css::Compound = ru2.comps[0]
+            let n1: dom::DomNode = a.dom.nodes[1]
+            js::js_debug("  test html: comps=" + to_string(array_len(ru2.comps)) + " comp.tag='" + c0.tag + "'(" + to_string(string_len(c0.tag)) + ") node.tag='" + n1.tag + "'(" + to_string(string_len(n1.tag)) + ") rowne=" + (if c0.tag == n1.tag then "tak" else "nie") + " compound_match=" + (if css::compound_matches_node(a.dom, 1, c0, interaction_state(a)) then "tak" else "nie") + " rule_matches=" + (if css::rule_matches(a.dom, 1, ru2, interaction_state(a)) then "tak" else "nie"))
+        else is
+            js::js_debug("  test html: reguła #2 ma comps=0")
+        end
+    end
+    let sts: [style::ComputedStyle] = layout::debug_styles(a.dom, a.sheet, interaction_state(a))
+    let tleft: int = dump_tree(a, res, sts, 0, 0, 70)
+    dump_match(a, 1)
+    dump_match(a, 4)
+    dump_match(a, 12)
+    dump_lens(a)
     if nn > 4 is
         let md: [css::CssDecl] = css::matching_decls_ctx(a.sheet, a.dom, 4, interaction_state(a))
         js::js_debug("  body(4): dopasowanych deklaracji=" + to_string(array_len(md)))
@@ -1102,8 +1206,14 @@ fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
         let op: string = ops[i]
         i += 1
         let kind: string = jsonlite::get_str(op, "o")
-        if debug_on() is js::js_debug("op " + to_string(i) + "/" + to_string(array_len(ops)) + " " + kind) end
-        let n: int = js_node(a, jsonlite::get_int(op, "n"))
+        let rawn: int = jsonlite::get_int(op, "n")
+        let n: int = js_node(a, rawn)
+        if debug_on() is
+            ;; pełny ślad dla operacji, które mogą trafić w złe miejsce: text/scroll/remove oraz każda z celem 0 lub -1
+            if kind == "text" || kind == "scroll" || kind == "remove" || (kind != "create" && kind != "createtext" && n <= 0) is
+                js::js_debug("op " + to_string(i) + "/" + to_string(array_len(ops)) + " " + kind + " js_id=" + to_string(rawn) + " -> real=" + to_string(n) + " (węzłów=" + to_string(array_len(a.dom.nodes)) + ", js_map=" + to_string(array_len(a.js_map)) + ")")
+            end
+        end
         if kind == "create" is
             a.dom = dom::create_element(a.dom, jsonlite::get_str(op, "t"))
             let real: int = array_len(a.dom.nodes) - 1
