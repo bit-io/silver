@@ -81,9 +81,12 @@ pub fn hex_pair(h: string) -> int is
 end
 
 fn clamp255(n: int) -> int is
-    if n < 0 is return 0 end
-    if n > 255 is return 255 end
-    return n
+    ;; BUGFIX: pojedynczy punkt powrotu — w skompilowanym kodzie wielokrotne wczesne `return`
+    ;; w funkcji z gałęziami dawały zły wynik (rgb()/rgba() zawsze 255,255,255).
+    let mut r: int = n
+    if n < 0 is r = 0 end
+    if n > 255 is r = 255 end
+    return r
 end
 
 pub fn is_hex_digits(s: string) -> bool is
@@ -99,22 +102,81 @@ pub fn is_hex_digits(s: string) -> bool is
     return true
 end
 
-;; Zamiana „np. 40%” lub „0.5” na 0..255 (alfa i kanały rgb)
-fn channel_value(tok: string, scale: int) -> int is
+;; BUGFIX: liczby dziesiętne parsujemy WYŁĄCZNIE na intach (bez f64): zwraca wartość * 1000
+;; ("0.07" -> 70, "12" -> 12000, "40%" -> 40000, "-5" -> -5000). Jednostki/% na końcu są ignorowane.
+;; Kompilator H# źle liczy mieszane działania int/f64, co psuło kolory rgb()/rgba().
+fn dec_milli(tok: string) -> int is
     let t: string = string_trim(tok)
-    if string_ends_with(t, "%") is
-        let f: f64 = conv::str_to_float(string_trim(string_slice(t, 0, string_len(t) - 1)))
-        return clamp255(conv::float_to_int(f * i2f(255) / 100.0 + 0.5))
+    let n: int = string_len(t)
+    let digits: string = "0123456789"
+    let mut i: int = 0
+    let mut neg: bool = false
+    if n > 0 is
+        let c0: string = string_slice(t, 0, 1)
+        if c0 == "-" is
+            neg = true
+            i = 1
+        end
+        if c0 == "+" is
+            i = 1
+        end
     end
-    let f: f64 = conv::str_to_float(t)
-    return clamp255(conv::float_to_int(f * i2f(scale) + 0.5))
+    let mut whole: int = 0
+    let mut going: bool = true
+    while i < n && going is
+        let d: int = string_find(digits, string_slice(t, i, i + 1))
+        if d < 0 is
+            going = false
+        else is
+            whole = whole * 10 + d
+            i += 1
+        end
+    end
+    let mut frac: int = 0
+    if i < n && string_slice(t, i, i + 1) == "." is
+        i += 1
+        let mut place: int = 100
+        let mut fgoing: bool = true
+        while i < n && fgoing && place > 0 is
+            let d: int = string_find(digits, string_slice(t, i, i + 1))
+            if d < 0 is
+                fgoing = false
+            else is
+                frac = frac + d * place
+                place = place / 10
+                i += 1
+            end
+        end
+    end
+    let mut v: int = whole * 1000 + frac
+    if neg is v = 0 - v end
+    return v
 end
 
+;; Kanał rgb: liczba (0..255) albo procent. `scale` = mnożnik liczby (zwykle 1).
+fn channel_value(tok: string, scale: int) -> int is
+    let t: string = string_trim(tok)
+    let m: int = dec_milli(t)
+    let mut r: int = 0
+    if string_ends_with(t, "%") is
+        r = (m * 255 + 50000) / 100000
+    else is
+        r = (m * scale + 500) / 1000
+    end
+    return clamp255(r)
+end
+
+;; Alfa: 0..1 albo procent -> 0..255
 fn alpha_value(tok: string) -> int is
     let t: string = string_trim(tok)
-    if string_ends_with(t, "%") is return channel_value(t, 1) end
-    let f: f64 = conv::str_to_float(t)
-    return clamp255(conv::float_to_int(f * 255.0 + 0.5))
+    let m: int = dec_milli(t)
+    let mut r: int = 0
+    if string_ends_with(t, "%") is
+        r = (m * 255 + 50000) / 100000
+    else is
+        r = (m * 255 + 500) / 1000
+    end
+    return clamp255(r)
 end
 
 fn split_args(inner: string) -> [string] is
