@@ -1548,6 +1548,11 @@ fn place_abs(cx: LayoutCtx, id: int, boxes: [LayoutBox], doc_h: int) -> [LayoutB
 end
 
 ;; ---------- punkty wejścia ----------
+;; Diagnostyka (SILVER_DEBUG=3): obliczone style wszystkich węzłów — to samo, co widzi layout_full.
+pub fn debug_styles(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionState) -> [style::ComputedStyle] is
+    return compute_styles(d, sheet, ix)
+end
+
 pub fn layout_full(d: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport_h: int, win_handle: int,
                    ix: css::InteractionState, scrolls: [int]) -> LayoutResult is
     if array_len(d.nodes) == 0 is return LayoutResult { boxes: [], height: 0 } end
