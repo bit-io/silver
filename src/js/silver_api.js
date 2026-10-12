@@ -414,7 +414,16 @@
         i = e; continue;
       }
       if (html.substr(i, 4) === '<!--') { var ce = html.indexOf('-->', i + 4); var cm = html.slice(i + 4, ce < 0 ? n : ce); top.k.push({ t: '#comment', x: cm }); i = ce < 0 ? n : ce + 3; continue; }
-      if (html[i + 1] === '!' || html[i + 1] === '?') { var de = html.indexOf('>', i); i = de < 0 ? n : de + 1; continue; }
+      if (html[i + 1] === '!' || html[i + 1] === '?') {
+        // BUGFIX: `<!>` (kotwice szablonów Svelte 5) i inne "bogus comments" to w HTML węzły komentarza
+        // (`<!>` = pusty komentarz). Wcześniej parser je pomijał, więc brakowało węzłów rodzeństwa i
+        // Svelte dostawał null z nextSibling (TypeError: cannot read property 'events' of null).
+        // Pomijamy tylko deklaracje <!DOCTYPE ...>.
+        var de = html.indexOf('>', i);
+        var decl = html.slice(i + 2, de < 0 ? n : de);
+        if (!(html[i + 1] === '!' && /^doctype/i.test(decl))) top.k.push({ t: '#comment', x: decl });
+        i = de < 0 ? n : de + 1; continue;
+      }
       if (html[i + 1] === '/') {
         var ge = html.indexOf('>', i); var nm = html.slice(i + 2, ge < 0 ? n : ge).trim().toLowerCase();
         for (var j = stack.length - 1; j > 0; j--) if (stack[j].t === nm) { stack.length = j; break; }
@@ -750,11 +759,35 @@
   g.Element = Element;
   g.HTMLElement = Element;
   g.Node = Element;
-  ['Text', 'Comment', 'DocumentFragment', 'HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement', 'HTMLTemplateElement',
-   'HTMLButtonElement', 'HTMLAnchorElement', 'HTMLImageElement', 'HTMLFormElement', 'SVGElement', 'ShadowRoot', 'Document',
-   'HTMLMediaElement', 'HTMLVideoElement', 'HTMLAudioElement', 'HTMLLabelElement', 'HTMLOptionElement', 'HTMLDivElement', 'HTMLSpanElement',
-   'HTMLCanvasElement', 'HTMLIFrameElement', 'HTMLLIElement', 'HTMLUListElement', 'HTMLBodyElement', 'HTMLHtmlElement', 'HTMLStyleElement',
-   'HTMLScriptElement', 'HTMLLinkElement', 'CharacterData', 'DOMTokenList', 'NodeList', 'HTMLCollection'].forEach(function (n) { g[n] = Element; });
+  // BUGFIX: dawniej wszystkie te klasy były aliasem na Element, więc `x instanceof Comment` było prawdziwe dla
+  // KAŻDEGO węzła. Svelte 5 (first_child: `node instanceof Comment && node.data === ""`) pomijał przez to
+  // pierwszy element szablonu i wszystkie przejścia po rodzeństwie były przesunięte o jeden węzeł
+  // (TypeError: cannot read property 'events' of null). Teraz każda klasa ma własne `instanceof`.
+  function mkClass(name, test) {
+    var C = function () {};
+    C.prototype = Element.prototype;   // wspólny prototyp (Svelte czyta deskryptory z Node/Text/Element.prototype)
+    try {
+      Object.defineProperty(C, Symbol.hasInstance, { value: function (v) { return !!v && typeof v === 'object' && !!test(v); } });
+    } catch (e) { /* bez Symbol.hasInstance: zostaje zwykły instanceof po prototypie */ }
+    g[name] = C;
+  }
+  function isTag(tag) { return function (v) { return v.nodeType === 1 && v.tagName === tag; }; }
+  mkClass('Text', function (v) { return v.nodeType === 3; });
+  mkClass('Comment', function (v) { return v.nodeType === 8; });
+  mkClass('CharacterData', function (v) { return v.nodeType === 3 || v.nodeType === 8; });
+  mkClass('DocumentFragment', function (v) { return v.nodeType === 11; });
+  mkClass('Document', function (v) { return v === document; });
+  mkClass('ShadowRoot', function () { return false; });
+  mkClass('SVGElement', function () { return false; });
+  mkClass('HTMLMediaElement', function (v) { return v.nodeType === 1 && (v.tagName === 'AUDIO' || v.tagName === 'VIDEO'); });
+  [['HTMLInputElement', 'INPUT'], ['HTMLTextAreaElement', 'TEXTAREA'], ['HTMLSelectElement', 'SELECT'],
+   ['HTMLTemplateElement', 'TEMPLATE'], ['HTMLButtonElement', 'BUTTON'], ['HTMLAnchorElement', 'A'],
+   ['HTMLImageElement', 'IMG'], ['HTMLFormElement', 'FORM'], ['HTMLVideoElement', 'VIDEO'], ['HTMLAudioElement', 'AUDIO'],
+   ['HTMLLabelElement', 'LABEL'], ['HTMLOptionElement', 'OPTION'], ['HTMLDivElement', 'DIV'], ['HTMLSpanElement', 'SPAN'],
+   ['HTMLCanvasElement', 'CANVAS'], ['HTMLIFrameElement', 'IFRAME'], ['HTMLLIElement', 'LI'], ['HTMLUListElement', 'UL'],
+   ['HTMLBodyElement', 'BODY'], ['HTMLHtmlElement', 'HTML'], ['HTMLStyleElement', 'STYLE'], ['HTMLScriptElement', 'SCRIPT'],
+   ['HTMLLinkElement', 'LINK']].forEach(function (p) { mkClass(p[0], isTag(p[1])); });
+  ['DOMTokenList', 'NodeList', 'HTMLCollection'].forEach(function (n) { g[n] = Element; });
   Element.ELEMENT_NODE = 1; Element.TEXT_NODE = 3; Element.COMMENT_NODE = 8; Element.DOCUMENT_NODE = 9; Element.DOCUMENT_FRAGMENT_NODE = 11;
   g.innerWidth = 0;
   g.innerHeight = 0;
