@@ -560,11 +560,11 @@ fn parse_line_height(val: string, font_size: int, env: cssval::LenEnv) -> int is
                          string_find(v, "pt") < 0 && string_find(v, "calc") < 0
     if is_plain is
         let f: f64 = conv::str_to_float(v)
-        return conv::float_to_int(f * conv::int_to_float(font_size) + 0.5)
+        return conv::float_to_int(f * cssval::i2f(font_size) + 0.5)
     end
     if string_ends_with(v, "%") is
         let f: f64 = conv::str_to_float(string_slice(v, 0, string_len(v) - 1))
-        return conv::float_to_int(f * conv::int_to_float(font_size) / 100.0 + 0.5)
+        return conv::float_to_int(f * cssval::i2f(font_size) / 100.0 + 0.5)
     end
     return len_px_or(v, env, font_size, 0)
 end
