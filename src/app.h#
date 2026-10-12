@@ -1180,13 +1180,18 @@ end
 
 ;; ---------- operacje DOM z JS ----------
 fn js_node(a: App, n: int) -> int is
+    ;; BUGFIX: jeden punkt powrotu. Wcześniej kilka wczesnych `return` dawało w skompilowanym kodzie
+    ;; zły wynik (0) dla zwykłego id < 1000000 → `text` trafiał w węzeł 0 (root) i kasował całe drzewo
+    ;; (pusty szary ekran po przejściu z kreatora do UI).
+    let mut r: int = -1
+    let total: int = array_len(a.dom.nodes)
     if n >= 1000000 is
         let idx: int = n - 1000000
-        if idx < array_len(a.js_map) is return a.js_map[idx] end
-        return -1
+        if idx < array_len(a.js_map) is r = a.js_map[idx] end
+    else is
+        if n >= 0 && n < total is r = n end
     end
-    if n < 0 || n >= array_len(a.dom.nodes) is return -1 end
-    return n
+    return r
 end
 
 struct DomOpsRes is
@@ -1207,7 +1212,12 @@ fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
         i += 1
         let kind: string = jsonlite::get_str(op, "o")
         let rawn: int = jsonlite::get_int(op, "n")
-        let n: int = js_node(a, rawn)
+        let mut n: int = js_node(a, rawn)
+        ;; Straż: zwykłe id (< 1000000) ma być dokładnie tym samym węzłem; nigdy nie podmieniaj na root.
+        if rawn > 0 && rawn < 1000000 && rawn < array_len(a.dom.nodes) && n != rawn is
+            if debug_on() is js::js_debug("UWAGA: js_node(" + to_string(rawn) + ") zwrócił " + to_string(n) + " — poprawiam") end
+            n = rawn
+        end
         if debug_on() is
             ;; pełny ślad dla operacji, które mogą trafić w złe miejsce: text/scroll/remove oraz każda z celem 0 lub -1
             if kind == "text" || kind == "scroll" || kind == "remove" || (kind != "create" && kind != "createtext" && n <= 0) is
@@ -1246,6 +1256,7 @@ fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
             continue
         end
         if n < 0 is continue end
+        if n == 0 && (kind == "text" || kind == "html" || kind == "remove") is continue end
         if kind == "text" is
             a.dom = dom::set_text(a.dom, n, jsonlite::get_str(op, "v"))
         elsif kind == "html" is
