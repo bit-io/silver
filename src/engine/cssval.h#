@@ -23,6 +23,13 @@ pub struct LenEnv is
     pub vh:  int
 end
 
+;; BUGFIX: conv::int_to_float (`n + 0.0`) w programie skompilowanym zwraca 0 — kompilator nie ma gałęzi
+;; dla mieszanego `int + f64` w binop i zwraca zero. Skutek: em/rem/vw/vh/vmin/vmax zawsze 0 (np. `100vh`,
+;; `2rem`). Konwersja przez napis działa niezawodnie (str_to_float i działania na f64 są w porządku).
+pub fn i2f(n: int) -> f64 is
+    return conv::str_to_float(to_string(n))
+end
+
 pub fn default_env() -> LenEnv is
     return LenEnv { em: 16, rem: 16, vw: 800, vh: 600 }
 end
@@ -97,10 +104,10 @@ fn channel_value(tok: string, scale: int) -> int is
     let t: string = string_trim(tok)
     if string_ends_with(t, "%") is
         let f: f64 = conv::str_to_float(string_trim(string_slice(t, 0, string_len(t) - 1)))
-        return clamp255(conv::float_to_int(f * conv::int_to_float(255) / 100.0 + 0.5))
+        return clamp255(conv::float_to_int(f * i2f(255) / 100.0 + 0.5))
     end
     let f: f64 = conv::str_to_float(t)
-    return clamp255(conv::float_to_int(f * conv::int_to_float(scale) + 0.5))
+    return clamp255(conv::float_to_int(f * i2f(scale) + 0.5))
 end
 
 fn alpha_value(tok: string) -> int is
@@ -135,7 +142,7 @@ end
 
 fn hsl_to_color(h_deg: f64, s: f64, l: f64, a: int) -> Color is
     let mut h: f64 = h_deg / 360.0
-    h = h - conv::int_to_float(conv::float_to_int(h))
+    h = h - i2f(conv::float_to_int(h))
     if h < 0.0 is h = h + 1.0 end
     if s <= 0.0 is
         let v: int = clamp255(conv::float_to_int(l * 255.0 + 0.5))
@@ -276,17 +283,17 @@ fn unit_to_cv(num: f64, unit: string, env: LenEnv) -> CV is
     if unit == "" is return CV { a: 0.0, b: 0.0, s: f, is_scalar: true, ok: true } end
     if unit == "px" is return CV { a: f, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
     if unit == "%" is return CV { a: 0.0, b: f, s: 0.0, is_scalar: false, ok: true } end
-    if unit == "em" is return CV { a: f * conv::int_to_float(env.em), b: 0.0, s: 0.0, is_scalar: false, ok: true } end
-    if unit == "rem" is return CV { a: f * conv::int_to_float(env.rem), b: 0.0, s: 0.0, is_scalar: false, ok: true } end
-    if unit == "vw" is return CV { a: f * conv::int_to_float(env.vw) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
-    if unit == "vh" is return CV { a: f * conv::int_to_float(env.vh) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "em" is return CV { a: f * i2f(env.em), b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "rem" is return CV { a: f * i2f(env.rem), b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "vw" is return CV { a: f * i2f(env.vw) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
+    if unit == "vh" is return CV { a: f * i2f(env.vh) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
     if unit == "vmin" is
         let m: int = if env.vw < env.vh then env.vw else env.vh
-        return CV { a: f * conv::int_to_float(m) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true }
+        return CV { a: f * i2f(m) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true }
     end
     if unit == "vmax" is
         let m: int = if env.vw > env.vh then env.vw else env.vh
-        return CV { a: f * conv::int_to_float(m) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true }
+        return CV { a: f * i2f(m) / 100.0, b: 0.0, s: 0.0, is_scalar: false, ok: true }
     end
     if unit == "pt" is return CV { a: f * 4.0 / 3.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
     if unit == "pc" is return CV { a: f * 16.0, b: 0.0, s: 0.0, is_scalar: false, ok: true } end
