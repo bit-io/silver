@@ -1,6 +1,77 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+Wydanie skoncentrowane na **CSS** (priorytet), z rozbudową układu, malowania, animacji, czcionek i warstwy JS.
+Testy silnika: 287 (225 + 62 nowe) — w interpreterze H# przechodzi 283, 4 wymagają skompilowanego H#/FFI.
+Nowe testy natywne: `native/tests/run-layer.sh` (obrót/skala/pochylenie/alfa/zagnieżdżanie warstw i `backdrop blur` — porównanie pikseli) oraz
+`native/tests/run-woff.sh` (dekoder WOFF: każda tablica identyczna z oryginalnym TTF).
+
+### Rozszerzenie pokrycia CSS (tej samej wersji 0.3)
+- **Rejestr wszystkich 474 właściwości** (`props.h#`, `props_data.h#` generowany przez `tools/gen_props.py`): walidacja gramatyki, dziedziczenie, wartości
+  początkowe, magazyn `xp` w stylu obliczonym, `@supports` oparte na rejestrze. Skrypt `tools/css_coverage.py` liczy pokrycie
+  (parsowane 100%, renderowane 56%, najczęściej używane 98%).
+- **Zamknięte z listy braków:** `rotate()/skew()/matrix()` i `rotate/scale/translate` (warstwy natywne), `display: contents`, zagnieżdżanie CSS (`&`),
+  `@container` z ewaluacją, `grid-auto-flow: column`, WOFF 1.0, RTL (`direction`, `start/end`, odbicie szyku słów, logiczne właściwości z rtl).
+- **Nowe renderowane:** wiele kolumn (`column-*`, `columns`, `break-*`, `box-decoration-break`), `text-align: justify/start/end`, `text-align-last`,
+  `text-wrap: balance|nowrap`, `white-space-collapse`, `line-clamp`, `tab-size`, `text-underline-offset/position`, `content-visibility`, `contain`,
+  `isolation`, `will-change`, `background-origin/clip/position-x/y`, `object-position`, `image-rendering`, `caret-color`, `accent-color`,
+  `scrollbar-width/color`, `scroll-margin/padding` + `scroll-behavior: smooth` (skok do `#id`, `scrollIntoView`), `backdrop-filter: blur()`,
+  `appearance: none`, `line-break`, logiczne `border-*`/`overflow-*`/`scroll-*`.
+- **Poprawki:** brakujące `border-{top,right,bottom,left}-style`; `text-align: start/end` nie były rozróżniane od `left/right`;
+  `scrollIntoView` było pustą funkcją; `tab-size` było parsowane bez efektu; `@supports` sprawdzał tylko ~125 nazw.
+Nowe testy natywne/JS: `native/tests/run-ext.sh` (20 kontroli API JS, moduły ES, WebSocket względem prawdziwego serwera, czcionki,
+React/Vue/Solid na prawdziwych bundlach).
+
+### CSS (`style.h#`, `css.h#`, `layout.h#`, `paint.h#`, nowe `anim.h#`, `netutil.h#`)
+- **Słowa kluczowe kaskady** `inherit/initial/unset/revert` dla każdej właściwości (generyczne `copy_prop`), `all`, prefiksy dostawców,
+  właściwości logiczne (`margin-inline`, `inline-size`, …).
+- **~60 nowych pól stylu** i parsery: `letter-spacing`, `word-spacing`, `text-indent`, `text-shadow`, `vertical-align`, `list-style*`,
+  `font-family`, `font-weight` numeryczne, `text-decoration-color/style/thickness`, `float`, `clear`, `align-content`, `justify-items/self`,
+  `place-*`, `grid-template-areas`, `grid-area`, `grid-row/column` (linie i `span`), `grid-auto-*`, `aspect-ratio`, `transform`,
+  `transform-origin`, `filter`, `clip-path`, `pointer-events`, `user-select`, `border-style` per krawędź, `outline-style/offset`,
+  `background-repeat/position`, `animation*`, `transition-*` (lista właściwości), `border-spacing/collapse`, `table-layout`.
+- **Układ:** `float` + `clear` z opływaniem tekstu i BFC; zwijanie marginesów rodzic↔dziecko; prawdziwe tabele (`colspan`, `rowspan`,
+  `thead/tfoot`, `caption`, `border-spacing/collapse`, `table-layout: fixed`); nowy grid (obszary, linie, auto-placement, `dense`, spany w obu osiach,
+  `justify-items/self`, `grid-auto-rows`); `align-content` we flexie; `aspect-ratio`; `vertical-align`; typy list (`roman`, `alpha`, …),
+  `ol[start|reversed]`, `list-style-position`; `letter-spacing/word-spacing` w pomiarze tekstu; `text-indent`.
+- **Przebiegi końcowe układu:** `z-index` (kolejność rysowania i trafień), grupowe `opacity`, `filter` (przekształcenie kolorów), `clip-path`,
+  `transform` (translate/scale z potomkami), dane dla `position: sticky` (przesunięcie liczone przy rysowaniu).
+- **Treść generowana:** `::before/::after` (wcześniej reguły były parsowane, ale węzły nie powstawały), `attr()`, `counter()/counters()`,
+  `counter-reset/increment/set`, cudzysłowy, ucieczki CSS; boxy pseudo-elementów mapowane na element-właściciela.
+- **`@`-reguły:** `@import` (lokalne, rekurencyjne, z media), `@font-face`, `@keyframes`, prawdziwe `@supports`, `@layer` z poprawną kaskadą
+  (także `!important`), nowy ewaluator `@media` (zakresy, `or`, `not`, `aspect-ratio`, `resolution`, …).
+- **Selektory:** `:nth-child(… of S)`, `:has()`, pełne selektory złożone w `:is/:where/:not`, `:only-of-type`, `:nth-last-of-type`, `:lang()`,
+  `:required`, `:optional`, `:read-write`, `:default`, `:indeterminate`, `:valid/:invalid`, `:focus-visible`, `:scope`, `:any-link`.
+- **Animacje (`anim.h#`):** `@keyframes` + `animation` (opóźnienie, iteracje, kierunek, fill-mode, `cubic-bezier`, `steps`), przejścia
+  geometrii/transformacji/filtra/cienia z `transition-property`; integracja w `app.h#` (start, śledzenie, podtrzymanie klatek, brak podwójnego przejścia kolorów).
+- **Malowanie:** ramki `dashed/dotted/double`, obrys z `outline-offset/style`, `text-shadow`, `letter-spacing/word-spacing`, podkreślenia
+  z kolorem/stylem/grubością, tło w naturalnym rozmiarze z `background-position/repeat`, `sticky`, `pointer-events` w trafieniach.
+- **Czcionki:** `@font-face` + kilka krojów (regular/bold/italic/bold-italic) w natywnej powłoce (`silver_font_register`; klucz rodziny w bitach
+  8–22 parametru `style`; syntetyczny styl tylko przy braku prawdziwego kroju). Test natywny `native/tests/fonts_test.c`.
+
+### JavaScript (`silver_api.js`, `silver_polyfills.js`, `silver_quickjs_shim.c`)
+- **Układ dla JS:** `getBoundingClientRect`, `offset*`, `client*`, `scroll*`, `getClientRects`, `scrollY`; **`getComputedStyle`** z wartościami z układu.
+- **Obserwatory:** działające `MutationObserver`, `ResizeObserver`, `IntersectionObserver`.
+- **`preventDefault()` synchroniczne** dla `click` i `keydown` (`js_emit_ret` w shimie + `dom_event_prevented` w H#).
+- **Moduły ES:** loader w shimie (względne importy, `.mjs`, `index.js`, dynamiczny `import()`, top-level `await`).
+- **Web:** `Intl` (NumberFormat, DateTimeFormat, PluralRules, Collator, ListFormat, RelativeTimeFormat, Segmenter), trwały `localStorage`
+  (+ `sessionStorage`), `fetch` z nagłówkami i plikami lokalnymi (`Headers`, `Request`, `Response`, `blob:`), `Worker` (ten sam wątek),
+  `WebSocket` (natywny klient `ws://`, SHA-1 w C), Shadow DOM (spłaszczony, ze slotami), Custom Elements, source mapy (VLQ, inline i `.map`).
+- **Zgodność z DOM wykryta przez frameworki:** `window.event`, właściwości `on*` (także kompilacja atrybutów), `ownerDocument`, `input.type`,
+  zapisywalny `currentTarget`, `document.title`/`defaultView`, `AbortError` jako `reason`. Sprawdzone: React 18, Vue 3, Solid (+ Preact, Svelte).
+
+### Naprawy
+- **`"{}"` w literałach H#** jest interpolacją i dawało **pusty napis**: `jsonlite::object()`, `store`, `js_resolve(…, "{}")` (odpowiedź `invoke`
+  bez danych była nieparsowalna dla `JSON.parse`) i zdarzenia `silver://focus|blur`, `ready`. Teraz `"{{}}"` (test `t03_literal_braces_are_not_interpolated`).
+- `AbortController`/`AbortSignal.abort()`: `reason` miał `name: "Error"` zamiast `AbortError` (a `timeout` — `TimeoutError`).
+- `fetch`: wcześniej odpowiedź nie miała nagłówków, a ścieżki lokalne nie działały.
+
+### Zmiany pozostałe
+- Wersja 0.3.0 w `Bit.hk`, CLI, szablonach (`-> silver => ^0.3`), pakietach i API JS (`silver.version`, `navigator.userAgent`).
+- Nowe/zmienione pliki testowe: `native/tests/run-ext.sh`, `ext_runner.c`, `checks/{ext03,modules,ws,framework}.js`, `ws_echo_server.py`, `mods/`, `frameworks/`.
+
+### Wcześniejsze poprawki (od 0.2)
 - `SILVER_DEBUG=3`: zrzut pierwszych 14 pudełek layoutu (węzeł, tag, klasa, rodzaj, rozmiar, `display`, tekst) i
   pierwszych 40 węzłów DOM, pierwszych 8 reguł arkusza (selektor, liczba deklaracji) i deklaracji dopasowanych do `body` na stderr — do diagnozy „DOM urósł, a layout niemal pusty”.
 - `src/app.h#` (`pump_js`): pętla odbioru wywołań JS sterowana liczbą oczekujących wywołań
