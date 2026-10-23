@@ -205,7 +205,7 @@ pub fn has_key(obj: string, key: string) -> bool is
     return false
 end
 
-pub fn object() -> string is return "{}" end
+pub fn object() -> string is return "{{}}" end
 
 ;; Ustawia klucz na surową wartość (nadpisuje lub dopisuje na końcu).
 pub fn set_raw(obj: string, key: string, raw: string) -> string is
