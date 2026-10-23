@@ -1,9 +1,13 @@
 mod dom
 mod cssval
+mod props_data
+mod props
 mod css
 mod style
+mod anim
 mod layout
 mod paint
 mod template
 mod jsonlite
 mod jsonval
+mod netutil
