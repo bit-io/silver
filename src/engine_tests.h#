@@ -1,12 +1,16 @@
 mod dom
 mod css
 mod cssval
+mod props_data
+mod props
 mod layout
+mod anim
 mod paint
 mod style
 mod template
 mod jsonval
 mod jsonlite
+mod netutil
 mod engine
 mod edit
 mod ipc
@@ -1716,4 +1720,1772 @@ fn test_window_decode_events() is
     assert_eq(w.y, -24)
     assert_eq(window::decode(12, "0|0|/tmp/a b.png").text, "/tmp/a b.png")
     assert_eq(window::decode(6, "640|480|200").code, 200)
+end
+
+
+;; ---------- 0.3: nowe właściwości CSS ----------
+
+#[test]
+fn t03_typography_props() is
+    let st: style::ComputedStyle = st_for("<p class=\"a\">x</p>", ".a { letter-spacing: 2px; word-spacing: 4px; text-indent: 12px; text-shadow: 1px 2px 3px red; vertical-align: super; font-family: \"Fira Sans\", sans-serif; font-weight: 600; }", 1)
+    assert_eq(st.letter_spacing, 2)
+    assert_eq(st.word_spacing, 4)
+    assert_eq(st.text_indent, 12)
+    assert_true(st.has_tshadow)
+    assert_eq(st.ts_x, 1)
+    assert_eq(st.ts_y, 2)
+    assert_eq(st.ts_blur, 3)
+    assert_eq(st.ts_color.r, 255)
+    assert_eq(st.valign, "super")
+    assert_eq(st.font_weight, 600)
+    assert_true(st.bold)
+end
+
+#[test]
+fn t03_inherited_typography() is
+    let d: dom::Dom = dom::parse("<div class=\"a\"><span>x</span></div>")
+    let sheet: css::Stylesheet = css::parse(".a { letter-spacing: 3px; text-indent: 5px; list-style-type: square; }")
+    let root: style::ComputedStyle = style::root_style()
+    let a: style::ComputedStyle = style::resolve_ctx(sheet, d, 1, root, css::no_interaction())
+    let sp: style::ComputedStyle = style::resolve_ctx(sheet, d, 2, a, css::no_interaction())
+    assert_eq(sp.letter_spacing, 3)
+    assert_eq(sp.text_indent, 5)
+    assert_eq(sp.list_style, "square")
+end
+
+#[test]
+fn t03_css_wide_keywords() is
+    let d: dom::Dom = dom::parse("<div class=\"a\"><p class=\"b\">x</p></div>")
+    let sheet: css::Stylesheet = css::parse(".a { padding: 9px; letter-spacing: 4px; opacity: 0.4; } .b { padding: inherit; letter-spacing: initial; opacity: unset; margin-top: 7px; margin: unset; }")
+    let root: style::ComputedStyle = style::root_style()
+    let a: style::ComputedStyle = style::resolve_ctx(sheet, d, 1, root, css::no_interaction())
+    let b: style::ComputedStyle = style::resolve_ctx(sheet, d, 2, a, css::no_interaction())
+    assert_eq(b.pad_top, 9)
+    assert_eq(b.pad_left, 9)
+    assert_eq(b.letter_spacing, 0)
+    assert_eq(b.opacity, 100)
+    assert_eq(b.mar_top, 0)
+end
+
+#[test]
+fn t03_all_initial() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { padding: 5px; border: 2px solid red; all: initial; }", 1)
+    assert_eq(st.pad_top, 0)
+    assert_eq(st.bt, 0)
+end
+
+#[test]
+fn t03_logical_properties() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { margin-inline: 4px 8px; padding-block: 3px; padding-inline-start: 11px; inline-size: 120px; min-block-size: 30px; border-block-end: 2px solid blue; }", 1)
+    assert_eq(st.mar_left, 4)
+    assert_eq(st.mar_right, 8)
+    assert_eq(st.pad_top, 3)
+    assert_eq(st.pad_bottom, 3)
+    assert_eq(st.pad_left, 11)
+    assert_eq(st.width, 120)
+    assert_eq(st.min_height, 30)
+    assert_eq(st.bb, 2)
+    assert_eq(st.bt, 0)
+end
+
+#[test]
+fn t03_vendor_prefix_and_transform() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { -webkit-transform: translate(10px, 20px) scale(1.5, 2) rotate(45deg); transform-origin: left top; }", 1)
+    assert_true(st.has_transform)
+    assert_eq(st.tr_tx, 10)
+    assert_eq(st.tr_ty, 20)
+    assert_eq(st.tr_sx, 1500)
+    assert_eq(st.tr_sy, 2000)
+    assert_eq(st.tr_rot, 450)
+    assert_eq(st.origin_x, 0)
+    assert_eq(st.origin_y, 0)
+end
+
+#[test]
+fn t03_transform_percent_and_none() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: translateX(-50%) translateY(10px); }", 1)
+    assert_eq(st.tr_tx_pct, -5000)
+    assert_eq(st.tr_ty, 10)
+    let none: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: scale(2); transform: none; }", 1)
+    assert_true(!none.has_transform)
+    assert_eq(none.tr_sx, 1000)
+end
+
+#[test]
+fn t03_filter() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { filter: grayscale(50%) brightness(1.2) invert(1) sepia(30%) contrast(80%) opacity(0.5); }", 1)
+    assert_true(st.has_filter)
+    assert_eq(st.f_gray, 50)
+    assert_eq(st.f_bright, 120)
+    assert_eq(st.f_invert, 100)
+    assert_eq(st.f_sepia, 30)
+    assert_eq(st.f_contrast, 80)
+    assert_eq(st.f_opacity, 50)
+end
+
+#[test]
+fn t03_animation_shorthand() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { animation: spin 2s ease-in-out 500ms infinite alternate both; }", 1)
+    assert_eq(st.anim_name, "spin")
+    assert_eq(st.anim_ms, 2000)
+    assert_eq(st.anim_delay, 500)
+    assert_eq(st.anim_iter, -1)
+    assert_eq(st.anim_dir, "alternate")
+    assert_eq(st.anim_fill, "both")
+    assert_eq(st.anim_ease, "ease-in-out")
+end
+
+#[test]
+fn t03_animation_longhands() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { animation-name: fade; animation-duration: 300ms; animation-iteration-count: 3; animation-fill-mode: forwards; animation-play-state: paused; }", 1)
+    assert_eq(st.anim_name, "fade")
+    assert_eq(st.anim_ms, 300)
+    assert_eq(st.anim_iter, 3000)
+    assert_eq(st.anim_fill, "forwards")
+    assert_true(st.anim_paused)
+end
+
+#[test]
+fn t03_transition_list() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transition: opacity 0.3s ease 100ms, transform 1s linear; }", 1)
+    assert_eq(st.trans_ms, 300)
+    assert_eq(st.trans_delay, 100)
+    assert_eq(st.trans_prop, "opacity,transform")
+    assert_eq(st.trans_ease, "ease")
+end
+
+#[test]
+fn t03_grid_areas_and_lines() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { grid-template-areas: \"head head\" \"nav main\"; grid-area: main; }", 1)
+    assert_eq(st.grid_areas, "head head\u0001nav main")
+    assert_eq(st.grid_area, "main")
+    let ln: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { grid-row: 2 / span 3; grid-column: 1 / 4; }", 1)
+    assert_eq(ln.grid_row_start, 2)
+    assert_eq(ln.grid_row_span, 3)
+    assert_eq(ln.grid_col_start, 1)
+    assert_eq(ln.grid_col_span, 3)
+    let sh: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { grid-area: 2 / 1 / 4 / 3; }", 1)
+    assert_eq(sh.grid_row_start, 2)
+    assert_eq(sh.grid_row_span, 2)
+    assert_eq(sh.grid_col_span, 2)
+end
+
+#[test]
+fn t03_alignment_props() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { align-content: space-between; place-items: center end; justify-self: end; }", 1)
+    assert_eq(st.align_content, "space-between")
+    assert_eq(st.align, "center")
+    assert_eq(st.justify_items, "flex-end")
+    assert_eq(st.justify_self, "flex-end")
+end
+
+#[test]
+fn t03_aspect_float_clear() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { aspect-ratio: 16 / 9; float: right; clear: both; }", 1)
+    assert_eq(st.aspect_ratio, 1778)
+    assert_eq(st.float_side, "right")
+    assert_eq(st.clear_side, "both")
+end
+
+#[test]
+fn t03_border_styles_per_side() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { border: 2px dashed red; border-bottom: 3px dotted blue; }", 1)
+    assert_eq(st.border_style, "dashed")
+    assert_eq(st.bs_b, "dotted")
+    assert_eq(st.bb, 3)
+    let two: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { border-width: 4px; border-style: solid none; }", 1)
+    assert_eq(two.bt, 4)
+    assert_eq(two.br, 0)
+    assert_eq(two.bl, 0)
+end
+
+#[test]
+fn t03_list_style_and_deco() is
+    let st: style::ComputedStyle = st_for("<ul class=\"a\"><li>x</li></ul>", ".a { list-style: lower-roman inside; text-decoration: underline wavy red; }", 1)
+    assert_eq(st.list_style, "lower-roman")
+    assert_eq(st.list_pos, "inside")
+    assert_true(st.underline)
+    assert_eq(st.deco_style, "wavy")
+    assert_true(st.has_deco_color)
+    assert_eq(st.deco_color.r, 255)
+end
+
+#[test]
+fn t03_misc_props() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { pointer-events: none; user-select: none; clip-path: inset(5px); background-repeat: no-repeat; outline: 2px dotted red; outline-offset: 3px; accent-color: blue; }", 1)
+    assert_true(!st.pointer_events)
+    assert_eq(st.user_select, "none")
+    assert_eq(st.clip_path, "inset(5px)")
+    assert_eq(st.bg_repeat, "no-repeat")
+    assert_eq(st.outline_w, 2)
+    assert_eq(st.outline_offset, 3)
+    assert_true(st.has_accent)
+end
+
+;; ---------- 0.3: at-reguły, @media, selektory ----------
+
+#[test]
+fn t03_import_font_face_keyframes() is
+    let sheet: css::Stylesheet = css::parse("@charset \"utf-8\"; @import url(\"base.css\") screen; @import 'x.css'; @font-face { font-family: \"My Font\"; src: url(a.woff2) format(\"woff2\"), url(a.ttf) format(\"truetype\"); font-weight: bold; } @keyframes spin { to { opacity: 1 } from { opacity: 0 } 50% { opacity: 0.5 } } .a { color: red }")
+    assert_eq(array_len(sheet.imports), 2)
+    assert_eq(sheet.imports[0], "base.css\u0001screen")
+    assert_eq(sheet.imports[1], "x.css\u0001")
+    assert_eq(array_len(sheet.fonts), 1)
+    assert_eq(sheet.fonts[0].family, "my font")
+    assert_eq(sheet.fonts[0].src, "a.ttf")
+    assert_true(sheet.fonts[0].bold)
+    assert_eq(array_len(sheet.keyframes), 1)
+    let k: css::Keyframes = sheet.keyframes[css::find_keyframes(sheet, "spin")]
+    assert_eq(array_len(k.stops), 3)
+    assert_eq(k.stops[0].pct, 0)
+    assert_eq(k.stops[1].pct, 50)
+    assert_eq(k.stops[2].pct, 100)
+    assert_eq(array_len(sheet.rules), 1)
+end
+
+#[test]
+fn t03_supports() is
+    assert_true(css::supports_matches("(display: grid)"))
+    assert_true(!css::supports_matches("(frobnicate: 1)"))
+    assert_true(css::supports_matches("not (frobnicate: 1)"))
+    assert_true(css::supports_matches("(display: flex) and (gap: 4px)"))
+    assert_true(css::supports_matches("(frobnicate: 1) or (transform: none)"))
+    assert_true(!css::supports_matches("(display: flex) and (frobnicate: 1)"))
+    let sheet: css::Stylesheet = css::parse("@supports (display: grid) { .a { color: red } } @supports (nope: 1) { .b { color: blue } }")
+    assert_eq(array_len(sheet.rules), 1)
+    assert_eq(sheet.rules[0].selector, ".a")
+end
+
+#[test]
+fn t03_layers_cascade() is
+    let d: dom::Dom = dom::parse("<p class=\"a\">x</p>")
+    let sheet: css::Stylesheet = css::parse("@layer base, theme; @layer theme { .a { color: blue; width: 10px } } @layer base { .a { color: green; width: 20px; height: 5px } } .a { height: 9px }")
+    let st: style::ComputedStyle = style::resolve_ctx(sheet, d, 1, style::root_style(), css::no_interaction())
+    assert_eq(st.color.b, 255)
+    assert_eq(st.width, 10)
+    assert_eq(st.height, 9)
+end
+
+#[test]
+fn t03_layers_important_reversed() is
+    let d: dom::Dom = dom::parse("<p class=\"a\">x</p>")
+    let sheet: css::Stylesheet = css::parse("@layer base, theme; @layer base { .a { width: 20px !important } } @layer theme { .a { width: 10px !important } } .a { width: 99px !important }")
+    let st: style::ComputedStyle = style::resolve_ctx(sheet, d, 1, style::root_style(), css::no_interaction())
+    assert_eq(st.width, 20)
+end
+
+#[test]
+fn t03_media_modern() is
+    let ix: css::InteractionState = css::interaction(-1, -1, -1)
+    assert_true(css::media_matches("(width >= 600px)", ix))
+    assert_true(!css::media_matches("(width > 900px)", ix))
+    assert_true(css::media_matches("(400px <= width <= 900px)", ix))
+    assert_true(css::media_matches("screen and (min-width: 700px) and (max-width: 900px)", ix))
+    assert_true(css::media_matches("(max-width: 100px) or (min-width: 700px)", ix))
+    assert_true(css::media_matches("not (max-width: 100px)", ix))
+    assert_true(!css::media_matches("print", ix))
+    assert_true(css::media_matches("print, screen", ix))
+    assert_true(css::media_matches("(orientation: landscape)", ix))
+    assert_true(css::media_matches("(min-aspect-ratio: 1/1)", ix))
+    assert_true(css::media_matches("(prefers-reduced-motion: no-preference)", ix))
+    assert_true(!css::media_matches("(prefers-reduced-motion: reduce)", ix))
+    assert_true(css::media_matches("(hover: hover)", ix))
+    assert_true(css::media_matches("(min-resolution: 1dppx)", ix))
+    assert_true(!css::media_matches("(min-resolution: 2dppx)", ix))
+end
+
+#[test]
+fn t03_has_selector() is
+    let d: dom::Dom = dom::parse("<div id=\"a\"><p class=\"x\">1</p></div><div id=\"b\"><span>2</span></div>")
+    let ix: css::InteractionState = css::no_interaction()
+    let a: int = dom::find_by_id(d, "a")
+    let b: int = dom::find_by_id(d, "b")
+    assert_true(css::node_matches_selector(d, a, "div:has(.x)", ix))
+    assert_true(!css::node_matches_selector(d, b, "div:has(.x)", ix))
+    assert_true(css::node_matches_selector(d, a, "div:has(> p)", ix))
+    assert_true(!css::node_matches_selector(d, b, "div:has(> p)", ix))
+    assert_true(css::node_matches_selector(d, b, "div:has(span)", ix))
+    assert_true(css::node_matches_selector(d, a, "div:has(+ #b)", ix))
+    assert_true(css::node_matches_selector(d, a, "#a:has(~ #b)", ix))
+    assert_true(!css::node_matches_selector(d, b, "div:has(+ #a)", ix))
+end
+
+#[test]
+fn t03_has_sibling_combinators() is
+    let d: dom::Dom = dom::parse("<h2 id=\"h\">t</h2><p id=\"p\">x</p>")
+    let ix: css::InteractionState = css::no_interaction()
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "h"), "h2:has(+ p)", ix))
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "h"), "h2:has(~ p)", ix))
+    assert_true(!css::node_matches_selector(d, dom::find_by_id(d, "p"), "p:has(+ p)", ix))
+end
+
+#[test]
+fn t03_nth_child_of_selector() is
+    let d: dom::Dom = dom::parse("<ul><li class=\"a\" id=\"i1\">1</li><li id=\"i2\">2</li><li class=\"a\" id=\"i3\">3</li><li class=\"a\" id=\"i4\">4</li></ul>")
+    let ix: css::InteractionState = css::no_interaction()
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "i3"), "li:nth-child(2 of .a)", ix))
+    assert_true(!css::node_matches_selector(d, dom::find_by_id(d, "i2"), "li:nth-child(2 of .a)", ix))
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "i4"), "li:nth-last-child(1 of .a)", ix))
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "i4"), "li:nth-last-of-type(1)", ix))
+end
+
+#[test]
+fn t03_complex_selectors_in_is_and_not() is
+    let d: dom::Dom = dom::parse("<div class=\"box\"><p id=\"p1\">1</p></div><section><p id=\"p2\">2</p></section>")
+    let ix: css::InteractionState = css::no_interaction()
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "p1"), "p:is(.box p, article p)", ix))
+    assert_true(!css::node_matches_selector(d, dom::find_by_id(d, "p2"), "p:is(.box p, article p)", ix))
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "p2"), "p:not(.box > p)", ix))
+    assert_true(!css::node_matches_selector(d, dom::find_by_id(d, "p1"), "p:not(.box > p)", ix))
+end
+
+#[test]
+fn t03_misc_pseudos() is
+    let d: dom::Dom = dom::parse("<div lang=\"pl-PL\"><input id=\"i\" required><input id=\"j\"><p id=\"p\">x</p></div>")
+    let ix: css::InteractionState = css::no_interaction()
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "p"), "p:lang(pl)", ix))
+    assert_true(!css::node_matches_selector(d, dom::find_by_id(d, "p"), "p:lang(en)", ix))
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "i"), "input:required", ix))
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "j"), "input:optional", ix))
+    assert_true(css::node_matches_selector(d, dom::find_by_id(d, "p"), "p:only-of-type", ix))
+end
+
+;; ---------- 0.3: układ ----------
+
+#[test]
+fn t03_float_left_text_wraps() is
+    let boxes: [layout::LayoutBox] = lay("<div id=\"c\"><div id=\"f\" class=\"f\"></div><p id=\"p\">aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp</p></div>", ".f { float: left; width: 100px; height: 200px; } #c { width: 300px; } p { margin: 0 }", 800)
+    let f: layout::LayoutBox = find_box(boxes, dom::find_by_id(dom::parse("<div id=\"c\"><div id=\"f\" class=\"f\"></div><p id=\"p\">x</p></div>"), "f"), "box")
+    assert_eq(f.x, 0)
+    assert_eq(f.w, 100)
+    assert_eq(f.h, 200)
+    ;; tekst pierwszego wiersza zaczyna się za floatem
+    let mut min_x: int = 100000
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].y < 200 && boxes[i].x < min_x is min_x = boxes[i].x end
+        i += 1
+    end
+    assert_true(min_x >= 100)
+end
+
+#[test]
+fn t03_float_right_and_stack() is
+    let d: dom::Dom = dom::parse("<div id=\"c\"><div id=\"a\" class=\"f\"></div><div id=\"b\" class=\"f\"></div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".f { float: right; width: 60px; height: 20px; } #c { width: 200px; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_eq(a.x, 140)
+    assert_eq(b.x, 80)
+    assert_eq(a.y, b.y)
+end
+
+#[test]
+fn t03_float_wraps_below_when_no_room() is
+    let d: dom::Dom = dom::parse("<div id=\"c\"><div id=\"a\" class=\"f\"></div><div id=\"b\" class=\"f\"></div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".f { float: left; width: 120px; height: 20px; } #c { width: 200px; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_eq(a.x, 0)
+    assert_eq(b.x, 0)
+    assert_eq(b.y, a.y + 20)
+end
+
+#[test]
+fn t03_clear_moves_below_float() is
+    let d: dom::Dom = dom::parse("<div><div id=\"f\" class=\"f\"></div><div id=\"c\" class=\"c\">x</div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".f { float: left; width: 50px; height: 80px; } .c { clear: both; }"), 800, -1)
+    let f: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "f"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    assert_true(c.y >= f.y + 80)
+end
+
+#[test]
+fn t03_overflow_container_contains_float() is
+    let d: dom::Dom = dom::parse("<div id=\"o\" class=\"o\"><div class=\"f\"></div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".o { overflow: hidden; } .f { float: left; width: 50px; height: 80px; }"), 800, -1)
+    let o: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "o"), "box")
+    assert_eq(o.h, 80)
+end
+
+#[test]
+fn t03_plain_container_ignores_float_height() is
+    let d: dom::Dom = dom::parse("<div id=\"o\"><div class=\"f\"></div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".f { float: left; width: 50px; height: 80px; }"), 800, -1)
+    let o: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "o"), "box")
+    assert_eq(o.h, 0)
+end
+
+#[test]
+fn t03_margin_collapse_parent_child() is
+    let d: dom::Dom = dom::parse("<div id=\"p\" class=\"p\"><div id=\"c\" class=\"c\">x</div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".p { margin-top: 10px; margin-bottom: 10px; } .c { margin-top: 30px; margin-bottom: 20px; height: 40px; }"), 800, -1)
+    let p: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "p"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    ;; margines rodzica i dziecka zwijają się do 30px; dziecko przylega do góry rodzica
+    assert_eq(p.y, 30)
+    assert_eq(c.y, 30)
+    assert_eq(p.h, 40)
+end
+
+#[test]
+fn t03_no_collapse_with_padding_or_border() is
+    let d: dom::Dom = dom::parse("<div id=\"p\" class=\"p\"><div id=\"c\" class=\"c\">x</div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".p { margin-top: 10px; padding-top: 1px; } .c { margin-top: 30px; height: 40px; }"), 800, -1)
+    let p: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "p"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    assert_eq(p.y, 10)
+    assert_eq(c.y, 41)
+end
+
+#[test]
+fn t03_aspect_ratio() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { width: 320px; aspect-ratio: 16 / 9; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.w, 320)
+    assert_eq(a.h, 180)
+end
+
+#[test]
+fn t03_letter_spacing_widens_text() is
+    let d: dom::Dom = dom::parse("<p id=\"p\" class=\"p\">abcd</p><p id=\"q\">abcd</p>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".p { letter-spacing: 3px; }"), 800, -1)
+    let p: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "p"), "text")
+    let q: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "q"), "text")
+    assert_eq(p.w - q.w, 12)
+end
+
+#[test]
+fn t03_text_indent_first_line() is
+    let d: dom::Dom = dom::parse("<p id=\"p\" class=\"p\">abc</p>")
+    let a: [layout::LayoutBox] = layout::layout(d, css::parse(".p { text-indent: 25px; margin: 0 }"), 800, -1)
+    let b: [layout::LayoutBox] = layout::layout(d, css::parse(".p { margin: 0 }"), 800, -1)
+    assert_eq(find_box(a, dom::find_by_id(d, "p"), "text").x - find_box(b, dom::find_by_id(d, "p"), "text").x, 25)
+end
+
+#[test]
+fn t03_list_style_types() is
+    let d: dom::Dom = dom::parse("<ol id=\"o\" class=\"o\" start=\"3\"><li id=\"a\">x</li><li id=\"b\">y</li></ol><ul class=\"u\"><li id=\"c\">z</li></ul>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".o { list-style-type: lower-roman; } .u { list-style: square; }"), 800, -1)
+    assert_eq(find_box(boxes, dom::find_by_id(d, "a"), "marker").text, "iii.")
+    assert_eq(find_box(boxes, dom::find_by_id(d, "b"), "marker").text, "iv.")
+    assert_eq(find_box(boxes, dom::find_by_id(d, "c"), "marker").text, "▪")
+end
+
+#[test]
+fn t03_list_style_none_has_no_marker() is
+    let d: dom::Dom = dom::parse("<ul class=\"u\"><li id=\"a\">x</li></ul>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".u { list-style: none; }"), 800, -1)
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "marker" is found = true end
+        i += 1
+    end
+    assert_true(!found)
+end
+
+#[test]
+fn t03_z_index_orders_boxes() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"></div><div id=\"b\" class=\"b\"></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { position: relative; z-index: 5; width: 10px; height: 10px; } .b { position: relative; width: 10px; height: 10px; }"), 800, -1)
+    let ida: int = dom::find_by_id(d, "a")
+    let mut pa: int = -1
+    let mut pb: int = -1
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == ida && boxes[i].kind == "box" is pa = i end
+        if boxes[i].node_id == dom::find_by_id(d, "b") && boxes[i].kind == "box" is pb = i end
+        i += 1
+    end
+    assert_true(pb < pa)
+end
+
+#[test]
+fn t03_negative_z_index_goes_behind() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"></div><div id=\"b\" class=\"b\"></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { position: relative; z-index: 1; width: 10px; height: 10px; } .b { position: relative; z-index: -1; width: 10px; height: 10px; }"), 800, -1)
+    assert_eq(boxes[0].node_id, dom::find_by_id(d, "b"))
+end
+
+#[test]
+fn t03_group_opacity_cascades_to_children() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"><p id=\"p\">hi</p></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { opacity: 0.5; }"), 800, -1)
+    assert_eq(find_box(boxes, dom::find_by_id(d, "p"), "text").st.opacity, 50)
+end
+
+#[test]
+fn t03_filter_changes_colors() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\">x</div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { background: #ff0000; filter: grayscale(100%); width: 10px; height: 10px; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.st.background.r, a.st.background.g)
+    assert_eq(a.st.background.g, a.st.background.b)
+end
+
+#[test]
+fn t03_filter_invert() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { background: #000000; filter: invert(1); width: 10px; height: 10px; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.st.background.r, 255)
+end
+
+#[test]
+fn t03_transform_translate_and_scale() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { width: 100px; height: 50px; margin: 0; transform: translate(10px, 20px) scale(2); transform-origin: left top; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.x, 10)
+    assert_eq(a.y, 20)
+    assert_eq(a.w, 200)
+    assert_eq(a.h, 100)
+end
+
+#[test]
+fn t03_transform_moves_children_and_percent() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"><div id=\"k\" class=\"k\"></div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { width: 100px; height: 50px; margin: 0; transform: translateX(50%); } .k { width: 10px; height: 10px; }"), 800, -1)
+    let k: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "k"), "box")
+    assert_eq(k.x, 50)
+end
+
+#[test]
+fn t03_clip_path_inset() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".a { width: 100px; height: 100px; margin: 0; clip-path: inset(10px 20px); }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_true(a.has_clip)
+    assert_eq(a.cx, 20)
+    assert_eq(a.cy, 10)
+    assert_eq(a.cw, 60)
+    assert_eq(a.ch, 80)
+end
+
+#[test]
+fn t03_sticky_marks_and_clamps() is
+    let d: dom::Dom = dom::parse("<div id=\"w\" class=\"w\"><div id=\"s\" class=\"s\">x</div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".w { height: 400px; margin: 0 } .s { position: sticky; top: 10px; height: 30px; margin: 0 }"), 800, -1)
+    let s: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "s"), "box")
+    assert_true(s.sticky)
+    ;; element na y=0 z top:10px zostaje przesunięty o 10px już przy scroll=0
+    assert_eq(layout::sticky_dy(s, 0), 10)
+    assert_eq(layout::sticky_dy(s, 100), 110)
+    assert_eq(layout::sticky_dy(s, 5000), 370)
+end
+
+#[test]
+fn t03_vertical_align_super() is
+    let d: dom::Dom = dom::parse("<p><span id=\"a\">a</span><sup id=\"s\" class=\"s\">1</sup></p>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".s { vertical-align: super; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "text")
+    let s: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "s"), "text")
+    assert_true(s.y < a.y)
+end
+
+;; ---------- 0.3: tabele ----------
+
+#[test]
+fn t03_table_columns_align_across_rows() is
+    let d: dom::Dom = dom::parse("<table id=\"t\"><tr><td id=\"a\">x</td><td id=\"b\">longer text here</td></tr><tr><td id=\"c\">yyyyyyyyyyyy</td><td id=\"e\">z</td></tr></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 400px; } td { padding: 0; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    let e: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "e"), "box")
+    assert_eq(a.x, c.x)
+    assert_eq(b.x, e.x)
+    assert_eq(a.w, c.w)
+    assert_true(b.x > a.x)
+    assert_true(c.y > a.y)
+    assert_eq(a.w + b.w, 400)
+end
+
+#[test]
+fn t03_table_shrinks_to_content_when_width_auto() is
+    let d: dom::Dom = dom::parse("<table id=\"t\"><tr><td>ab</td><td>cd</td></tr></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("td { padding: 0; }"), 800, -1)
+    let t: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "t"), "box")
+    assert_true(t.w < 200)
+    assert_true(t.w > 10)
+end
+
+#[test]
+fn t03_table_row_height_is_tallest_cell() is
+    let d: dom::Dom = dom::parse("<table><tr><td id=\"a\" class=\"a\">x</td><td id=\"b\" class=\"b\">y</td></tr><tr><td id=\"c\">z</td></tr></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 300px; } td { padding: 0; } .a { height: 20px; } .b { height: 50px; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    assert_eq(a.h, 50)
+    assert_eq(b.h, 50)
+    assert_eq(c.y, a.y + 50)
+end
+
+#[test]
+fn t03_table_colspan() is
+    let d: dom::Dom = dom::parse("<table><tr><td id=\"a\" colspan=\"2\">wide cell</td></tr><tr><td id=\"b\">l</td><td id=\"c\">r</td></tr></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 200px; } td { padding: 0; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    assert_eq(a.w, 200)
+    assert_eq(b.w + c.w, 200)
+    assert_eq(c.x, b.x + b.w)
+end
+
+#[test]
+fn t03_table_rowspan() is
+    let d: dom::Dom = dom::parse("<table><tr><td id=\"a\" rowspan=\"2\">tall</td><td id=\"b\">1</td></tr><tr><td id=\"c\">2</td></tr></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 200px; } td { padding: 0; height: 30px; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    assert_eq(a.h, 60)
+    assert_eq(c.x, b.x)
+    assert_eq(c.y, b.y + 30)
+end
+
+#[test]
+fn t03_table_border_spacing_and_collapse() is
+    let d: dom::Dom = dom::parse("<table id=\"t\"><tr><td id=\"a\">1</td><td id=\"b\">2</td></tr></table>")
+    let spaced: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 200px; border-spacing: 10px; } td { padding: 0; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(spaced, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(spaced, dom::find_by_id(d, "b"), "box")
+    assert_eq(a.x, 10)
+    assert_eq(b.x, a.x + a.w + 10)
+    let flush: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 200px; border-collapse: collapse; } td { padding: 0; }"), 800, -1)
+    let a2: layout::LayoutBox = find_box(flush, dom::find_by_id(d, "a"), "box")
+    let b2: layout::LayoutBox = find_box(flush, dom::find_by_id(d, "b"), "box")
+    assert_eq(a2.x, 0)
+    assert_eq(b2.x, a2.x + a2.w)
+end
+
+#[test]
+fn t03_table_header_group_goes_first() is
+    let d: dom::Dom = dom::parse("<table><tbody><tr><td id=\"body\">b</td></tr></tbody><thead><tr><th id=\"head\">h</th></tr></thead></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 100px; }"), 800, -1)
+    let h: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "head"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "body"), "box")
+    assert_true(h.y < b.y)
+end
+
+#[test]
+fn t03_table_cell_vertical_align_middle() is
+    let d: dom::Dom = dom::parse("<table><tr><td id=\"a\" class=\"a\">x</td><td id=\"b\" class=\"b\">y</td></tr></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 200px; } td { padding: 0; } .a { height: 80px; } .b { vertical-align: middle; }"), 800, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "text")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "text")
+    assert_true(b.y > a.y + 20)
+end
+
+#[test]
+fn t03_table_fixed_layout_equal_columns() is
+    let d: dom::Dom = dom::parse("<table><tr><td id=\"a\">x</td><td id=\"b\">a very very long cell text</td></tr></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 300px; table-layout: fixed; } td { padding: 0; }"), 800, -1)
+    assert_eq(find_box(boxes, dom::find_by_id(d, "a"), "box").w, 150)
+    assert_eq(find_box(boxes, dom::find_by_id(d, "b"), "box").w, 150)
+end
+
+#[test]
+fn t03_table_row_background_box() is
+    let d: dom::Dom = dom::parse("<table><tr id=\"r\" class=\"r\"><td>x</td></tr></table>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("table { width: 100px; } .r { background: #ff0000; }"), 800, -1)
+    let r: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "r"), "box")
+    assert_eq(r.node_id, dom::find_by_id(d, "r"))
+    assert_eq(r.w, 100)
+end
+
+;; ---------- 0.3: grid ----------
+
+#[test]
+fn t03_grid_template_areas() is
+    let d: dom::Dom = dom::parse("<div class=\"g\"><div id=\"m\" class=\"m\">m</div><div id=\"h\" class=\"h\">h</div><div id=\"n\" class=\"n\">n</div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".g { display: grid; grid-template-columns: 100px 200px; grid-template-areas: \"head head\" \"nav main\"; } .h { grid-area: head; height: 20px } .n { grid-area: nav; height: 30px } .m { grid-area: main; height: 30px }"), 600, -1)
+    let h: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "h"), "box")
+    let n: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "n"), "box")
+    let m: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "m"), "box")
+    assert_eq(h.x, 0)
+    assert_eq(h.w, 300)
+    assert_eq(n.x, 0)
+    assert_eq(n.y, 20)
+    assert_eq(m.x, 100)
+    assert_eq(m.y, 20)
+    assert_eq(m.w, 200)
+end
+
+#[test]
+fn t03_grid_explicit_lines_and_spans() is
+    let d: dom::Dom = dom::parse("<div class=\"g\"><div id=\"a\" class=\"a\">a</div><div id=\"b\">b</div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".g { display: grid; grid-template-columns: 50px 50px 50px; } .g div { height: 10px } .a { grid-column: 2 / span 2; grid-row: 2 }"), 600, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_eq(a.x, 50)
+    assert_eq(a.w, 100)
+    assert_eq(a.y, 10)
+    assert_eq(b.x, 0)
+    assert_eq(b.y, 0)
+end
+
+#[test]
+fn t03_grid_row_span() is
+    let d: dom::Dom = dom::parse("<div class=\"g\"><div id=\"a\" class=\"a\">a</div><div id=\"b\">b</div><div id=\"c\">c</div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".g { display: grid; grid-template-columns: 50px 50px; } #b, #c { height: 20px } .a { grid-row: span 2 }"), 600, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    assert_eq(a.h, 40)
+    assert_eq(b.x, 50)
+    assert_eq(b.y, 0)
+    assert_eq(c.x, 50)
+    assert_eq(c.y, 20)
+end
+
+#[test]
+fn t03_grid_auto_rows_and_dense() is
+    let d: dom::Dom = dom::parse("<div class=\"g\"><div id=\"a\" class=\"a\">a</div><div id=\"b\" class=\"b\">b</div><div id=\"c\">c</div></div>")
+    let sparse: [layout::LayoutBox] = layout::layout(d, css::parse(".g { display: grid; grid-template-columns: 50px 50px; grid-auto-rows: 30px; } .a { grid-column: span 1 } .b { grid-column: 1 / span 2 }"), 600, -1)
+    assert_eq(find_box(sparse, dom::find_by_id(d, "b"), "box").y, 30)
+    assert_eq(find_box(sparse, dom::find_by_id(d, "c"), "box").y, 60)
+    let dense: [layout::LayoutBox] = layout::layout(d, css::parse(".g { display: grid; grid-template-columns: 50px 50px; grid-auto-rows: 30px; grid-auto-flow: row dense; } .b { grid-column: 1 / span 2 }"), 600, -1)
+    assert_eq(find_box(dense, dom::find_by_id(d, "c"), "box").y, 0)
+    assert_eq(find_box(dense, dom::find_by_id(d, "c"), "box").x, 50)
+end
+
+#[test]
+fn t03_grid_justify_items_center() is
+    let d: dom::Dom = dom::parse("<div class=\"g\"><div id=\"a\" class=\"a\">ab</div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".g { display: grid; grid-template-columns: 200px; justify-items: center; } .a { height: 10px }"), 600, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_true(a.w < 200)
+    assert_eq(a.x, (200 - a.w) / 2)
+end
+
+#[test]
+fn t03_flex_align_content() is
+    let d: dom::Dom = dom::parse("<div class=\"f\"><div id=\"a\" class=\"i\">a</div><div id=\"b\" class=\"i\">b</div></div>")
+    let base: string = ".f { display: flex; flex-wrap: wrap; width: 100px; height: 200px; } .i { width: 100px; height: 20px; }"
+    let plain: [layout::LayoutBox] = layout::layout(d, css::parse(base), 600, -1)
+    let ctr: [layout::LayoutBox] = layout::layout(d, css::parse(base + " .f { align-content: center; }"), 600, -1)
+    let btw: [layout::LayoutBox] = layout::layout(d, css::parse(base + " .f { align-content: space-between; }"), 600, -1)
+    let fin: [layout::LayoutBox] = layout::layout(d, css::parse(base + " .f { align-content: flex-end; }"), 600, -1)
+    let ida: int = dom::find_by_id(d, "a")
+    let idb: int = dom::find_by_id(d, "b")
+    assert_eq(find_box(plain, ida, "box").y, 0)
+    assert_eq(find_box(ctr, ida, "box").y, 80)
+    assert_eq(find_box(ctr, idb, "box").y, 100)
+    assert_eq(find_box(btw, ida, "box").y, 0)
+    assert_eq(find_box(btw, idb, "box").y, 180)
+    assert_eq(find_box(fin, idb, "box").y, 180)
+end
+
+;; ---------- 0.3: ::before / ::after, counter(), attr() ----------
+
+fn texts_of(boxes: [layout::LayoutBox], id: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "text" is out = out + boxes[i].text end
+        i += 1
+    end
+    return out
+end
+
+#[test]
+fn t03_before_after_generate_text() is
+    let d: dom::Dom = dom::parse("<p id=\"p\" class=\"q\">hello</p>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".q::before { content: \"[\"; } .q::after { content: \"]\"; }"), 800, -1)
+    let t: string = texts_of(boxes, dom::find_by_id(d, "p"))
+    assert_true(string_find(t, "[") >= 0)
+    assert_true(string_find(t, "]") > string_find(t, "hello"))
+    assert_true(string_find(t, "[") < string_find(t, "hello"))
+end
+
+#[test]
+fn t03_content_attr_and_escape() is
+    let d: dom::Dom = dom::parse("<a id=\"a\" class=\"l\" href=\"/x\" data-n=\"7\">go</a>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".l::after { content: \" (\" attr(data-n) \") \\2022\"; }"), 800, -1)
+    let t: string = texts_of(boxes, dom::find_by_id(d, "a"))
+    assert_true(string_find(t, "(7)") >= 0)
+    assert_true(string_find(t, "•") >= 0)
+end
+
+#[test]
+fn t03_counters_number_items() is
+    let d: dom::Dom = dom::parse("<div id=\"w\" class=\"w\"><p id=\"a\" class=\"i\">x</p><p id=\"b\" class=\"i\">y</p><p id=\"c\" class=\"i\">z</p></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".w { counter-reset: item; } .i::before { counter-increment: item; content: counter(item) \". \"; }"), 800, -1)
+    assert_true(string_find(texts_of(boxes, dom::find_by_id(d, "a")), "1.") >= 0)
+    assert_true(string_find(texts_of(boxes, dom::find_by_id(d, "b")), "2.") >= 0)
+    assert_true(string_find(texts_of(boxes, dom::find_by_id(d, "c")), "3.") >= 0)
+end
+
+#[test]
+fn t03_counter_styles_and_nesting() is
+    let d: dom::Dom = dom::parse("<div class=\"w\"><p id=\"a\" class=\"i\">x</p><p id=\"b\" class=\"i\">y</p></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".w { counter-reset: n 4; } .i::before { counter-increment: n; content: counter(n, upper-roman) \")\"; }"), 800, -1)
+    assert_true(string_find(texts_of(boxes, dom::find_by_id(d, "a")), "V)") >= 0)
+    assert_true(string_find(texts_of(boxes, dom::find_by_id(d, "b")), "VI)") >= 0)
+end
+
+#[test]
+fn t03_counters_function_nested_scopes() is
+    let d: dom::Dom = dom::parse("<div class=\"s\"><div class=\"s\"><p id=\"p\" class=\"h\">t</p></div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".s { counter-reset: sec; } .h::before { counter-increment: sec; content: counters(sec, \".\") \" \"; }"), 800, -1)
+    let t: string = texts_of(boxes, dom::find_by_id(d, "p"))
+    assert_true(string_find(t, "0.1") >= 0)
+end
+
+#[test]
+fn t03_no_content_no_node() is
+    let d: dom::Dom = dom::parse("<p id=\"p\" class=\"q\">hello</p>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".q::before { color: red; } .q::after { content: none; }"), 800, -1)
+    assert_eq(texts_of(boxes, dom::find_by_id(d, "p")), "hello")
+end
+
+#[test]
+fn t03_pseudo_boxes_map_to_host() is
+    let d: dom::Dom = dom::parse("<p id=\"p\" class=\"q\">a</p>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".q::before { content: \"x\"; display: block; background: red; }"), 800, -1)
+    let mut i: int = 0
+    let mut max_id: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id > max_id is max_id = boxes[i].node_id end
+        i += 1
+    end
+    assert_true(max_id < array_len(d.nodes))
+end
+
+#[test]
+fn t03_clearfix_after_contains_float() is
+    let d: dom::Dom = dom::parse("<div id=\"w\" class=\"w\"><div class=\"f\"></div></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".w::after { content: \"\"; display: block; clear: both; } .f { float: left; width: 30px; height: 70px; }"), 800, -1)
+    let w: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "w"), "box")
+    assert_eq(w.h, 70)
+end
+
+;; ---------- 0.3: animacje i przejścia ----------
+
+#[test]
+fn t03_easing_functions() is
+    assert_eq(anim::ease_apply("linear", 500), 500)
+    assert_eq(anim::ease_apply("ease", 0), 0)
+    assert_eq(anim::ease_apply("ease", 1000), 1000)
+    assert_true(anim::ease_apply("ease-in", 500) < 500)
+    assert_true(anim::ease_apply("ease-out", 500) > 500)
+    assert_eq(anim::ease_apply("step-end", 999), 0)
+    assert_eq(anim::ease_apply("step-start", 1), 1000)
+    assert_eq(anim::ease_apply("steps(4)", 500), 500)
+    assert_eq(anim::ease_apply("steps(4)", 260), 250)
+    let cb: int = anim::ease_apply("cubic-bezier(0, 0, 1, 1)", 400)
+    assert_true(cb >= 395 && cb <= 405)
+end
+
+#[test]
+fn t03_anim_progress_iterations_and_direction() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { animation: k 1s linear 500ms 2 alternate both; }", 1)
+    assert_eq(anim::anim_progress(st, 0), 0)
+    assert_eq(anim::anim_progress(st, 1000), 500)
+    assert_eq(anim::anim_progress(st, 1500), 1000)
+    assert_eq(anim::anim_progress(st, 2000), 500)
+    assert_eq(anim::anim_progress(st, 2500), 0)
+    assert_eq(anim::anim_progress(st, 9000), 0)
+end
+
+#[test]
+fn t03_anim_progress_no_fill_and_infinite() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { animation: k 1s linear 200ms; }", 1)
+    assert_eq(anim::anim_progress(st, 0), -1)
+    assert_eq(anim::anim_progress(st, 700), 500)
+    assert_eq(anim::anim_progress(st, 5000), -1)
+    let inf: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { animation: k 1s linear infinite; }", 1)
+    assert_eq(anim::anim_progress(inf, 3250), 250)
+    assert_true(anim::anim_running(inf, 999999))
+    assert_true(!anim::anim_running(st, 5000))
+end
+
+#[test]
+fn t03_keyframes_sampling_changes_style() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\">x</div>")
+    let sheet: css::Stylesheet = css::parse("@keyframes grow { from { width: 100px; opacity: 0 } to { width: 300px; opacity: 1 } } .a { width: 100px; animation: grow 1s linear both; }")
+    let base: style::ComputedStyle = style::resolve_ctx(sheet, d, 1, style::root_style(), css::no_interaction())
+    let kf: int = css::find_keyframes(sheet, "grow")
+    let mid: style::ComputedStyle = anim::keyframe_style(sheet, kf, base, style::root_style(), 500)
+    assert_eq(mid.width, 200)
+    assert_eq(mid.opacity, 50)
+    let end_st: style::ComputedStyle = anim::keyframe_style(sheet, kf, base, style::root_style(), 1000)
+    assert_eq(end_st.width, 300)
+end
+
+#[test]
+fn t03_keyframes_percent_stops_and_missing_ends() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\">x</div>")
+    let sheet: css::Stylesheet = css::parse("@keyframes k { 50% { padding-left: 40px } } .a { padding-left: 0px; animation: k 1s linear; }")
+    let base: style::ComputedStyle = style::resolve_ctx(sheet, d, 1, style::root_style(), css::no_interaction())
+    let kf: int = css::find_keyframes(sheet, "k")
+    assert_eq(anim::keyframe_style(sheet, kf, base, style::root_style(), 250).pad_left, 20)
+    assert_eq(anim::keyframe_style(sheet, kf, base, style::root_style(), 500).pad_left, 40)
+    assert_eq(anim::keyframe_style(sheet, kf, base, style::root_style(), 750).pad_left, 20)
+end
+
+#[test]
+fn t03_keyframes_drive_layout() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"></div>")
+    let sheet: css::Stylesheet = css::parse("@keyframes slide { from { transform: translateX(0px); } to { transform: translateX(100px); } } .a { width: 50px; height: 10px; margin: 0; animation: slide 1s linear both; }")
+    let mut act: anim::AnimCtx = anim::no_anim()
+    act.now = 500
+    act.starts = [dom::find_by_id(d, "a"), 0]
+    let res: layout::LayoutResult = layout::layout_full_a(d, sheet, 800, 600, -1, css::no_interaction(), [], act)
+    assert_eq(find_box(res.boxes, dom::find_by_id(d, "a"), "box").x, 50)
+    let still: layout::LayoutResult = layout::layout_full(d, sheet, 800, 600, -1, css::no_interaction(), [])
+    assert_eq(find_box(still.boxes, dom::find_by_id(d, "a"), "box").x, 0)
+end
+
+#[test]
+fn t03_transition_geometry_interpolates() is
+    let d: dom::Dom = dom::parse("<div id=\"a\" class=\"a\"></div>")
+    let sheet: css::Stylesheet = css::parse(".a { width: 200px; height: 10px; margin: 0; transition: width 1s linear; }")
+    let id: int = dom::find_by_id(d, "a")
+    let target: style::ComputedStyle = style::resolve_ctx(sheet, d, id, style::root_style(), css::no_interaction())
+    let mut from: style::ComputedStyle = target
+    from.width = 100
+    assert_true(anim::geometry_differs(from, target))
+    assert_true(anim::trans_covers_geometry(target))
+    let mut act: anim::AnimCtx = anim::no_anim()
+    act.now = 250
+    act.t_ids = [id]
+    act.t_from = [from]
+    act.t_start = [0]
+    act.t_dur = [1000]
+    act.t_delay = [0]
+    act.t_ease = ["linear"]
+    let res: layout::LayoutResult = layout::layout_full_a(d, sheet, 800, 600, -1, css::no_interaction(), [], act)
+    assert_eq(find_box(res.boxes, id, "box").w, 125)
+    act.now = 1500
+    let done: layout::LayoutResult = layout::layout_full_a(d, sheet, 800, 600, -1, css::no_interaction(), [], act)
+    assert_eq(find_box(done.boxes, id, "box").w, 200)
+end
+
+#[test]
+fn t03_trans_covers_property_lists() is
+    let a: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transition: color 1s, transform 1s; }", 1)
+    assert_true(anim::trans_covers_geometry(a))
+    let b: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transition: color 1s, background 1s; }", 1)
+    assert_true(!anim::trans_covers_geometry(b))
+end
+
+;; ---------- 0.3: czcionki ----------
+
+#[test]
+fn t03_family_key() is
+    assert_eq(style::family_key("sans-serif"), 0)
+    assert_eq(style::family_key("system-ui, sans-serif"), 0)
+    let a: int = style::family_key("\"Fira Sans\", sans-serif")
+    assert_true(a > 0)
+    assert_eq(a, style::family_key("fira sans"))
+    assert_true(a != style::family_key("Roboto"))
+    assert_true(a <= 32750)
+end
+
+#[test]
+fn t03_font_key_in_style_and_inherited() is
+    let d: dom::Dom = dom::parse("<div class=\"a\"><span>x</span></div>")
+    let sheet: css::Stylesheet = css::parse(".a { font-family: 'Inter', sans-serif; }")
+    let a: style::ComputedStyle = style::resolve_ctx(sheet, d, 1, style::root_style(), css::no_interaction())
+    let sp: style::ComputedStyle = style::resolve_ctx(sheet, d, 2, a, css::no_interaction())
+    assert_eq(a.font_key, style::family_key("inter"))
+    assert_eq(sp.font_key, a.font_key)
+    let un: style::ComputedStyle = st_for("<p class=\"x\">y</p>", ".x { font-family: monospace; }", 1)
+    assert_eq(un.font_key, 0)
+end
+
+
+;; ---------- 0.3: netutil ----------
+#[test]
+fn t03_curl_output_parsing() is
+    let raw: string = "HTTP/1.1 301 Moved\r\nLocation: /x\r\n\r\nHTTP/2 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n{\"ok\":true}"
+    let r: string = netutil::parse_curl_output(raw)
+    assert_eq(jsonlite::get_int(r, "status"), 200)
+    assert_eq(jsonlite::get_bool(r, "ok"), true)
+    assert_eq(jsonlite::get_str(r, "body"), "{\"ok\":true}")
+    assert_eq(jsonlite::get_str(r, "statusText"), "OK")
+    let h: string = jsonlite::get_raw(r, "headers")
+    assert_eq(jsonlite::get_str(h, "content-type"), "application/json")
+    assert_eq(jsonlite::get_str(h, "set-cookie"), "a=1, b=2")
+    let e: string = netutil::parse_curl_output("HTTP/1.1 404 Not Found\r\nX-A: b\r\n\r\nbrak")
+    assert_eq(jsonlite::get_int(e, "status"), 404)
+    assert_eq(jsonlite::get_bool(e, "ok"), false)
+end
+
+#[test]
+fn t03_css_alpha_scheme_mime() is
+    assert_eq(netutil::css_alpha(255), "1")
+    assert_eq(netutil::css_alpha(0), "0")
+    assert_eq(netutil::css_alpha(128), "0.501")
+    assert_true(netutil::has_scheme("https://a.b"))
+    assert_true(netutil::has_scheme("file:///x"))
+    assert_true(!netutil::has_scheme("data/x.json"))
+    assert_true(!netutil::has_scheme("./a://b"))
+    assert_eq(netutil::local_mime("a/b.JSON"), "application/json")
+    assert_eq(netutil::local_mime("x.mjs"), "application/javascript")
+end
+
+#[test]
+fn t03_literal_braces_are_not_interpolated() is
+    ;; w H# zrównoważone {…} w literale to interpolacja; dosłowne klamry wymagają {{ i }}
+    assert_eq(jsonlite::object(), "{{}}")
+    assert_eq(string_len(jsonlite::object()), 2)
+    assert_eq(string_len("{}"), 0)
+    assert_eq(jsonlite::set_str(jsonlite::object(), "a", "b"), "{{\"a\":\"b\"}}")
+    assert_eq(jsonlite::remove_key(jsonlite::set_str(jsonlite::object(), "a", "b"), "a"), "{{}}")
+end
+
+;; ---------- 0.3: rejestr wszystkich właściwości (props.h#) ----------
+#[test]
+fn t03p_registry_covers_all_properties() is
+    assert_true(props::coverage() >= 470)
+    assert_true(props::known("column-count"))
+    assert_true(props::known("scroll-snap-type"))
+    assert_true(props::known("anchor-name"))
+    assert_true(props::known("--custom"))
+    assert_true(!props::known("not-a-property"))
+    assert_true(props::inherited("text-wrap"))
+    assert_true(!props::inherited("column-count"))
+    assert_eq(props::initial("isolation"), "auto")
+end
+
+#[test]
+fn t03p_value_validation() is
+    assert_true(props::valid("column-count", "3"))
+    assert_true(props::valid("column-count", "auto"))
+    assert_true(!props::valid("column-count", "banana"))
+    assert_true(props::valid("scroll-snap-type", "x mandatory"))
+    assert_true(!props::valid("scroll-snap-type", "diagonal"))
+    assert_true(props::valid("caret-color", "#ff0000"))
+    assert_true(props::valid("caret-color", "auto"))
+    assert_true(!props::valid("caret-color", "12px"))
+    assert_true(props::valid("scroll-margin", "4px 8px"))
+    assert_true(props::valid("column-width", "calc(10px + 2em)"))
+    assert_true(props::valid("mix-blend-mode", "multiply"))
+    assert_true(!props::valid("mix-blend-mode", "wobble"))
+    assert_true(props::valid("text-underline-offset", "0.2em"))
+    assert_true(props::valid("zoom", "150%"))
+    assert_true(props::valid("column-gap", "normal"))
+    assert_true(props::valid("column-count", "inherit"))
+end
+
+#[test]
+fn t03p_generic_storage_and_ignore_invalid() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { column-count: 3; text-wrap: balance; scroll-snap-type: x mandatory; mix-blend-mode: nonsense; }", 1)
+    assert_eq(props::xget(st.xp, "column-count"), "3")
+    assert_eq(props::xget(st.xp, "text-wrap"), "balance")
+    assert_eq(props::xget(st.xp, "scroll-snap-type"), "x mandatory")
+    assert_true(!props::xhas(st.xp, "mix-blend-mode"))
+    assert_eq(props::xval(st.xp, "mix-blend-mode"), "normal")
+end
+
+#[test]
+fn t03p_inheritance_of_generic_props() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"p\"><div class=\"c\">x</div></div>", ".p { text-wrap: balance; column-count: 2; }", 400)
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == 2 && boxes[i].kind == "box" is
+            found = true
+            assert_eq(props::xget(boxes[i].st.xp, "text-wrap"), "balance")
+            assert_true(!props::xhas(boxes[i].st.xp, "column-count"))
+        end
+        i += 1
+    end
+    assert_true(found)
+end
+
+#[test]
+fn t03p_css_wide_keywords_on_generic_props() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { column-count: 3; column-count: initial; text-wrap: nowrap; }", 1)
+    assert_true(!props::xhas(st.xp, "column-count"))
+    assert_eq(props::xget(st.xp, "text-wrap"), "nowrap")
+end
+
+#[test]
+fn t03p_supports_uses_registry() is
+    assert_true(css::supports_matches("(column-count: 2)"))
+    assert_true(css::supports_matches("(scroll-snap-type: x mandatory)"))
+    assert_true(!css::supports_matches("(column-count: banana)"))
+    assert_true(!css::supports_matches("(frobnicate: 1)"))
+    assert_true(css::supports_matches("(display: grid) and (gap: 4px)"))
+    assert_true(css::supports_matches("not (frobnicate: 1)"))
+end
+
+;; ---------- 0.3: właściwości logiczne i krawędzie ----------
+#[test]
+fn t03l_border_logical_longhands() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { border-inline-width: 3px 5px; border-block-style: dashed dotted; border-inline-start-color: red; border-block-end-width: 7px; }", 1)
+    assert_eq(st.bl, 3)
+    assert_eq(st.br, 5)
+    assert_eq(st.bb, 7)
+    assert_eq(st.border_style, "dashed")
+    assert_eq(st.bs_b, "dotted")
+    assert_eq(st.bcl.r, 255)
+end
+
+#[test]
+fn t03l_logical_rtl_swaps_inline_axis() is
+    let ltr: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { margin-inline-start: 11px; padding-inline-end: 6px; border-start-start-radius: 9px; }", 1)
+    assert_eq(ltr.mar_left, 11)
+    assert_eq(ltr.pad_right, 6)
+    assert_eq(ltr.rad_tl, 9)
+    let rtl: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { direction: rtl; margin-inline-start: 11px; padding-inline-end: 6px; border-start-start-radius: 9px; }", 1)
+    assert_eq(rtl.mar_right, 11)
+    assert_eq(rtl.pad_left, 6)
+    assert_eq(rtl.rad_tr, 9)
+end
+
+#[test]
+fn t03l_per_edge_border_style_longhands() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { border: 2px solid red; border-left-style: dashed; border-top-style: dotted; border-bottom-style: double; }", 1)
+    assert_eq(st.border_style, "dotted")
+    assert_eq(st.bs_l, "dashed")
+    assert_eq(st.bs_b, "double")
+    assert_eq(st.bs_r, "solid")
+end
+
+#[test]
+fn t03l_scroll_margin_logical_maps_to_physical() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { scroll-margin-inline: 4px 8px; scroll-padding-block-start: 12px; }", 1)
+    assert_eq(props::xget(st.xp, "scroll-margin-left"), "4px")
+    assert_eq(props::xget(st.xp, "scroll-margin-right"), "8px")
+    assert_eq(props::xget(st.xp, "scroll-padding-top"), "12px")
+end
+
+;; ---------- 0.3: display: contents ----------
+fn has_box(boxes: [layout::LayoutBox], id: int) -> bool is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is return true end
+        i += 1
+    end
+    return false
+end
+
+#[test]
+fn t03c_display_contents_promotes_children() is
+    let css_t: string = ".p { display: flex; width: 200px; } .c { display: contents; color: rgb(255, 0, 0); } .x, .y { width: 50px; height: 10px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"p\"><div class=\"c\"><div class=\"x\">a</div><div class=\"y\">b</div></div></div>", css_t, 400)
+    assert_true(!has_box(boxes, 2))
+    assert_true(has_box(boxes, 3))
+    assert_true(has_box(boxes, 5))
+    let x: layout::LayoutBox = find_box(boxes, 3, "box")
+    let y: layout::LayoutBox = find_box(boxes, 5, "box")
+    assert_eq(y.x - x.x, 50)
+    assert_eq(y.y, x.y)
+    assert_eq(x.st.color.r, 255)
+end
+
+#[test]
+fn t03c_display_contents_replaced_acts_as_none() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"p\"><img class=\"i\" src=\"a.png\"><div class=\"z\">q</div></div>", ".i { display: contents; width: 40px; height: 40px; } .z { height: 10px; }", 300)
+    assert_true(!has_box(boxes, 2))
+    assert_true(has_box(boxes, 3))
+end
+
+#[test]
+fn t03c_display_contents_nested_and_wrapper_without_it() is
+    let with_c: [layout::LayoutBox] = lay("<div class=\"p\"><div class=\"c\"><div class=\"c\"><div class=\"x\">a</div></div></div></div>", ".p { padding: 10px; } .c { display: contents; padding: 50px; border: 5px solid red; } .x { height: 12px; }", 300)
+    let x: layout::LayoutBox = find_box(with_c, 4, "box")
+    assert_eq(x.x, 10)
+    assert_eq(x.y, 10)
+end
+
+;; ---------- 0.3: zagnieżdżanie CSS ----------
+fn rule_sels(sheet: css::Stylesheet) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(sheet.rules) is
+        out = out + "[" + sheet.rules[i].selector + "]"
+        i += 1
+    end
+    return out
+end
+
+#[test]
+fn t03n_nesting_ampersand_and_descendant() is
+    let sheet: css::Stylesheet = css::parse(".card { color: red; &:hover { color: blue; } .title { font-weight: bold; } & > p { margin: 0; } }")
+    assert_eq(rule_sels(sheet), "[.card][.card:hover][.card .title][.card > p]")
+    assert_eq(sheet.rules[0].decls[0].prop, "color")
+    assert_eq(array_len(sheet.rules[0].decls), 1)
+    assert_eq(sheet.rules[1].decls[0].val, "blue")
+end
+
+#[test]
+fn t03n_nesting_lists_and_deep() is
+    let sheet: css::Stylesheet = css::parse(".a, .b { x-y: 1; .c, .d { color: red; &.e { color: blue; } } }")
+    assert_eq(rule_sels(sheet), "[.a][.b][.a .c][.a .d][.b .c][.b .d][.a .c.e][.a .d.e][.b .c.e][.b .d.e]")
+end
+
+#[test]
+fn t03n_nesting_with_at_media_and_cascade() is
+    let sheet: css::Stylesheet = css::parse(".box { width: 100px; @media (min-width: 500px) { width: 300px; } }")
+    assert_eq(array_len(sheet.rules), 2)
+    assert_eq(sheet.rules[1].selector, ".box")
+    assert_true(sheet.rules[1].media != "")
+    let mut nix: css::InteractionState = css::no_interaction()
+    nix.viewport_w = 400
+    let narrow: style::ComputedStyle = style::resolve_ctx(sheet, dom::parse("<div class=\"box\">x</div>"), 1, style::root_style(), nix)
+    assert_eq(narrow.width, 100)
+    let mut ix: css::InteractionState = css::no_interaction()
+    ix.viewport_w = 800
+    let wide: style::ComputedStyle = style::resolve_ctx(sheet, dom::parse("<div class=\"box\">x</div>"), 1, style::root_style(), ix)
+    assert_eq(wide.width, 300)
+end
+
+#[test]
+fn t03n_nesting_actually_styles_elements() is
+    let st: style::ComputedStyle = st_for("<div class=\"card\"><p class=\"title\">x</p></div>", ".card { .title { color: rgb(0, 128, 0); padding: 7px; } }", 2)
+    assert_eq(st.color.g, 128)
+    assert_eq(st.pad_top, 7)
+end
+
+#[test]
+fn t03n_declarations_after_nested_and_urls_survive() is
+    let sheet: css::Stylesheet = css::parse(".a { background: url(data:image/png;base64,AAA); & .b { color: red; } padding: 3px; }")
+    assert_eq(array_len(sheet.rules), 2)
+    assert_eq(array_len(sheet.rules[0].decls), 2)
+    assert_eq(sheet.rules[0].decls[1].prop, "padding")
+end
+
+;; ---------- 0.3: @container ----------
+fn lay_full(html: string, css_text: string, vw: int) -> [layout::LayoutBox] is
+    return layout::layout_full(dom::parse(html), css::parse(css_text), vw, 600, -1, css::no_interaction(), []).boxes
+end
+
+#[test]
+fn t03q_container_query_matches_container_width() is
+    let css_t: string = ".wrap { container-type: inline-size; width: 300px; } .item { width: 10px; height: 10px; } @container (min-width: 400px) { .item { width: 99px; } } @container (max-width: 350px) { .item { height: 33px; } }"
+    let boxes: [layout::LayoutBox] = lay_full("<div class=\"wrap\"><div class=\"item\">x</div></div>", css_t, 800)
+    let it: layout::LayoutBox = find_box(boxes, 2, "box")
+    assert_eq(it.w, 10)
+    assert_eq(it.h, 33)
+end
+
+#[test]
+fn t03q_container_query_wide_container_and_names() is
+    let css_t: string = ".wrap { container: side / inline-size; width: 500px; } .item { width: 10px; height: 10px; } @container side (min-width: 400px) { .item { width: 77px; } } @container other (min-width: 400px) { .item { height: 55px; } }"
+    let boxes: [layout::LayoutBox] = lay_full("<div class=\"wrap\"><div class=\"item\">x</div></div>", css_t, 800)
+    let it: layout::LayoutBox = find_box(boxes, 2, "box")
+    assert_eq(it.w, 77)
+    assert_eq(it.h, 10)
+end
+
+#[test]
+fn t03q_container_query_without_container_is_false() is
+    let boxes: [layout::LayoutBox] = lay_full("<div class=\"item\">x</div>", ".item { width: 10px; height: 10px; } @container (min-width: 1px) { .item { width: 50px; } }", 800)
+    assert_eq(find_box(boxes, 1, "box").w, 10)
+end
+
+#[test]
+fn t03q_container_shorthand_parsed() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { container: card / size; }", 1)
+    assert_eq(props::xget(st.xp, "container-type"), "size")
+    assert_eq(props::xget(st.xp, "container-name"), "card")
+end
+
+;; ---------- 0.3: układ wielokolumnowy ----------
+fn lines_html(n: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        out = out + "<div class=\"l\">x</div>"
+        i += 1
+    end
+    return out
+end
+
+fn count_in_col(boxes: [layout::LayoutBox], x_lo: int, x_hi: int) -> int is
+    let mut c: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "box" && boxes[i].node_id >= 2 && boxes[i].x >= x_lo && boxes[i].x < x_hi is c += 1 end
+        i += 1
+    end
+    return c
+end
+
+#[test]
+fn t03m_column_count_balances_blocks() is
+    let css_t: string = ".c { column-count: 3; column-gap: 10px; width: 320px; } .l { height: 22px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"c\">" + lines_html(6) + "</div>", css_t, 400)
+    ;; kolumna = (320 - 2*10)/3 = 100 px; 6 bloków po 22px → 2 w kolumnie
+    assert_eq(find_box(boxes, 1, "box").h, 44)
+    assert_eq(count_in_col(boxes, 0, 100), 2)
+    assert_eq(count_in_col(boxes, 110, 210), 2)
+    assert_eq(count_in_col(boxes, 220, 320), 2)
+    assert_eq(find_box(boxes, 2, "box").w, 100)
+end
+
+#[test]
+fn t03m_column_width_chooses_count() is
+    let css_t: string = ".c { column-width: 100px; column-gap: 20px; width: 340px; } .l { height: 22px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"c\">" + lines_html(6) + "</div>", css_t, 400)
+    ;; (340+20)/(100+20) = 3 kolumny
+    assert_eq(count_in_col(boxes, 0, 110), 2)
+    assert_eq(count_in_col(boxes, 240, 340), 2)
+end
+
+#[test]
+fn t03m_columns_shorthand_and_rule() is
+    let css_t: string = ".c { columns: 2; column-gap: 20px; column-rule: 4px solid rgb(255, 0, 0); width: 220px; } .l { height: 22px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"c\">" + lines_html(4) + "</div>", css_t, 400)
+    let mut rules: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "box" && boxes[i].node_id == 1 && boxes[i].w == 4 && boxes[i].st.background.r == 255 is
+            rules += 1
+            assert_eq(boxes[i].x, 108)
+            assert_eq(boxes[i].h, 44)
+        end
+        i += 1
+    end
+    assert_eq(rules, 1)
+end
+
+#[test]
+fn t03m_no_columns_by_default() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"c\">" + lines_html(3) + "</div>", ".c { width: 300px; } .l { height: 10px; }", 400)
+    assert_eq(find_box(boxes, 1, "box").h, 30)
+end
+
+#[test]
+fn t03m_box_splits_across_columns_with_slice() is
+    let css_t: string = ".c { column-count: 2; column-gap: 0px; width: 200px; } .tall { height: 80px; border: 2px solid red; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"c\"><div class=\"tall\"></div></div>", css_t, 400)
+    let mut pieces: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "box" && boxes[i].node_id == 2 is pieces += 1 end
+        i += 1
+    end
+    assert_eq(pieces, 2)
+end
+
+;; ---------- 0.3: wyrównanie tekstu, kierunek, justify, text-wrap ----------
+fn first_text_x(boxes: [layout::LayoutBox]) -> int is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is return boxes[i].x end
+        i += 1
+    end
+    return -1
+end
+
+fn last_text_end(boxes: [layout::LayoutBox]) -> int is
+    let mut best: int = -1
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].x + boxes[i].w > best is best = boxes[i].x + boxes[i].w end
+        i += 1
+    end
+    return best
+end
+
+#[test]
+fn t03a_text_align_start_end_follow_direction() is
+    let ltr: [layout::LayoutBox] = lay("<div class=\"a\">ab</div>", ".a { width: 200px; text-align: end; }", 400)
+    assert_eq(last_text_end(ltr), 200)
+    let rtl: [layout::LayoutBox] = lay("<div class=\"a\">ab</div>", ".a { width: 200px; direction: rtl; }", 400)
+    assert_eq(last_text_end(rtl), 200)
+    let rtl_end: [layout::LayoutBox] = lay("<div class=\"a\">ab</div>", ".a { width: 200px; direction: rtl; text-align: end; }", 400)
+    assert_eq(first_text_x(rtl_end), 0)
+end
+
+#[test]
+fn t03a_rtl_reverses_word_order_in_line() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">aa bb</div>", ".a { width: 300px; direction: rtl; }", 400)
+    let mut xa: int = -1
+    let mut xb: int = -1
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is
+            if string_starts_with(boxes[i].text, "aa") is xa = boxes[i].x end
+            if string_starts_with(boxes[i].text, "bb") is xb = boxes[i].x end
+        end
+        i += 1
+    end
+    ;; w RTL pierwsze słowo jest z prawej strony
+    assert_true(xa > xb)
+end
+
+#[test]
+fn t03a_justify_fills_inner_width_except_last_line() is
+    let css_t: string = ".a { width: 100px; text-align: justify; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">aa bb cc dd ee ff gg hh</div>", css_t, 400)
+    let mut right_edges: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].x + boxes[i].w == 100 is right_edges += 1 end
+        i += 1
+    end
+    assert_true(right_edges >= 1)
+    let last: [layout::LayoutBox] = lay("<div class=\"a\">aa bb</div>", css_t, 400)
+    assert_true(last_text_end(last) < 100)
+end
+
+#[test]
+fn t03a_text_align_last_center() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">ab</div>", ".a { width: 200px; text-align: justify; text-align-last: center; }", 400)
+    assert_true(first_text_x(boxes) > 50)
+end
+
+#[test]
+fn t03a_text_wrap_nowrap_and_white_space_collapse() is
+    let wrapped: [layout::LayoutBox] = lay("<div class=\"a\">aaaa bbbb cccc dddd</div>", ".a { width: 60px; }", 400)
+    let nowrap: [layout::LayoutBox] = lay("<div class=\"a\">aaaa bbbb cccc dddd</div>", ".a { width: 60px; text-wrap: nowrap; }", 400)
+    assert_true(find_box(wrapped, 1, "box").h > find_box(nowrap, 1, "box").h)
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { white-space-collapse: preserve; }", 1)
+    assert_eq(st.white_space, "pre-wrap")
+    let st2: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { white-space-collapse: preserve-breaks; }", 1)
+    assert_eq(st2.white_space, "pre-line")
+end
+
+;; ---------- 0.3: grid-auto-flow: column ----------
+#[test]
+fn t03g_grid_auto_flow_column_fills_rows_first() is
+    let css_t: string = ".g { display: grid; grid-auto-flow: column; grid-template-rows: 20px 20px; grid-auto-columns: 50px; width: 200px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"g\"><div></div><div></div><div></div><div></div></div>", css_t, 400)
+    let a: layout::LayoutBox = find_box(boxes, 2, "box")
+    let b: layout::LayoutBox = find_box(boxes, 3, "box")
+    let c: layout::LayoutBox = find_box(boxes, 4, "box")
+    let d: layout::LayoutBox = find_box(boxes, 5, "box")
+    assert_eq(a.x, 0)
+    assert_eq(a.y, 0)
+    assert_eq(b.x, 0)
+    assert_eq(b.y, 20)
+    assert_eq(c.x, 50)
+    assert_eq(c.y, 0)
+    assert_eq(d.x, 50)
+    assert_eq(d.y, 20)
+    assert_eq(a.w, 50)
+    assert_eq(find_box(boxes, 1, "box").h, 40)
+end
+
+#[test]
+fn t03g_grid_auto_flow_column_single_row_default() is
+    let css_t: string = ".g { display: grid; grid-auto-flow: column; grid-auto-columns: 30px; width: 200px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"g\"><div style=\"height: 10px\"></div><div style=\"height: 10px\"></div><div style=\"height: 10px\"></div></div>", css_t, 400)
+    assert_eq(find_box(boxes, 2, "box").x, 0)
+    assert_eq(find_box(boxes, 3, "box").x, 30)
+    assert_eq(find_box(boxes, 4, "box").x, 60)
+    assert_eq(find_box(boxes, 4, "box").y, 0)
+end
+
+#[test]
+fn t03g_grid_row_flow_unchanged() is
+    let css_t: string = ".g { display: grid; grid-template-columns: 50px 50px; width: 200px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"g\"><div style=\"height: 10px\"></div><div style=\"height: 10px\"></div><div style=\"height: 10px\"></div></div>", css_t, 400)
+    assert_eq(find_box(boxes, 3, "box").x, 50)
+    assert_eq(find_box(boxes, 4, "box").x, 0)
+    assert_eq(find_box(boxes, 4, "box").y, 10)
+end
+
+;; ---------- 0.3: line-clamp, balance, content-visibility, contain, stacking ----------
+#[test]
+fn t03t_line_clamp_limits_lines_and_adds_ellipsis() is
+    let css_t: string = ".a { width: 60px; line-clamp: 2; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">aaaa bbbb cccc dddd eeee ffff</div>", css_t, 400)
+    assert_eq(find_box(boxes, 1, "box").h, 44)
+    let mut texts: int = 0
+    let mut ell: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is
+            texts += 1
+            if string_ends_with(boxes[i].text, "…") is ell += 1 end
+        end
+        i += 1
+    end
+    assert_true(texts >= 2)
+    assert_eq(ell, 1)
+end
+
+#[test]
+fn t03t_webkit_line_clamp_alias() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">aaaa bbbb cccc dddd eeee ffff</div>", ".a { width: 60px; -webkit-line-clamp: 1; }", 400)
+    assert_eq(find_box(boxes, 1, "box").h, 22)
+end
+
+#[test]
+fn t03t_text_wrap_balance_evens_lines() is
+    let plain: [layout::LayoutBox] = lay("<div class=\"a\">aaaa bbbb cccc dddd eeee</div>", ".a { width: 120px; }", 400)
+    let bal: [layout::LayoutBox] = lay("<div class=\"a\">aaaa bbbb cccc dddd eeee</div>", ".a { width: 120px; text-wrap: balance; }", 400)
+    assert_eq(find_box(plain, 1, "box").h, find_box(bal, 1, "box").h)
+    assert_true(last_text_end(bal) <= last_text_end(plain))
+end
+
+#[test]
+fn t03t_content_visibility_hidden_skips_children() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\"><div class=\"k\">kid</div></div>", ".a { content-visibility: hidden; contain-intrinsic-size: 100px 50px; width: 100px; }", 400)
+    assert_eq(find_box(boxes, 1, "box").h, 50)
+    assert_true(!has_box(boxes, 2))
+end
+
+#[test]
+fn t03t_contain_paint_clips_and_is_bfc() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { contain: paint; }", 1)
+    assert_eq(st.overflow_x, "hidden")
+    assert_true(props::xget(st.xp, "contain") == "paint")
+end
+
+#[test]
+fn t03t_isolation_creates_stacking_context() is
+    let css_t: string = ".a { position: relative; } .iso { isolation: isolate; } .k { position: relative; z-index: 5; } .o { position: relative; z-index: 3; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"iso\"><div class=\"k\">k</div></div><div class=\"o\">o</div>", css_t, 400)
+    let mut ik: int = -1
+    let mut io: int = -1
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "box" && boxes[i].node_id == 2 is ik = i end
+        if boxes[i].kind == "box" && boxes[i].node_id == 4 is io = i end
+        i += 1
+    end
+    ;; k (z=5) jest wewnątrz izolowanego kontekstu 0, więc rysuje się PRZED o (z=3)
+    assert_true(ik >= 0 && io >= 0 && ik < io)
+end
+
+;; ---------- 0.3: transformacje macierzowe (rotate, skew, matrix, rotate/scale/translate) ----------
+fn m_of(st: style::ComputedStyle, i: int) -> int is
+    return st.tr_m[i]
+end
+
+fn near(a: int, b: int, tol: int) -> bool is
+    let d: int = a - b
+    return d >= 0 - tol && d <= tol
+end
+
+#[test]
+fn t03x_rotate_builds_matrix() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: rotate(90deg); }", 1)
+    assert_eq(array_len(st.tr_m), 6)
+    assert_true(near(m_of(st, 0), 0, 2))
+    assert_true(near(m_of(st, 1), 1000, 2))
+    assert_true(near(m_of(st, 2), -1000, 2))
+    assert_true(near(m_of(st, 3), 0, 2))
+    assert_true(st.has_transform)
+end
+
+#[test]
+fn t03x_rotate_45_and_units() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: rotate(45deg); }", 1)
+    assert_true(near(m_of(st, 0), 707, 3))
+    assert_true(near(m_of(st, 1), 707, 3))
+    let t: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: rotate(0.25turn); }", 1)
+    assert_true(near(m_of(t, 1), 1000, 3))
+    let r: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: rotate(-90deg); }", 1)
+    assert_true(near(m_of(r, 1), -1000, 3))
+end
+
+#[test]
+fn t03x_skew_and_matrix_functions() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: skewX(45deg); }", 1)
+    assert_true(near(m_of(st, 2), 1000, 5))
+    assert_true(near(m_of(st, 1), 0, 1))
+    let mx: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: matrix(0, 1, -1, 0, 10, 20); }", 1)
+    assert_eq(m_of(mx, 1), 1000)
+    assert_eq(m_of(mx, 4), 10000)
+    assert_eq(m_of(mx, 5), 20000)
+end
+
+#[test]
+fn t03x_composition_order() is
+    ;; translate(10px) rotate(90deg): obrót najpierw, potem przesunięcie → e = 10
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: translate(10px, 0) rotate(90deg); }", 1)
+    assert_eq(m_of(st, 4), 10000)
+    ;; rotate(90deg) translate(10px,0): przesunięcie w obróconym układzie → f = 10
+    let st2: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: rotate(90deg) translate(10px, 0); }", 1)
+    assert_true(near(m_of(st2, 5), 10000, 20))
+    assert_true(near(m_of(st2, 4), 0, 20))
+end
+
+#[test]
+fn t03x_individual_transform_properties() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { rotate: 90deg; }", 1)
+    assert_eq(array_len(st.tr_m), 6)
+    assert_true(near(m_of(st, 1), 1000, 2))
+    let sc: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { scale: 2; translate: 10px 5px; }", 1)
+    assert_eq(array_len(sc.tr_m), 0)
+    assert_true(sc.has_transform)
+    assert_eq(sc.tr_sx, 2000)
+    assert_eq(sc.tr_tx, 10)
+    assert_eq(sc.tr_ty, 5)
+end
+
+#[test]
+fn t03x_pure_scale_keeps_legacy_path() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: scale(1.5) translate(10px, 0); }", 1)
+    assert_eq(array_len(st.tr_m), 0)
+    assert_true(st.has_transform)
+end
+
+#[test]
+fn t03x_transform_none_clears() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { transform: rotate(30deg); transform: none; }", 1)
+    assert_eq(array_len(st.tr_m), 0)
+    assert_true(!st.has_transform)
+end
+
+fn xf_count(boxes: [layout::LayoutBox], id: int) -> int is
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].xf_id == id is n += 1 end
+        i += 1
+    end
+    return n
+end
+
+#[test]
+fn t03x_layout_marks_rotated_subtree() is
+    let css_t: string = ".a { width: 100px; height: 40px; transform: rotate(90deg); } .k { height: 10px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\"><div class=\"k\">q</div></div><div class=\"o\">z</div>", css_t, 400)
+    let a: layout::LayoutBox = find_box(boxes, 1, "box")
+    assert_eq(a.xf_id, 1)
+    assert_eq(array_len(a.xf), 12)
+    ;; punkt obrotu = środek (50,20)
+    assert_eq(a.xf[6], 50)
+    assert_eq(a.xf[7], 20)
+    assert_true(xf_count(boxes, 1) >= 3)
+    ;; geometria nie jest zmieniana (obrót robi warstwa natywna)
+    assert_eq(a.w, 100)
+    assert_eq(a.h, 40)
+    assert_eq(find_box(boxes, 5, "box").xf_id, 0)
+end
+
+#[test]
+fn t03x_layout_transform_origin_for_rotation() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">x</div>", ".a { width: 100px; height: 40px; transform: rotate(10deg); transform-origin: left top; }", 400)
+    let a: layout::LayoutBox = find_box(boxes, 1, "box")
+    assert_eq(a.xf[6], 0)
+    assert_eq(a.xf[7], 0)
+end
+
+#[test]
+fn t03x_hit_test_inverts_rotation() is
+    ;; pudełko 100x20 obrócone o 90° wokół środka (50,10): zajmuje teraz x∈[40,60], y∈[-40,60]
+    let boxes: [layout::LayoutBox] = lay("<div class=\"a\">x</div>", ".a { width: 100px; height: 20px; transform: rotate(90deg); }", 400)
+    assert_eq(paint::hit_test_at(boxes, 50, 50, 0), 1)
+    assert_eq(paint::hit_test_at(boxes, 90, 10, 0), 0)
+end
+
+#[test]
+fn t03x_inverse_point_identity_and_quarter_turn() is
+    let id_xf: [int] = [1000, 0, 0, 1000, 0, 0, 50, 50, 0, 0, 100, 100]
+    let p: [int] = paint::inv_xf_point(id_xf, 20, 30)
+    assert_eq(p[0], 20)
+    assert_eq(p[1], 30)
+    let rot: [int] = [0, 1000, -1000, 0, 0, 0, 0, 0, 0, 0, 100, 100]
+    let q: [int] = paint::inv_xf_point(rot, 0, 10)
+    assert_eq(q[0], 10)
+    assert_eq(q[1], 0)
+end
+
+;; ---------- 0.3: podziały w kolumnach (break-inside / break-before / break-after) ----------
+fn col_of(boxes: [layout::LayoutBox], id: int, colw: int, gap: int) -> int is
+    let b: layout::LayoutBox = find_box(boxes, id, "box")
+    return b.x / (colw + gap)
+end
+
+#[test]
+fn t03m_break_inside_avoid_moves_box_to_next_column() is
+    ;; 4 bloki po 22px; trzeci ma 40px i break-inside: avoid → nie może się dzielić między kolumny
+    let css_t: string = ".c { column-count: 2; column-gap: 0px; width: 200px; } .l { height: 22px; } .big { height: 40px; break-inside: avoid; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"c\"><div class=\"l\">a</div><div class=\"l\">b</div><div class=\"big\"></div></div>", css_t, 400)
+    let mut pieces: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "box" && boxes[i].node_id == 6 is pieces += 1 end
+        i += 1
+    end
+    assert_eq(pieces, 1)
+end
+
+#[test]
+fn t03m_break_before_column_forces_new_column() is
+    let css_t: string = ".c { column-count: 2; column-gap: 0px; width: 200px; } .l { height: 22px; } .nb { height: 22px; break-before: column; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"c\"><div class=\"l\">a</div><div class=\"nb\">b</div></div>", css_t, 400)
+    assert_eq(find_box(boxes, 2, "box").x, 0)
+    assert_eq(find_box(boxes, 4, "box").x, 100)
+    assert_eq(find_box(boxes, 4, "box").y, 0)
+end
+
+;; ---------- 0.3: właściwości rysowania: pomocnicze funkcje czysto-obliczeniowe ----------
+#[test]
+fn t03r_background_clip_and_origin_rects() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { border: 4px solid red; padding: 10px; background-clip: content-box; background-origin: padding-box; }", 1)
+    let cb: [int] = paint::bg_box_rect(st, "background-clip", 0, 0, 100, 60)
+    assert_eq(cb[0], 14)
+    assert_eq(cb[1], 14)
+    assert_eq(cb[2], 72)
+    assert_eq(cb[3], 32)
+    let ob: [int] = paint::bg_box_rect(st, "background-origin", 0, 0, 100, 60)
+    assert_eq(ob[0], 4)
+    assert_eq(ob[2], 92)
+    let def: [int] = paint::bg_box_rect(st, "background-position-x", 0, 0, 100, 60)
+    assert_eq(def[0], 0)
+    assert_eq(def[2], 100)
+end
+
+#[test]
+fn t03r_background_position_xy_longhands() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { background-position: 10px 20px; background-position-x: right; background-position-y: 30%; }", 1)
+    assert_eq(st.bg_pos, "100% 30%")
+end
+
+#[test]
+fn t03r_line_break_anywhere_and_overflow_logical() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { line-break: anywhere; overflow-block: hidden; overflow-inline: scroll; }", 1)
+    assert_true(st.break_words)
+    assert_eq(st.overflow_y, "hidden")
+    assert_eq(st.overflow_x, "scroll")
+end
+
+#[test]
+fn t03s_scroll_into_view_uses_scroll_margin() is
+    let css_t: string = ".s { height: 300px; } .t { scroll-margin-top: 20px; height: 30px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"s\"></div><div class=\"t\">x</div>", css_t, 400)
+    assert_eq(layout::scroll_into_y(boxes, 2), 280)
+    assert_eq(layout::scroll_into_y(boxes, 0), 0)
+    assert_eq(layout::scroll_into_y(boxes, 999), -1)
+end
+
+#[test]
+fn t03s_scroll_margin_block_start_maps_to_top() is
+    let css_t: string = ".s { height: 100px; } .t { scroll-margin-block-start: 8px; height: 10px; }"
+    let boxes: [layout::LayoutBox] = lay("<div class=\"s\"></div><div class=\"t\">x</div>", css_t, 400)
+    assert_eq(layout::scroll_into_y(boxes, 2), 92)
+end
+
+#[test]
+fn t03s_scroll_margin_clamped_at_zero() is
+    let boxes: [layout::LayoutBox] = lay("<div class=\"t\">x</div>", ".t { scroll-margin-top: 50px; height: 10px; }", 400)
+    assert_eq(layout::scroll_into_y(boxes, 1), 0)
+end
+
+#[test]
+fn t03s_scroll_margin_shorthand_expands() is
+    let st: style::ComputedStyle = st_for("<div class=\"a\">x</div>", ".a { scroll-margin: 1px 2px 3px; scroll-padding: 9px; }", 1)
+    assert_eq(props::xget(st.xp, "scroll-margin-top"), "1px")
+    assert_eq(props::xget(st.xp, "scroll-margin-right"), "2px")
+    assert_eq(props::xget(st.xp, "scroll-margin-bottom"), "3px")
+    assert_eq(props::xget(st.xp, "scroll-margin-left"), "2px")
+    assert_eq(props::xget(st.xp, "scroll-padding-left"), "9px")
+end
+
+#[test]
+fn t03s_tab_size_expands_tabs_in_pre() is
+    assert_eq(layout::expand_tabs("a\tb", 4), "a   b")
+    assert_eq(layout::expand_tabs("\tx", 8), "        x")
+    assert_eq(layout::expand_tabs("ab\n\tc", 2), "ab\n  c")
+    let narrow: [layout::LayoutBox] = lay("<pre class=\"a\">a\tb</pre>", ".a { tab-size: 2; }", 400)
+    let wide: [layout::LayoutBox] = lay("<pre class=\"a\">a\tb</pre>", ".a { tab-size: 8; }", 400)
+    assert_true(last_text_end(wide) > last_text_end(narrow))
 end
