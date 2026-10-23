@@ -1,0 +1,336 @@
+mod css
+mod style
+use "std -> conv" from "conv"
+
+;; Kontekst animacji dla jednego układu.
+pub struct AnimCtx is
+    pub now:     int
+    pub starts:  [int]                    ;; płaskie [id, start_ms, …] — animacje @keyframes
+    pub t_ids:   [int]                    ;; węzły z trwającym przejściem
+    pub t_from:  [style::ComputedStyle]   ;; styl początkowy przejścia
+    pub t_start: [int]
+    pub t_dur:   [int]
+    pub t_delay: [int]
+    pub t_ease:  [string]
+end
+
+pub fn no_anim() -> AnimCtx is
+    return AnimCtx { now: 0, starts: [], t_ids: [], t_from: [], t_start: [], t_dur: [], t_delay: [], t_ease: [] }
+end
+
+;; ---------- funkcje czasowe ----------
+fn num(s: string) -> f64 is
+    return conv::str_to_float(string_trim(s))
+end
+
+fn cubic(a: f64, b: f64, s: f64) -> f64 is
+    let u: f64 = 1.0 - s
+    return 3.0 * u * u * s * a + 3.0 * u * s * s * b + s * s * s
+end
+
+fn bezier_ease(x1: f64, y1: f64, x2: f64, y2: f64, t: int) -> int is
+    let x: f64 = conv::int_to_float(t) / 1000.0
+    let mut lo: f64 = 0.0
+    let mut hi: f64 = 1.0
+    let mut i: int = 0
+    while i < 24 is
+        let mid: f64 = (lo + hi) / 2.0
+        if cubic(x1, x2, mid) < x is
+            lo = mid
+        else is
+            hi = mid
+        end
+        i += 1
+    end
+    let s: f64 = (lo + hi) / 2.0
+    return conv::float_to_int(cubic(y1, y2, s) * 1000.0 + 0.5)
+end
+
+;; t: 0..1000 → 0..1000 (może wyjść poza zakres dla cubic-bezier z przeregulowaniem).
+pub fn ease_apply(name0: string, t0: int) -> int is
+    let name: string = string_lower(string_trim(name0))
+    let t: int = if t0 < 0 then 0 elsif t0 > 1000 then 1000 else t0
+    if name == "linear" is return t end
+    if name == "ease" || name == "" is return bezier_ease(0.25, 0.1, 0.25, 1.0, t) end
+    if name == "ease-in" is return bezier_ease(0.42, 0.0, 1.0, 1.0, t) end
+    if name == "ease-out" is return bezier_ease(0.0, 0.0, 0.58, 1.0, t) end
+    if name == "ease-in-out" is return bezier_ease(0.42, 0.0, 0.58, 1.0, t) end
+    if name == "step-start" is
+        return if t > 0 then 1000 else 0
+    end
+    if name == "step-end" is
+        return if t >= 1000 then 1000 else 0
+    end
+    if string_starts_with(name, "cubic-bezier(") is
+        let a: [string] = string_split(string_slice(name, 13, string_len(name) - 1), ",")
+        if array_len(a) >= 4 is return bezier_ease(num(a[0]), num(a[1]), num(a[2]), num(a[3]), t) end
+    end
+    if string_starts_with(name, "steps(") is
+        let a: [string] = string_split(string_slice(name, 6, string_len(name) - 1), ",")
+        let n: int = str_to_int(string_trim(a[0]))
+        if n >= 1 is
+            let jump_start: bool = array_len(a) >= 2 && (string_trim(a[1]) == "start" || string_trim(a[1]) == "jump-start")
+            let mut k: int = t * n / 1000
+            if t >= 1000 is k = n end
+            if jump_start && t < 1000 is k += 1 end
+            if k > n is k = n end
+            return k * 1000 / n
+        end
+    end
+    return t
+end
+
+;; ---------- interpolacja ----------
+fn li(a: int, b: int, t: int) -> int is
+    return a + (b - a) * t / 1000
+end
+
+fn lerp_color(a: style::Color, b: style::Color, t: int) -> style::Color is
+    return style::Color { r: li(a.r, b.r, t), g: li(a.g, b.g, t), b: li(a.b, b.b, t), a: li(a.a, b.a, t) }
+end
+
+fn is_auto(v: int) -> bool is
+    return v == style::auto_val()
+end
+
+;; Interpoluje pole długości, gdy żadne nie jest `auto`.
+fn li_len(a: int, b: int, t: int) -> int is
+    if is_auto(a) || is_auto(b) is return b end
+    return li(a, b, t)
+end
+
+;; Interpoluje animowalne pola stylu. `full` = także kolory i opacity (dla @keyframes);
+;; przejścia kolorów/opacity obsługuje osobny mechanizm w app.h#.
+pub fn lerp_style(a: style::ComputedStyle, b: style::ComputedStyle, t: int, full: bool) -> style::ComputedStyle is
+    let mut s: style::ComputedStyle = b
+    if a.width_mode == "px" && b.width_mode == "px" is s.width = li(a.width, b.width, t) end
+    if a.height_mode == "px" && b.height_mode == "px" is s.height = li(a.height, b.height, t) end
+    if a.width_mode == "pct" && b.width_mode == "pct" is s.width_pct = li(a.width_pct, b.width_pct, t) end
+    if a.height_mode == "pct" && b.height_mode == "pct" is s.height_pct = li(a.height_pct, b.height_pct, t) end
+    s.min_width = li(a.min_width, b.min_width, t)
+    s.min_height = li(a.min_height, b.min_height, t)
+    s.mar_top = li_len(a.mar_top, b.mar_top, t)
+    s.mar_right = li_len(a.mar_right, b.mar_right, t)
+    s.mar_bottom = li_len(a.mar_bottom, b.mar_bottom, t)
+    s.mar_left = li_len(a.mar_left, b.mar_left, t)
+    s.pad_top = li(a.pad_top, b.pad_top, t)
+    s.pad_right = li(a.pad_right, b.pad_right, t)
+    s.pad_bottom = li(a.pad_bottom, b.pad_bottom, t)
+    s.pad_left = li(a.pad_left, b.pad_left, t)
+    s.top = li_len(a.top, b.top, t)
+    s.right = li_len(a.right, b.right, t)
+    s.bottom = li_len(a.bottom, b.bottom, t)
+    s.left = li_len(a.left, b.left, t)
+    s.bt = li(a.bt, b.bt, t)
+    s.br = li(a.br, b.br, t)
+    s.bb = li(a.bb, b.bb, t)
+    s.bl = li(a.bl, b.bl, t)
+    s.rad_tl = li(a.rad_tl, b.rad_tl, t)
+    s.rad_tr = li(a.rad_tr, b.rad_tr, t)
+    s.rad_br = li(a.rad_br, b.rad_br, t)
+    s.rad_bl = li(a.rad_bl, b.rad_bl, t)
+    s.font_size = li(a.font_size, b.font_size, t)
+    s.letter_spacing = li(a.letter_spacing, b.letter_spacing, t)
+    s.gap = li(a.gap, b.gap, t)
+    s.row_gap = li(a.row_gap, b.row_gap, t)
+    s.flex_grow = li(a.flex_grow, b.flex_grow, t)
+    s.has_transform = a.has_transform || b.has_transform
+    s.tr_tx = li(a.tr_tx, b.tr_tx, t)
+    s.tr_ty = li(a.tr_ty, b.tr_ty, t)
+    s.tr_tx_pct = li(a.tr_tx_pct, b.tr_tx_pct, t)
+    s.tr_ty_pct = li(a.tr_ty_pct, b.tr_ty_pct, t)
+    s.tr_sx = li(a.tr_sx, b.tr_sx, t)
+    s.tr_sy = li(a.tr_sy, b.tr_sy, t)
+    s.tr_rot = li(a.tr_rot, b.tr_rot, t)
+    s.has_filter = a.has_filter || b.has_filter
+    s.f_gray = li(a.f_gray, b.f_gray, t)
+    s.f_bright = li(a.f_bright, b.f_bright, t)
+    s.f_contrast = li(a.f_contrast, b.f_contrast, t)
+    s.f_invert = li(a.f_invert, b.f_invert, t)
+    s.f_sepia = li(a.f_sepia, b.f_sepia, t)
+    s.f_opacity = li(a.f_opacity, b.f_opacity, t)
+    if a.has_shadow && b.has_shadow is
+        s.sh_x = li(a.sh_x, b.sh_x, t)
+        s.sh_y = li(a.sh_y, b.sh_y, t)
+        s.sh_blur = li(a.sh_blur, b.sh_blur, t)
+        s.sh_spread = li(a.sh_spread, b.sh_spread, t)
+        s.sh_color = lerp_color(a.sh_color, b.sh_color, t)
+    end
+    if full is
+        s.opacity = li(a.opacity, b.opacity, t)
+        s.color = lerp_color(a.color, b.color, t)
+        let abg: style::Color = if a.has_bg then a.background else style::Color { r: b.background.r, g: b.background.g, b: b.background.b, a: 0 }
+        let bbg: style::Color = if b.has_bg then b.background else style::Color { r: a.background.r, g: a.background.g, b: a.background.b, a: 0 }
+        s.background = lerp_color(abg, bbg, t)
+        s.has_bg = a.has_bg || b.has_bg
+        s.bct = lerp_color(a.bct, b.bct, t)
+        s.bcr = lerp_color(a.bcr, b.bcr, t)
+        s.bcb = lerp_color(a.bcb, b.bcb, t)
+        s.bcl = lerp_color(a.bcl, b.bcl, t)
+        s.outline_color = lerp_color(a.outline_color, b.outline_color, t)
+    end
+    return s
+end
+
+;; Czy styl `a` i `b` różnią się w polach, które animują przejścia geometrii/transformacji.
+pub fn geometry_differs(a: style::ComputedStyle, b: style::ComputedStyle) -> bool is
+    if a.width != b.width || a.height != b.height || a.width_pct != b.width_pct || a.height_pct != b.height_pct is return true end
+    if a.width_mode != b.width_mode || a.height_mode != b.height_mode is return false end
+    if a.min_width != b.min_width || a.min_height != b.min_height is return true end
+    if a.mar_top != b.mar_top || a.mar_right != b.mar_right || a.mar_bottom != b.mar_bottom || a.mar_left != b.mar_left is return true end
+    if a.pad_top != b.pad_top || a.pad_right != b.pad_right || a.pad_bottom != b.pad_bottom || a.pad_left != b.pad_left is return true end
+    if a.top != b.top || a.right != b.right || a.bottom != b.bottom || a.left != b.left is return true end
+    if a.bt != b.bt || a.br != b.br || a.bb != b.bb || a.bl != b.bl is return true end
+    if a.rad_tl != b.rad_tl || a.rad_tr != b.rad_tr || a.rad_br != b.rad_br || a.rad_bl != b.rad_bl is return true end
+    if a.font_size != b.font_size || a.letter_spacing != b.letter_spacing || a.gap != b.gap || a.row_gap != b.row_gap is return true end
+    if a.has_transform != b.has_transform || a.tr_tx != b.tr_tx || a.tr_ty != b.tr_ty || a.tr_sx != b.tr_sx || a.tr_sy != b.tr_sy is return true end
+    if a.tr_tx_pct != b.tr_tx_pct || a.tr_ty_pct != b.tr_ty_pct || a.tr_rot != b.tr_rot is return true end
+    if a.has_filter != b.has_filter || a.f_gray != b.f_gray || a.f_bright != b.f_bright || a.f_contrast != b.f_contrast is return true end
+    if a.f_invert != b.f_invert || a.f_sepia != b.f_sepia is return true end
+    if a.has_shadow != b.has_shadow || a.sh_x != b.sh_x || a.sh_y != b.sh_y || a.sh_blur != b.sh_blur || a.sh_spread != b.sh_spread is return true end
+    return false
+end
+
+;; Czy lista `transition-property` obejmuje animacje geometrii.
+pub fn trans_covers_geometry(st: style::ComputedStyle) -> bool is
+    if st.trans_ms <= 0 is return false end
+    let p: string = st.trans_prop
+    if p == "all" || p == "" is return true end
+    let names: [string] = string_split(p, ",")
+    let mut i: int = 0
+    while i < array_len(names) is
+        let n: string = string_trim(names[i])
+        i += 1
+        if n == "all" || n == "transform" || n == "width" || n == "height" || n == "margin" || n == "padding" || n == "top" ||
+           n == "left" || n == "right" || n == "bottom" || n == "border-radius" || n == "filter" || n == "box-shadow" ||
+           n == "font-size" || n == "gap" || n == "letter-spacing" || n == "min-width" || n == "min-height" ||
+           string_starts_with(n, "margin-") || string_starts_with(n, "padding-") || string_starts_with(n, "border-") is
+            return true
+        end
+    end
+    return false
+end
+
+;; ---------- @keyframes ----------
+;; Postęp animacji (0..1000) po uwzględnieniu opóźnienia, iteracji, kierunku i fill-mode;
+;; -1 = animacja nie wpływa na styl.
+pub fn anim_progress(st: style::ComputedStyle, elapsed: int) -> int is
+    let dur: int = st.anim_ms
+    if dur <= 0 is return -1 end
+    let t: int = elapsed - st.anim_delay
+    let infinite: bool = st.anim_iter < 0
+    let iters: int = if infinite then 0 else st.anim_iter
+    let fill_back: bool = st.anim_fill == "backwards" || st.anim_fill == "both"
+    let fill_fwd: bool = st.anim_fill == "forwards" || st.anim_fill == "both"
+    let dir: string = st.anim_dir
+    let mut index: int = 0
+    let mut within: int = 0
+    if t < 0 is
+        if !fill_back is return -1 end
+        index = 0
+        within = 0
+    elsif !infinite && t * 1000 >= dur * iters is
+        if !fill_fwd is return -1 end
+        let whole: int = iters / 1000
+        let frac: int = iters % 1000
+        if frac == 0 is
+            index = if whole > 0 then whole - 1 else 0
+            within = 1000
+        else is
+            index = whole
+            within = frac
+        end
+    else is
+        index = t / dur
+        within = (t % dur) * 1000 / dur
+    end
+    let mut reverse: bool = false
+    if dir == "reverse" is
+        reverse = true
+    elsif dir == "alternate" is
+        reverse = index % 2 == 1
+    elsif dir == "alternate-reverse" is
+        reverse = index % 2 == 0
+    end
+    return if reverse then 1000 - within else within
+end
+
+;; Styl elementu w punkcie p (0..1000) osi @keyframes; `base` = jego zwykły styl.
+pub fn keyframe_style(sheet: css::Stylesheet, kf: int, base: style::ComputedStyle, parent: style::ComputedStyle, p: int) -> style::ComputedStyle is
+    let k: css::Keyframes = sheet.keyframes[kf]
+    let n: int = array_len(k.stops)
+    if n == 0 is return base end
+    let ix: css::InteractionState = css::no_interaction()
+    let em: int = parent.font_size
+    ;; indeks ostatniego przystanku <= p oraz pierwszego >= p
+    let mut lo: int = -1
+    let mut hi: int = -1
+    let mut i: int = 0
+    while i < n is
+        if k.stops[i].pct * 10 <= p is lo = i end
+        i += 1
+    end
+    i = n - 1
+    while i >= 0 is
+        if k.stops[i].pct * 10 >= p is hi = i end
+        i -= 1
+    end
+    let from_pct: int = if lo >= 0 then k.stops[lo].pct else 0
+    let to_pct: int = if hi >= 0 then k.stops[hi].pct else 100
+    let from_st: style::ComputedStyle = if lo >= 0 then style::apply_decls(base, k.stops[lo].decls, em, ix, parent) else base
+    let to_st: style::ComputedStyle = if hi >= 0 then style::apply_decls(base, k.stops[hi].decls, em, ix, parent) else base
+    if to_pct <= from_pct is return to_st end
+    let local: int = (p - from_pct * 10) * 1000 / ((to_pct - from_pct) * 10)
+    let eased: int = ease_apply(base.anim_ease, local)
+    return lerp_style(from_st, to_st, eased, true)
+end
+
+fn find_start(ctx: AnimCtx, id: int) -> int is
+    let mut i: int = 0
+    while i + 1 < array_len(ctx.starts) is
+        if ctx.starts[i] == id is return ctx.starts[i + 1] end
+        i += 2
+    end
+    return -1
+end
+
+fn find_trans(ctx: AnimCtx, id: int) -> int is
+    let mut i: int = 0
+    while i < array_len(ctx.t_ids) is
+        if ctx.t_ids[i] == id is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; Hak wołany z compute_styles: nakłada animację @keyframes i przejście na styl węzła.
+pub fn animate_style(sheet: css::Stylesheet, st0: style::ComputedStyle, parent: style::ComputedStyle, ctx: AnimCtx, id: int) -> style::ComputedStyle is
+    let mut st: style::ComputedStyle = st0
+    let ti: int = find_trans(ctx, id)
+    if ti >= 0 is
+        let elapsed: int = ctx.now - ctx.t_start[ti] - ctx.t_delay[ti]
+        let dur: int = ctx.t_dur[ti]
+        if elapsed < dur && dur > 0 is
+            let raw: int = if elapsed <= 0 then 0 else elapsed * 1000 / dur
+            st = lerp_style(ctx.t_from[ti], st, ease_apply(ctx.t_ease[ti], raw), false)
+        end
+    end
+    if st.anim_name != "" is
+        let start: int = find_start(ctx, id)
+        if start >= 0 is
+            let kf: int = css::find_keyframes(sheet, st.anim_name)
+            if kf >= 0 is
+                let p: int = anim_progress(st, ctx.now - start)
+                if p >= 0 is st = keyframe_style(sheet, kf, st, parent, p) end
+            end
+        end
+    end
+    return st
+end
+
+;; Czy animacja @keyframes elementu nadal się zmienia (do podtrzymania renderowania klatek).
+pub fn anim_running(st: style::ComputedStyle, elapsed: int) -> bool is
+    if st.anim_name == "" || st.anim_ms <= 0 || st.anim_paused is return false end
+    if st.anim_iter < 0 is return true end
+    return elapsed - st.anim_delay < st.anim_ms * st.anim_iter / 1000
+end
