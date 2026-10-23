@@ -1,6 +1,7 @@
 mod css
 mod dom
 mod cssval
+mod props
 use "std -> conv" from "conv"
 
 pub struct Color is
@@ -126,6 +127,99 @@ pub struct ComputedStyle is
     pub content:    string   ;; content: "…" dla ::before/::after (po usunięciu cudzysłowów)
     pub has_content: bool
     pub vars:       string   ;; zmienne CSS: "\u0002--nazwa\u0001wartość…"
+    pub tr_m:       [int]    ;; 0.3: macierz 2D [a,b,c,d,e,f] (a-d x1000, e/f px x1000) gdy jest obrót/pochylenie; [] = brak
+    pub xp:         string   ;; 0.3: właściwości bez dedykowanego pola (rejestr props.h#): "\u0002nazwa\u0001wartość…"
+
+    ;; ---- 0.3: typografia ----
+    pub letter_spacing: int  ;; px
+    pub word_spacing:   int  ;; px
+    pub text_indent:    int  ;; px
+    pub has_tshadow:    bool
+    pub ts_x:           int
+    pub ts_y:           int
+    pub ts_blur:        int
+    pub ts_color:       Color
+    pub valign:         string   ;; baseline | top | middle | bottom | sub | super | text-top | text-bottom
+    pub valign_px:      int      ;; przesunięcie dla vertical-align: <długość>
+    pub list_style:     string   ;; "" (domyślny wg tagu) | none | disc | circle | square | decimal | …
+    pub list_pos:       string   ;; outside | inside
+    pub font_family:    string
+    pub font_key:       int      ;; 15-bitowy klucz rodziny z @font-face (0 = domyślna)
+    pub font_weight:    int      ;; 100..900
+    pub deco_color:     Color
+    pub has_deco_color: bool
+    pub deco_style:     string   ;; solid | double | dotted | dashed | wavy
+    pub deco_thick:     int      ;; px, 0 = domyślna
+    pub direction:      string   ;; ltr | rtl
+    pub hyphens:        string
+    pub tab_size:       int
+    pub border_spacing: int      ;; px (tabele, model separate)
+    pub border_collapse: bool
+    pub table_fixed:    bool     ;; table-layout: fixed
+
+    ;; ---- 0.3: pudełko / układ ----
+    pub float_side:     string   ;; none | left | right
+    pub clear_side:     string   ;; none | left | right | both
+    pub align_content:  string   ;; normal | flex-start | center | flex-end | space-between | space-around | space-evenly | stretch
+    pub justify_items:  string   ;; "" | start | center | end | stretch
+    pub justify_self:   string
+    pub grid_areas:     string   ;; grid-template-areas: wiersze oddzielone \u0001
+    pub grid_area:      string   ;; grid-area: nazwa
+    pub grid_row_start: int      ;; 0 = auto
+    pub grid_row_span:  int
+    pub grid_col_start: int      ;; 0 = auto
+    pub grid_auto_flow: string
+    pub grid_auto_rows: string
+    pub grid_auto_cols: string
+    pub aspect_ratio:   int      ;; szer/wys x1000, 0 = auto
+    pub box_sizing_content: bool
+    pub pointer_events: bool
+    pub user_select:    string
+    pub resize:         string
+    pub accent:         Color
+    pub has_accent:     bool
+    pub scroll_behavior: string
+
+    ;; ---- 0.3: efekty ----
+    pub has_transform:  bool
+    pub tr_tx:          int      ;; translate px
+    pub tr_ty:          int
+    pub tr_tx_pct:      int      ;; translate % x100 (5000 = 50%)
+    pub tr_ty_pct:      int
+    pub tr_sx:          int      ;; scale x1000
+    pub tr_sy:          int
+    pub tr_rot:         int      ;; obrót w stopniach x10
+    pub origin_x:       int      ;; transform-origin % x100
+    pub origin_y:       int
+    pub has_filter:     bool
+    pub f_gray:         int      ;; 0..100
+    pub f_bright:       int      ;; 100 = bez zmian
+    pub f_contrast:     int
+    pub f_invert:       int
+    pub f_sepia:        int
+    pub f_opacity:      int
+    pub clip_path:      string
+    pub bg_repeat:      string
+    pub bg_pos:         string
+    pub border_style:   string   ;; styl górnej krawędzi (solid|dashed|dotted|double|none)
+    pub bs_r:           string
+    pub bs_b:           string
+    pub bs_l:           string
+    pub outline_style:  string
+    pub outline_offset: int
+
+    ;; ---- 0.3: animacje i przejścia ----
+    pub anim_name:      string
+    pub anim_ms:        int
+    pub anim_delay:     int
+    pub anim_iter:      int      ;; x1000, -1 = infinite
+    pub anim_dir:       string
+    pub anim_fill:      string
+    pub anim_ease:      string
+    pub anim_paused:    bool
+    pub trans_prop:     string   ;; lista właściwości po przecinku lub "all"
+    pub trans_delay:    int
+    pub trans_ease:     string
 end
 
 pub fn black() -> Color is return Color { r: 0, g: 0, b: 0, a: 255 } end
@@ -144,7 +238,7 @@ pub fn root_style() -> ComputedStyle is
         mar_top: 0, mar_right: 0, mar_bottom: 0, mar_left: 0,
         top: a, right: a, bottom: a, left: a, z_index: 0,
         font_size: 16, bold: false, italic: false, underline: false, strike: false, line_height: 0,
-        text_align: "left", text_transform: "none", white_space: "normal", ellipsis: false,
+        text_align: "start", text_transform: "none", white_space: "normal", ellipsis: false,
         break_words: false, cursor: "default",
         border: 0, bt: 0, br: 0, bb: 0, bl: 0, border_color: black(),
         bct: black(), bcr: black(), bcb: black(), bcl: black(),
@@ -154,7 +248,21 @@ pub fn root_style() -> ComputedStyle is
         gap: 0, row_gap: 0, flex_dir: "row", flex_wrap: false, justify: "flex-start", align: "stretch",
         align_self: "", flex_grow: 0, flex_shrink: 1000, flex_basis: -1, order: 0,
         grid_cols: "", grid_rows: "", grid_col_span: 1,
-        opacity: 100, object_fit: "fill", trans_ms: 0, content: "", has_content: false, vars: ""
+        opacity: 100, object_fit: "fill", trans_ms: 0, content: "", has_content: false, vars: "", tr_m: [], xp: "",
+        letter_spacing: 0, word_spacing: 0, text_indent: 0, has_tshadow: false, ts_x: 0, ts_y: 0, ts_blur: 0,
+        ts_color: Color { r: 0, g: 0, b: 0, a: 128 }, valign: "baseline", valign_px: 0, list_style: "", list_pos: "outside",
+        font_family: "", font_key: 0, font_weight: 400, deco_color: black(), has_deco_color: false, deco_style: "solid", deco_thick: 0,
+        direction: "ltr", hyphens: "manual", tab_size: 8, border_spacing: 0, border_collapse: false, table_fixed: false,
+        float_side: "none", clear_side: "none", align_content: "normal", justify_items: "", justify_self: "",
+        grid_areas: "", grid_area: "", grid_row_start: 0, grid_row_span: 1, grid_col_start: 0, grid_auto_flow: "row",
+        grid_auto_rows: "", grid_auto_cols: "", aspect_ratio: 0, box_sizing_content: false, pointer_events: true,
+        user_select: "auto", resize: "none", accent: black(), has_accent: false, scroll_behavior: "auto",
+        has_transform: false, tr_tx: 0, tr_ty: 0, tr_tx_pct: 0, tr_ty_pct: 0, tr_sx: 1000, tr_sy: 1000, tr_rot: 0,
+        origin_x: 5000, origin_y: 5000, has_filter: false, f_gray: 0, f_bright: 100, f_contrast: 100, f_invert: 0,
+        f_sepia: 0, f_opacity: 100, clip_path: "", bg_repeat: "repeat", bg_pos: "0% 0%",
+        border_style: "solid", bs_r: "solid", bs_b: "solid", bs_l: "solid", outline_style: "solid", outline_offset: 0,
+        anim_name: "", anim_ms: 0, anim_delay: 0, anim_iter: 1000, anim_dir: "normal", anim_fill: "none",
+        anim_ease: "ease", anim_paused: false, trans_prop: "all", trans_delay: 0, trans_ease: "ease"
     }
 end
 
@@ -176,6 +284,30 @@ fn base_for(inherited: ComputedStyle) -> ComputedStyle is
     st.visible = inherited.visible
     st.cursor = inherited.cursor
     st.vars = inherited.vars
+    st.xp = props::xinherit(inherited.xp)
+    st.letter_spacing = inherited.letter_spacing
+    st.word_spacing = inherited.word_spacing
+    st.text_indent = inherited.text_indent
+    st.has_tshadow = inherited.has_tshadow
+    st.ts_x = inherited.ts_x
+    st.ts_y = inherited.ts_y
+    st.ts_blur = inherited.ts_blur
+    st.ts_color = inherited.ts_color
+    st.list_style = inherited.list_style
+    st.list_pos = inherited.list_pos
+    st.font_family = inherited.font_family
+    st.font_key = inherited.font_key
+    st.font_weight = inherited.font_weight
+    st.direction = inherited.direction
+    st.hyphens = inherited.hyphens
+    st.tab_size = inherited.tab_size
+    st.border_spacing = inherited.border_spacing
+    st.border_collapse = inherited.border_collapse
+    st.pointer_events = inherited.pointer_events
+    st.has_accent = inherited.has_accent
+    st.accent = inherited.accent
+    st.scroll_behavior = inherited.scroll_behavior
+    st.break_words = inherited.break_words
     st.align = "stretch"
     return st
 end
@@ -193,11 +325,19 @@ fn apply_ua(tag: string, st0: ComputedStyle, parent: ComputedStyle) -> ComputedS
         st.display = "none"
     end
     if tag == "li" is st.display = "list-item" end
-    if tag == "tr" is st.display = "flex" end
-    if tag == "td" || tag == "th" is
+    if tag == "table" is st.display = "table" end
+    if tag == "thead" is st.display = "table-header-group" end
+    if tag == "tbody" is st.display = "table-row-group" end
+    if tag == "tfoot" is st.display = "table-footer-group" end
+    if tag == "colgroup" || tag == "col" is st.display = "none" end
+    if tag == "caption" is
         st.display = "block"
-        st.flex_grow = 1000
-        st.flex_basis = 0
+        st.text_align = "center"
+    end
+    if tag == "tr" is st.display = "table-row" end
+    if tag == "td" || tag == "th" is
+        st.display = "table-cell"
+        st.valign = "top"
         st.pad_top = 4
         st.pad_bottom = 4
         st.pad_left = 8
@@ -501,6 +641,7 @@ struct BorderRes is
     pub w:     int
     pub color: Color
     pub has_color: bool
+    pub bstyle: string
 end
 
 fn parse_border_value(val: string, env: cssval::LenEnv, cur_color: Color) -> BorderRes is
@@ -509,14 +650,16 @@ fn parse_border_value(val: string, env: cssval::LenEnv, cur_color: Color) -> Bor
     let mut none: bool = false
     let mut color: Color = cur_color
     let mut has_c: bool = false
+    let mut bstyle: string = ""
     let mut i: int = 0
     while i < array_len(toks) is
         let t: string = string_lower(toks[i])
         i += 1
         if t == "none" || t == "hidden" is
             none = true
+            bstyle = t
         elsif is_line_style(t) is
-            w = w
+            bstyle = t
         elsif t == "thin" is
             w = 1
         elsif t == "medium" is
@@ -531,7 +674,7 @@ fn parse_border_value(val: string, env: cssval::LenEnv, cur_color: Color) -> Bor
             if l.ok && !l.auto is w = cssval::px_of(l, 0) end
         end
     end
-    return BorderRes { w: if none then 0 else w, color: color, has_color: has_c }
+    return BorderRes { w: if none then 0 else w, color: color, has_color: has_c, bstyle: bstyle }
 end
 
 fn parse_radius_all(val: string, env: cssval::LenEnv, w_hint: int) -> BoxSides is
@@ -788,6 +931,1378 @@ fn set_all_borders(st0: ComputedStyle, w: int, c: Color, set_color: bool) -> Com
     return st
 end
 
+;; =====================================================================
+;; 0.3: dodatkowe właściwości CSS
+;; =====================================================================
+fn num_f(s: string) -> f64 is
+    return conv::str_to_float(string_trim(s))
+end
+
+fn milli_of(f: f64) -> int is
+    return conv::float_to_int(f * 1000.0 + (if f < 0.0 then -0.5 else 0.5))
+end
+
+;; Wartość procentowa bez przycinania: "150%" -> 150, "1.5" -> 150.
+fn pct_unclamped(val: string) -> int is
+    let v: string = string_trim(val)
+    if v == "" is return 100 end
+    if string_ends_with(v, "%") is
+        return conv::float_to_int(num_f(string_slice(v, 0, string_len(v) - 1)))
+    end
+    return conv::float_to_int(num_f(v) * 100.0 + 0.5)
+end
+
+;; Kąt -> dziesiąte części stopnia (deg/turn/rad/grad).
+fn clamp_pct(n: int) -> int is
+    if n < 0 is return 0 end
+    if n > 100 is return 100 end
+    return n
+end
+
+fn angle_deci(val: string) -> int is
+    let v: string = string_lower(string_trim(val))
+    if string_ends_with(v, "deg") is return milli_of(num_f(string_slice(v, 0, string_len(v) - 3))) / 100 end
+    if string_ends_with(v, "grad") is return milli_of(num_f(string_slice(v, 0, string_len(v) - 4)) * 0.9) / 100 end
+    if string_ends_with(v, "turn") is return milli_of(num_f(string_slice(v, 0, string_len(v) - 4)) * 360.0) / 100 end
+    if string_ends_with(v, "rad") is return milli_of(num_f(string_slice(v, 0, string_len(v) - 3)) * 57.29578) / 100 end
+    return milli_of(num_f(v)) / 100
+end
+
+;; Wnętrze pierwszego wywołania funkcji `name(...)` w wartości; "" gdy brak.
+fn fn_args(val: string, name: string, from: int) -> string is
+    let lower: string = string_lower(val)
+    let pat: string = name + "("
+    let at: int = string_find(string_slice(lower, from, string_len(lower)), pat)
+    if at < 0 is return "" end
+    let open: int = from + at + string_len(pat)
+    let mut depth: int = 1
+    let mut q: int = open
+    while q < string_len(val) && depth > 0 is
+        let c: string = string_at(val, q)
+        if c == "(" is depth += 1 end
+        if c == ")" is depth -= 1 end
+        q += 1
+    end
+    return string_slice(val, open, q - 1)
+end
+
+fn has_fn(val: string, name: string) -> bool is
+    return string_find(string_lower(val), name + "(") >= 0
+end
+
+;; Długość lub procent: zwraca px (pct == false) albo procent x100 (pct == true).
+struct PxPct is
+    pub px:  int
+    pub pct: int
+end
+
+fn parse_px_pct(tok: string, env: cssval::LenEnv) -> PxPct is
+    let t: string = string_trim(tok)
+    if string_ends_with(t, "%") is
+        return PxPct { px: 0, pct: conv::float_to_int(num_f(string_slice(t, 0, string_len(t) - 1)) * 100.0) }
+    end
+    return PxPct { px: len_px_or(t, env, 0, 0), pct: 0 }
+end
+
+fn apply_transform_fns(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let l: string = string_lower(string_trim(val))
+    st.has_transform = false
+    st.tr_tx = 0
+    st.tr_ty = 0
+    st.tr_tx_pct = 0
+    st.tr_ty_pct = 0
+    st.tr_sx = 1000
+    st.tr_sy = 1000
+    st.tr_rot = 0
+    if l == "none" || l == "" is return st end
+    let mut got: bool = false
+    if has_fn(l, "translate") is
+        let a: [string] = string_split(fn_args(l, "translate", 0), ",")
+        let x: PxPct = parse_px_pct(a[0], env)
+        st.tr_tx = x.px
+        st.tr_tx_pct = x.pct
+        if array_len(a) >= 2 is
+            let y: PxPct = parse_px_pct(a[1], env)
+            st.tr_ty = y.px
+            st.tr_ty_pct = y.pct
+        end
+        got = true
+    end
+    if has_fn(l, "translatex") is
+        let x: PxPct = parse_px_pct(fn_args(l, "translatex", 0), env)
+        st.tr_tx = x.px
+        st.tr_tx_pct = x.pct
+        got = true
+    end
+    if has_fn(l, "translatey") is
+        let y: PxPct = parse_px_pct(fn_args(l, "translatey", 0), env)
+        st.tr_ty = y.px
+        st.tr_ty_pct = y.pct
+        got = true
+    end
+    if has_fn(l, "scale") is
+        let a: [string] = string_split(fn_args(l, "scale", 0), ",")
+        st.tr_sx = milli_of(num_f(a[0]))
+        st.tr_sy = if array_len(a) >= 2 then milli_of(num_f(a[1])) else st.tr_sx
+        got = true
+    end
+    if has_fn(l, "scalex") is
+        st.tr_sx = milli_of(num_f(fn_args(l, "scalex", 0)))
+        got = true
+    end
+    if has_fn(l, "scaley") is
+        st.tr_sy = milli_of(num_f(fn_args(l, "scaley", 0)))
+        got = true
+    end
+    if has_fn(l, "rotate") is
+        st.tr_rot = angle_deci(fn_args(l, "rotate", 0))
+        got = true
+    end
+    st.has_transform = got
+    return st
+end
+
+
+;; ---------- macierze transformacji 2D (liczby całkowite: współczynniki x1000) ----------
+fn sin_tab() -> [int] is
+    return [0, 17, 35, 52, 70, 87, 105, 122, 139, 156, 174, 191, 208, 225, 242, 259, 276, 292, 309, 326, 342, 358, 375, 391, 407, 423, 438, 454, 469, 485, 500, 515, 530, 545, 559, 574, 588, 602, 616, 629, 643, 656, 669, 682, 695, 707, 719, 731, 743, 755, 766, 777, 788, 799, 809, 819, 829, 839, 848, 857, 866, 875, 883, 891, 899, 906, 914, 921, 927, 934, 940, 946, 951, 956, 961, 966, 970, 974, 978, 982, 985, 988, 990, 993, 995, 996, 998, 999, 999, 1000, 1000]
+end
+
+;; sin/cos w tysięcznych dla kąta w dziesiątych częściach stopnia.
+fn sin_m(deci0: int) -> int is
+    let mut d: int = deci0 % 3600
+    if d < 0 is d += 3600 end
+    let mut sign: int = 1
+    if d >= 1800 is
+        sign = -1
+        d = d - 1800
+    end
+    if d > 900 is d = 1800 - d end
+    let t: [int] = sin_tab()
+    let whole: int = d / 10
+    let frac: int = d % 10
+    let lo: int = t[whole]
+    let hi: int = if whole >= 90 then t[90] else t[whole + 1]
+    return sign * (lo + (hi - lo) * frac / 10)
+end
+
+fn cos_m(deci: int) -> int is
+    return sin_m(deci + 900)
+end
+
+fn tan_m(deci: int) -> int is
+    let c: int = cos_m(deci)
+    let s: int = sin_m(deci)
+    if c > -20 && c < 20 is return (if s >= 0 then 50000 else -50000) end
+    return s * 1000 / c
+end
+
+fn mat_id() -> [int] is
+    return [1000, 0, 0, 1000, 0, 0]
+end
+
+;; m1 * m2 (m2 działa pierwszy na punkcie), e/f w tysięcznych px
+fn mat_mul(m1: [int], m2: [int]) -> [int] is
+    let a: int = (m1[0] * m2[0] + m1[2] * m2[1]) / 1000
+    let b: int = (m1[1] * m2[0] + m1[3] * m2[1]) / 1000
+    let c: int = (m1[0] * m2[2] + m1[2] * m2[3]) / 1000
+    let d: int = (m1[1] * m2[2] + m1[3] * m2[3]) / 1000
+    let e: int = (m1[0] * m2[4] + m1[2] * m2[5]) / 1000 + m1[4]
+    let f: int = (m1[1] * m2[4] + m1[3] * m2[5]) / 1000 + m1[5]
+    return [a, b, c, d, e, f]
+end
+
+fn mat_rotate(deci: int) -> [int] is
+    let c: int = cos_m(deci)
+    let s: int = sin_m(deci)
+    return [c, s, 0 - s, c, 0, 0]
+end
+
+fn mat_str(m: [int]) -> string is
+    return to_string(m[0]) + " " + to_string(m[1]) + " " + to_string(m[2]) + " " + to_string(m[3]) + " " + to_string(m[4]) + " " + to_string(m[5])
+end
+
+fn mat_parse(v: string) -> [int] is
+    if v == "" is return [] end
+    let t: [string] = string_split(v, " ")
+    if array_len(t) < 6 is return [] end
+    return [str_to_int(t[0]), str_to_int(t[1]), str_to_int(t[2]), str_to_int(t[3]), str_to_int(t[4]), str_to_int(t[5])]
+end
+
+fn px_milli(tok: string, env: cssval::LenEnv) -> int is
+    let l: cssval::Len = cssval::parse_len(tok, env)
+    if !l.ok is return 0 end
+    return l.px * 1000
+end
+
+;; Lista funkcji transform → złożona macierz (kolejność jak w CSS: pierwsza funkcja jest zewnętrzna).
+fn parse_transform_matrix(val: string, env: cssval::LenEnv) -> [int] is
+    let l: string = string_lower(string_trim(val))
+    if l == "none" || l == "" is return [] end
+    let toks: [string] = cssval::split_top(l)
+    let mut m: [int] = mat_id()
+    let mut got: bool = false
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        let op: int = string_find(t, "(")
+        if op <= 0 is continue end
+        let name: string = string_slice(t, 0, op)
+        let inner: string = string_slice(t, op + 1, if string_ends_with(t, ")") then string_len(t) - 1 else string_len(t))
+        let a: [string] = cssval::split_commas(inner)
+        let a0: string = if array_len(a) >= 1 then string_trim(a[0]) else "0"
+        let a1: string = if array_len(a) >= 2 then string_trim(a[1]) else ""
+        let mut f: [int] = []
+        if name == "translate" || name == "translate3d" is
+            f = [1000, 0, 0, 1000, px_milli(a0, env), if a1 == "" then 0 else px_milli(a1, env)]
+        elsif name == "translatex" is
+            f = [1000, 0, 0, 1000, px_milli(a0, env), 0]
+        elsif name == "translatey" is
+            f = [1000, 0, 0, 1000, 0, px_milli(a0, env)]
+        elsif name == "scale" || name == "scale3d" is
+            let sx: int = milli_of(num_f(a0))
+            f = [sx, 0, 0, if a1 == "" then sx else milli_of(num_f(a1)), 0, 0]
+        elsif name == "scalex" is
+            f = [milli_of(num_f(a0)), 0, 0, 1000, 0, 0]
+        elsif name == "scaley" is
+            f = [1000, 0, 0, milli_of(num_f(a0)), 0, 0]
+        elsif name == "rotate" || name == "rotatez" is
+            f = mat_rotate(angle_deci(a0))
+        elsif name == "rotate3d" is
+            f = mat_rotate(angle_deci(if array_len(a) >= 4 then string_trim(a[3]) else "0"))
+        elsif name == "skew" is
+            f = [1000, if a1 == "" then 0 else tan_m(angle_deci(a1)), tan_m(angle_deci(a0)), 1000, 0, 0]
+        elsif name == "skewx" is
+            f = [1000, 0, tan_m(angle_deci(a0)), 1000, 0, 0]
+        elsif name == "skewy" is
+            f = [1000, tan_m(angle_deci(a0)), 0, 1000, 0, 0]
+        elsif name == "matrix" && array_len(a) >= 6 is
+            f = [milli_of(num_f(a[0])), milli_of(num_f(a[1])), milli_of(num_f(a[2])), milli_of(num_f(a[3])), px_milli(a[4], env), px_milli(a[5], env)]
+        end
+        if array_len(f) == 6 is
+            m = mat_mul(m, f)
+            got = true
+        end
+    end
+    if !got is return [] end
+    return m
+end
+
+;; Po wszystkich deklaracjach: translate · rotate · scale · transform. Obrót/pochylenie → st.tr_m.
+fn finalize_transform(st0: ComputedStyle) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let mt: [int] = mat_parse(props::xget(st.xp, "x-m-transform"))
+    let mtr: [int] = mat_parse(props::xget(st.xp, "x-m-translate"))
+    let mr: [int] = mat_parse(props::xget(st.xp, "x-m-rotate"))
+    let ms: [int] = mat_parse(props::xget(st.xp, "x-m-scale"))
+    st.tr_m = []
+    if array_len(mt) == 0 && array_len(mtr) == 0 && array_len(mr) == 0 && array_len(ms) == 0 is return st end
+    let mut m: [int] = mat_id()
+    if array_len(mtr) == 6 is m = mat_mul(m, mtr) end
+    if array_len(mr) == 6 is m = mat_mul(m, mr) end
+    if array_len(ms) == 6 is m = mat_mul(m, ms) end
+    if array_len(mt) == 6 is m = mat_mul(m, mt) end
+    if m[1] != 0 || m[2] != 0 is
+        st.tr_m = m          ;; pola tr_* zostają (zgodność); układ/rysowanie używają tr_m, gdy niepuste
+        st.has_transform = true
+        return st
+    end
+    ;; osobne właściwości rotate/scale/translate (bez obrotu): wynik złożony w polach skali/przesunięcia
+    if array_len(mtr) == 6 || array_len(mr) == 6 || array_len(ms) == 6 is
+        st.has_transform = true
+        st.tr_sx = m[0]
+        st.tr_sy = m[3]
+        st.tr_tx = m[4] / 1000
+        st.tr_ty = m[5] / 1000
+        st.tr_tx_pct = 0
+        st.tr_ty_pct = 0
+    end
+    return st
+end
+
+fn origin_tok(t: string) -> int is
+    let l: string = string_lower(string_trim(t))
+    if l == "left" || l == "top" is return 0 end
+    if l == "right" || l == "bottom" is return 10000 end
+    if l == "center" is return 5000 end
+    if string_ends_with(l, "%") is return conv::float_to_int(num_f(string_slice(l, 0, string_len(l) - 1)) * 100.0) end
+    return 5000
+end
+
+fn apply_filter_fns(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let l: string = string_lower(string_trim(val))
+    st.has_filter = false
+    st.f_gray = 0
+    st.f_bright = 100
+    st.f_contrast = 100
+    st.f_invert = 0
+    st.f_sepia = 0
+    st.f_opacity = 100
+    if l == "none" || l == "" is return st end
+    if has_fn(l, "grayscale") is
+        st.f_gray = clamp_pct(pct_unclamped(fn_args(l, "grayscale", 0)))
+        st.has_filter = true
+    end
+    if has_fn(l, "brightness") is
+        st.f_bright = pct_unclamped(fn_args(l, "brightness", 0))
+        st.has_filter = true
+    end
+    if has_fn(l, "contrast") is
+        st.f_contrast = pct_unclamped(fn_args(l, "contrast", 0))
+        st.has_filter = true
+    end
+    if has_fn(l, "invert") is
+        st.f_invert = clamp_pct(pct_unclamped(fn_args(l, "invert", 0)))
+        st.has_filter = true
+    end
+    if has_fn(l, "sepia") is
+        st.f_sepia = clamp_pct(pct_unclamped(fn_args(l, "sepia", 0)))
+        st.has_filter = true
+    end
+    if has_fn(l, "opacity") is
+        st.f_opacity = clamp_pct(pct_unclamped(fn_args(l, "opacity", 0)))
+        st.has_filter = true
+    end
+    return st
+end
+
+fn is_time_tok(t: string) -> bool is
+    if string_ends_with(t, "ms") && string_len(t) > 2 is return true end
+    if string_ends_with(t, "s") && string_len(t) > 1 is
+        let c: string = string_slice(t, 0, 1)
+        return (c >= "0" && c <= "9") || c == "." || c == "-"
+    end
+    return false
+end
+
+fn time_ms(t: string) -> int is
+    if string_ends_with(t, "ms") is return conv::float_to_int(num_f(string_slice(t, 0, string_len(t) - 2))) end
+    return conv::float_to_int(num_f(string_slice(t, 0, string_len(t) - 1)) * 1000.0)
+end
+
+fn is_timing_tok(t: string) -> bool is
+    return t == "ease" || t == "linear" || t == "ease-in" || t == "ease-out" || t == "ease-in-out" ||
+           t == "step-start" || t == "step-end" || string_starts_with(t, "cubic-bezier(") || string_starts_with(t, "steps(")
+end
+
+fn apply_animation(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let layers: [string] = cssval::split_commas(val)
+    if array_len(layers) == 0 || string_lower(string_trim(layers[0])) == "none" is
+        st.anim_name = ""
+        st.anim_ms = 0
+        return st
+    end
+    let toks: [string] = cssval::split_top(string_lower(layers[0]))
+    let mut times: int = 0
+    st.anim_name = ""
+    st.anim_ms = 0
+    st.anim_delay = 0
+    st.anim_iter = 1000
+    st.anim_dir = "normal"
+    st.anim_fill = "none"
+    st.anim_ease = "ease"
+    st.anim_paused = false
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if is_time_tok(t) is
+            if times == 0 is st.anim_ms = time_ms(t) else is st.anim_delay = time_ms(t) end
+            times += 1
+        elsif is_timing_tok(t) is
+            st.anim_ease = t
+        elsif t == "infinite" is
+            st.anim_iter = -1
+        elsif t == "normal" || t == "reverse" || t == "alternate" || t == "alternate-reverse" is
+            st.anim_dir = t
+        elsif t == "none" && st.anim_name != "" is
+            st.anim_fill = "none"
+        elsif t == "forwards" || t == "backwards" || t == "both" is
+            st.anim_fill = t
+        elsif t == "paused" is
+            st.anim_paused = true
+        elsif t == "running" is
+            st.anim_paused = false
+        else is
+            let c: string = string_slice(t, 0, 1)
+            if (c >= "0" && c <= "9") || c == "." is
+                st.anim_iter = milli_of(num_f(t))
+            else is
+                st.anim_name = t
+            end
+        end
+    end
+    return st
+end
+
+fn apply_transition(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let layers: [string] = cssval::split_commas(val)
+    if array_len(layers) == 0 || string_lower(string_trim(layers[0])) == "none" is
+        st.trans_ms = 0
+        st.trans_prop = "all"
+        return st
+    end
+    let mut props: string = ""
+    let mut li: int = 0
+    while li < array_len(layers) is
+        let toks: [string] = cssval::split_top(string_lower(layers[li]))
+        let mut times: int = 0
+        let mut name: string = "all"
+        let mut ti: int = 0
+        while ti < array_len(toks) is
+            let t: string = toks[ti]
+            ti += 1
+            if is_time_tok(t) is
+                if li == 0 is
+                    if times == 0 is st.trans_ms = time_ms(t) else is st.trans_delay = time_ms(t) end
+                end
+                times += 1
+            elsif is_timing_tok(t) is
+                if li == 0 is st.trans_ease = t end
+            else is
+                name = t
+            end
+        end
+        props = if li == 0 then name else props + "," + name
+        li += 1
+    end
+    st.trans_prop = props
+    return st
+end
+
+;; grid-template-areas: "a b" "c d"  ->  "a b\u0001c d"
+fn parse_areas(val: string) -> string is
+    let mut out: string = ""
+    let mut p: int = 0
+    let n: int = string_len(val)
+    while p < n is
+        let q: int = string_find(string_slice(val, p, n), "\"")
+        if q < 0 is break end
+        let start: int = p + q + 1
+        let e: int = string_find(string_slice(val, start, n), "\"")
+        if e < 0 is break end
+        let row: string = string_trim(string_slice(val, start, start + e))
+        out = if out == "" then row else out + "\u0001" + row
+        p = start + e + 1
+    end
+    return out
+end
+
+;; "2", "span 3", "2 / span 3", "2 / 4" -> [start, span]
+fn parse_line_span(val: string) -> [int] is
+    let l: string = string_lower(string_trim(val))
+    let parts: [string] = string_split(l, "/")
+    let a: string = string_trim(parts[0])
+    let mut start: int = 0
+    let mut span: int = 1
+    if string_starts_with(a, "span") is
+        span = str_to_int(string_trim(string_slice(a, 4, string_len(a))))
+    elsif a != "auto" && a != "" is
+        start = str_to_int(a)
+    end
+    if array_len(parts) >= 2 is
+        let b: string = string_trim(parts[1])
+        if string_starts_with(b, "span") is
+            span = str_to_int(string_trim(string_slice(b, 4, string_len(b))))
+        elsif b != "auto" && b != "" && start > 0 is
+            let e: int = str_to_int(b)
+            if e > start is span = e - start end
+        end
+    end
+    if span < 1 is span = 1 end
+    return [start, span]
+end
+
+fn parse_aspect(val: string) -> int is
+    let l: string = string_lower(string_trim(val))
+    if l == "auto" || l == "" is return 0 end
+    let parts: [string] = string_split(l, "/")
+    let a: f64 = num_f(parts[0])
+    let b: f64 = if array_len(parts) >= 2 then num_f(parts[1]) else 1.0
+    if a <= 0.0 || b <= 0.0 is return 0 end
+    return milli_of(a / b)
+end
+
+fn list_style_type(t: string) -> bool is
+    return t == "none" || t == "disc" || t == "circle" || t == "square" || t == "decimal" || t == "decimal-leading-zero" ||
+           t == "lower-alpha" || t == "upper-alpha" || t == "lower-latin" || t == "upper-latin" || t == "lower-roman" ||
+           t == "upper-roman" || t == "lower-greek"
+end
+
+fn apply_list_style(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let toks: [string] = cssval::split_top(string_lower(val))
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if list_style_type(t) is st.list_style = t end
+        if t == "inside" || t == "outside" is st.list_pos = t end
+    end
+    return st
+end
+
+fn apply_text_shadow(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let layers: [string] = cssval::split_commas(val)
+    if array_len(layers) == 0 || string_lower(string_trim(layers[0])) == "none" is
+        st.has_tshadow = false
+        return st
+    end
+    let toks: [string] = cssval::split_top(layers[0])
+    let mut nums: [int] = []
+    let mut col: Color = st.color
+    let mut have_col: bool = false
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if cssval::is_color(t) is
+            col = parse_color(t)
+            have_col = true
+        else is
+            nums = array_push(nums, len_px_or(t, env, 0, 0))
+        end
+    end
+    if array_len(nums) < 2 is
+        st.has_tshadow = false
+        return st
+    end
+    st.has_tshadow = true
+    st.ts_x = nums[0]
+    st.ts_y = nums[1]
+    st.ts_blur = if array_len(nums) >= 3 then nums[2] else 0
+    st.ts_color = col
+    return st
+end
+
+fn apply_vertical_align(st0: ComputedStyle, lower: string, env: cssval::LenEnv) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    st.valign_px = 0
+    if lower == "baseline" || lower == "top" || lower == "middle" || lower == "bottom" || lower == "sub" ||
+       lower == "super" || lower == "text-top" || lower == "text-bottom" is
+        st.valign = lower
+    else is
+        st.valign = "baseline"
+        st.valign_px = len_px_or(lower, env, st.font_size, 0)
+    end
+    return st
+end
+
+fn font_weight_num(lower: string, cur: int) -> int is
+    if lower == "normal" is return 400 end
+    if lower == "bold" || lower == "bolder" is return 700 end
+    if lower == "lighter" is return 300 end
+    let n: int = str_to_int(lower)
+    if n >= 1 && n <= 1000 is return n end
+    return cur
+end
+
+fn apply_deco_extras(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let toks: [string] = cssval::split_top(string_lower(val))
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if t == "solid" || t == "double" || t == "dotted" || t == "dashed" || t == "wavy" is
+            st.deco_style = t
+        elsif cssval::is_color(t) is
+            st.deco_color = parse_color(t)
+            st.has_deco_color = true
+        end
+    end
+    return st
+end
+
+fn apply_bg_extras(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let toks: [string] = cssval::split_top(string_lower(val))
+    let mut pos: string = ""
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if t == "/" is break end
+        if t == "repeat" || t == "no-repeat" || t == "repeat-x" || t == "repeat-y" || t == "space" || t == "round" is
+            st.bg_repeat = t
+        elsif t == "left" || t == "right" || t == "top" || t == "bottom" || t == "center" || (string_ends_with(t, "%") && !cssval::is_color(t)) is
+            pos = if pos == "" then t else pos + " " + t
+        end
+    end
+    if pos != "" is st.bg_pos = pos end
+    return st
+end
+
+fn side_style_of(t: string) -> bool is
+    return t == "none" || t == "hidden" || t == "solid" || t == "dashed" || t == "dotted" || t == "double" ||
+           t == "groove" || t == "ridge" || t == "inset" || t == "outset"
+end
+
+fn grid_align_kw(lower: string) -> string is
+    if lower == "start" || lower == "self-start" is return "flex-start" end
+    if lower == "end" || lower == "self-end" is return "flex-end" end
+    if lower == "normal" is return "stretch" end
+    return lower
+end
+
+;; Rozwija właściwości logiczne do fizycznych (zakładamy LTR, tryb poziomy).
+fn emit_decl(out: [css::CssDecl], prop: string, val: string, imp: bool) -> [css::CssDecl] is
+    return array_push(out, css::CssDecl { prop: prop, val: val, important: imp })
+end
+
+;; Czy układ jest od prawej do lewej (ostatnia deklaracja `direction` w bloku albo dziedziczone).
+fn dir_is_rtl(decls: [css::CssDecl], parent_dir: string) -> bool is
+    let mut dir: string = parent_dir
+    let mut i: int = 0
+    while i < array_len(decls) is
+        if decls[i].prop == "direction" is dir = string_lower(string_trim(decls[i].val)) end
+        i += 1
+    end
+    return dir == "rtl"
+end
+
+;; Rodziny z sufiksami fizycznymi `<rodzina>-top|right|bottom|left`; `inset` ma gołe top/right/bottom/left.
+fn phys_name(family: string, side: string) -> string is
+    if family == "inset" is return side end
+    return family + "-" + side
+end
+
+;; Zamienia właściwości logiczne na fizyczne (tryb poziomy; `rtl` zamienia start↔end w osi inline).
+fn expand_logical(decls: [css::CssDecl], rtl: bool) -> [css::CssDecl] is
+    let il: string = if rtl then "right" else "left"      ;; inline-start
+    let ir: string = if rtl then "left" else "right"      ;; inline-end
+    let mut out: [css::CssDecl] = []
+    let mut i: int = 0
+    while i < array_len(decls) is
+        let d: css::CssDecl = decls[i]
+        i += 1
+        let p: string = d.prop
+        let toks: [string] = cssval::split_top(d.val)
+        let a: string = if array_len(toks) >= 1 then toks[0] else d.val
+        let b: string = if array_len(toks) >= 2 then toks[1] else a
+        let imp: bool = d.important
+        let mut done: bool = false
+        ;; skróty scroll-margin / scroll-padding (1–4 wartości, jak margin)
+        if p == "scroll-margin" || p == "scroll-padding" is
+            let t4: [string] = toks
+            let n4: int = array_len(t4)
+            if n4 >= 1 && n4 <= 4 is
+                let vt: string = t4[0]
+                let vr: string = if n4 >= 2 then t4[1] else vt
+                let vb: string = if n4 >= 3 then t4[2] else vt
+                let vl: string = if n4 >= 4 then t4[3] else vr
+                out = emit_decl(out, p + "-top", vt, imp)
+                out = emit_decl(out, p + "-right", vr, imp)
+                out = emit_decl(out, p + "-bottom", vb, imp)
+                out = emit_decl(out, p + "-left", vl, imp)
+                continue
+            end
+        end
+        ;; rodziny margin / padding / inset / scroll-margin / scroll-padding
+        let fams: [string] = ["margin", "padding", "inset", "scroll-margin", "scroll-padding"]
+        let mut f: int = 0
+        while f < array_len(fams) && !done is
+            let fam: string = fams[f]
+            f += 1
+            if p == fam + "-inline" || (fam == "inset" && p == "inset-inline") is
+                out = emit_decl(out, phys_name(fam, il), a, imp)
+                out = emit_decl(out, phys_name(fam, ir), b, imp)
+                done = true
+            elsif p == fam + "-block" || (fam == "inset" && p == "inset-block") is
+                out = emit_decl(out, phys_name(fam, "top"), a, imp)
+                out = emit_decl(out, phys_name(fam, "bottom"), b, imp)
+                done = true
+            elsif p == fam + "-inline-start" is
+                out = emit_decl(out, phys_name(fam, il), d.val, imp)
+                done = true
+            elsif p == fam + "-inline-end" is
+                out = emit_decl(out, phys_name(fam, ir), d.val, imp)
+                done = true
+            elsif p == fam + "-block-start" is
+                out = emit_decl(out, phys_name(fam, "top"), d.val, imp)
+                done = true
+            elsif p == fam + "-block-end" is
+                out = emit_decl(out, phys_name(fam, "bottom"), d.val, imp)
+                done = true
+            end
+        end
+        if done is continue end
+        ;; rozmiary logiczne (tryb poziomy)
+        if p == "overflow-inline" is
+            out = emit_decl(out, "overflow-x", d.val, imp)
+        elsif p == "overflow-block" is
+            out = emit_decl(out, "overflow-y", d.val, imp)
+        elsif p == "inline-size" is
+            out = emit_decl(out, "width", d.val, imp)
+        elsif p == "block-size" is
+            out = emit_decl(out, "height", d.val, imp)
+        elsif p == "min-inline-size" is
+            out = emit_decl(out, "min-width", d.val, imp)
+        elsif p == "max-inline-size" is
+            out = emit_decl(out, "max-width", d.val, imp)
+        elsif p == "min-block-size" is
+            out = emit_decl(out, "min-height", d.val, imp)
+        elsif p == "max-block-size" is
+            out = emit_decl(out, "max-height", d.val, imp)
+        ;; ramki skrótowe
+        elsif p == "border-inline" is
+            out = emit_decl(out, "border-left", d.val, imp)
+            out = emit_decl(out, "border-right", d.val, imp)
+        elsif p == "border-block" is
+            out = emit_decl(out, "border-top", d.val, imp)
+            out = emit_decl(out, "border-bottom", d.val, imp)
+        elsif p == "border-inline-start" is
+            out = emit_decl(out, "border-" + il, d.val, imp)
+        elsif p == "border-inline-end" is
+            out = emit_decl(out, "border-" + ir, d.val, imp)
+        elsif p == "border-block-start" is
+            out = emit_decl(out, "border-top", d.val, imp)
+        elsif p == "border-block-end" is
+            out = emit_decl(out, "border-bottom", d.val, imp)
+        ;; promienie logiczne
+        elsif p == "border-start-start-radius" is
+            out = emit_decl(out, if rtl then "border-top-right-radius" else "border-top-left-radius", d.val, imp)
+        elsif p == "border-start-end-radius" is
+            out = emit_decl(out, if rtl then "border-top-left-radius" else "border-top-right-radius", d.val, imp)
+        elsif p == "border-end-start-radius" is
+            out = emit_decl(out, if rtl then "border-bottom-right-radius" else "border-bottom-left-radius", d.val, imp)
+        elsif p == "border-end-end-radius" is
+            out = emit_decl(out, if rtl then "border-bottom-left-radius" else "border-bottom-right-radius", d.val, imp)
+        ;; border-{inline,block}[-start|-end]-{width,style,color}
+        elsif string_starts_with(p, "border-inline-") || string_starts_with(p, "border-block-") is
+            let axis_inline: bool = string_starts_with(p, "border-inline-")
+            let rest: string = string_slice(p, if axis_inline then 14 else 13, string_len(p))
+            let mut prop_kind: string = ""
+            let mut which: string = ""
+            if rest == "width" || rest == "style" || rest == "color" is
+                prop_kind = rest
+                which = "both"
+            elsif string_starts_with(rest, "start-") is
+                prop_kind = string_slice(rest, 6, string_len(rest))
+                which = "start"
+            elsif string_starts_with(rest, "end-") is
+                prop_kind = string_slice(rest, 4, string_len(rest))
+                which = "end"
+            end
+            if prop_kind == "" is
+                out = emit_decl(out, p, d.val, imp)
+            else is
+                let s1: string = if axis_inline then il else "top"
+                let s2: string = if axis_inline then ir else "bottom"
+                if which == "both" is
+                    out = emit_decl(out, "border-" + s1 + "-" + prop_kind, a, imp)
+                    out = emit_decl(out, "border-" + s2 + "-" + prop_kind, b, imp)
+                elsif which == "start" is
+                    out = emit_decl(out, "border-" + s1 + "-" + prop_kind, d.val, imp)
+                else is
+                    out = emit_decl(out, "border-" + s2 + "-" + prop_kind, d.val, imp)
+                end
+            end
+        else is
+            out = array_push(out, d)
+        end
+    end
+    return out
+end
+
+;; Zdejmuje prefiksy dostawców z nazwy właściwości.
+fn unprefix(prop: string) -> string is
+    if string_starts_with(prop, "-webkit-") is return string_slice(prop, 8, string_len(prop)) end
+    if string_starts_with(prop, "-moz-") is return string_slice(prop, 5, string_len(prop)) end
+    if string_starts_with(prop, "-ms-") is return string_slice(prop, 4, string_len(prop)) end
+    if string_starts_with(prop, "-o-") is return string_slice(prop, 3, string_len(prop)) end
+    return prop
+end
+
+;; Właściwości dziedziczone (do `unset`).
+fn is_inherited_prop(prop: string) -> bool is
+    return prop == "color" || prop == "font-size" || prop == "font-weight" || prop == "font-style" || prop == "font-family" ||
+           prop == "font" || prop == "line-height" || prop == "text-align" || prop == "text-transform" || prop == "text-indent" ||
+           prop == "letter-spacing" || prop == "word-spacing" || prop == "white-space" || prop == "cursor" || prop == "visibility" ||
+           prop == "list-style" || prop == "list-style-type" || prop == "list-style-position" || prop == "text-shadow" ||
+           prop == "direction" || prop == "border-spacing" || prop == "border-collapse" || prop == "pointer-events" || prop == "word-break" || prop == "overflow-wrap" ||
+           prop == "word-wrap" || prop == "tab-size" || prop == "hyphens" || prop == "accent-color" || prop == "caret-color" ||
+           prop == "scroll-behavior"
+end
+
+;; Kopiuje wartość właściwości `prop` (i jej skrótowych odpowiedników) z `src` do `st0`.
+fn copy_prop(st0: ComputedStyle, src: ComputedStyle, prop: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    if prop == "color" is st.color = src.color
+    elsif prop == "background" || prop == "background-color" || prop == "background-image" is
+        st.background = src.background
+        st.has_bg = src.has_bg
+        if prop != "background-color" is
+            st.bg_image = src.bg_image
+            st.has_grad = src.has_grad
+            st.grad_from = src.grad_from
+            st.grad_to = src.grad_to
+            st.grad_vertical = src.grad_vertical
+        end
+    elsif prop == "background-size" is st.bg_size = src.bg_size
+    elsif prop == "background-repeat" is st.bg_repeat = src.bg_repeat
+    elsif prop == "background-position" is st.bg_pos = src.bg_pos
+    elsif prop == "display" is st.display = src.display
+    elsif prop == "position" is st.position = src.position
+    elsif prop == "visibility" is st.visible = src.visible
+    elsif prop == "overflow" || prop == "overflow-x" || prop == "overflow-y" is
+        if prop != "overflow-y" is st.overflow_x = src.overflow_x end
+        if prop != "overflow-x" is st.overflow_y = src.overflow_y end
+    elsif prop == "width" is
+        st.width = src.width
+        st.width_pct = src.width_pct
+        st.width_mode = src.width_mode
+    elsif prop == "height" is
+        st.height = src.height
+        st.height_pct = src.height_pct
+        st.height_mode = src.height_mode
+    elsif prop == "min-width" is
+        st.min_width = src.min_width
+        st.min_width_pct = src.min_width_pct
+    elsif prop == "max-width" is
+        st.max_width = src.max_width
+        st.max_width_pct = src.max_width_pct
+        st.max_width_mode = src.max_width_mode
+    elsif prop == "min-height" is st.min_height = src.min_height
+    elsif prop == "max-height" is
+        st.max_height = src.max_height
+        st.max_height_mode = src.max_height_mode
+    elsif prop == "box-sizing" is st.border_box = src.border_box
+    elsif prop == "padding" || prop == "margin" || prop == "inset" is
+        if prop == "padding" is
+            st.pad_top = src.pad_top
+            st.pad_right = src.pad_right
+            st.pad_bottom = src.pad_bottom
+            st.pad_left = src.pad_left
+            st.padding = src.padding
+        elsif prop == "margin" is
+            st.mar_top = src.mar_top
+            st.mar_right = src.mar_right
+            st.mar_bottom = src.mar_bottom
+            st.mar_left = src.mar_left
+            st.margin = src.margin
+        else is
+            st.top = src.top
+            st.right = src.right
+            st.bottom = src.bottom
+            st.left = src.left
+        end
+    elsif prop == "padding-top" is st.pad_top = src.pad_top
+    elsif prop == "padding-right" is st.pad_right = src.pad_right
+    elsif prop == "padding-bottom" is st.pad_bottom = src.pad_bottom
+    elsif prop == "padding-left" is st.pad_left = src.pad_left
+    elsif prop == "margin-top" is st.mar_top = src.mar_top
+    elsif prop == "margin-right" is st.mar_right = src.mar_right
+    elsif prop == "margin-bottom" is st.mar_bottom = src.mar_bottom
+    elsif prop == "margin-left" is st.mar_left = src.mar_left
+    elsif prop == "top" is st.top = src.top
+    elsif prop == "right" is st.right = src.right
+    elsif prop == "bottom" is st.bottom = src.bottom
+    elsif prop == "left" is st.left = src.left
+    elsif prop == "z-index" is st.z_index = src.z_index
+    elsif prop == "font-size" is st.font_size = src.font_size
+    elsif prop == "font-weight" is
+        st.bold = src.bold
+        st.font_weight = src.font_weight
+    elsif prop == "font-style" is st.italic = src.italic
+    elsif prop == "font-family" is
+        st.font_family = src.font_family
+        st.font_key = src.font_key
+    elsif prop == "font" is
+        st.font_size = src.font_size
+        st.bold = src.bold
+        st.italic = src.italic
+        st.line_height = src.line_height
+        st.font_weight = src.font_weight
+        st.font_family = src.font_family
+        st.font_key = src.font_key
+    elsif prop == "line-height" is st.line_height = src.line_height
+    elsif prop == "text-align" is st.text_align = src.text_align
+    elsif prop == "text-transform" is st.text_transform = src.text_transform
+    elsif prop == "text-decoration" || prop == "text-decoration-line" is
+        st.underline = src.underline
+        st.strike = src.strike
+        st.deco_color = src.deco_color
+        st.has_deco_color = src.has_deco_color
+        st.deco_style = src.deco_style
+    elsif prop == "text-overflow" is st.ellipsis = src.ellipsis
+    elsif prop == "white-space" is st.white_space = src.white_space
+    elsif prop == "word-break" || prop == "overflow-wrap" || prop == "word-wrap" is st.break_words = src.break_words
+    elsif prop == "cursor" is st.cursor = src.cursor
+    elsif prop == "letter-spacing" is st.letter_spacing = src.letter_spacing
+    elsif prop == "word-spacing" is st.word_spacing = src.word_spacing
+    elsif prop == "text-indent" is st.text_indent = src.text_indent
+    elsif prop == "text-shadow" is
+        st.has_tshadow = src.has_tshadow
+        st.ts_x = src.ts_x
+        st.ts_y = src.ts_y
+        st.ts_blur = src.ts_blur
+        st.ts_color = src.ts_color
+    elsif prop == "vertical-align" is
+        st.valign = src.valign
+        st.valign_px = src.valign_px
+    elsif prop == "list-style" || prop == "list-style-type" || prop == "list-style-position" is
+        st.list_style = src.list_style
+        st.list_pos = src.list_pos
+    elsif prop == "direction" is st.direction = src.direction
+    elsif prop == "border-spacing" is st.border_spacing = src.border_spacing
+    elsif prop == "border-collapse" is st.border_collapse = src.border_collapse
+    elsif prop == "table-layout" is st.table_fixed = src.table_fixed
+    elsif prop == "border" is
+        st.bt = src.bt
+        st.br = src.br
+        st.bb = src.bb
+        st.bl = src.bl
+        st.border = src.border
+        st.border_color = src.border_color
+        st.bct = src.bct
+        st.bcr = src.bcr
+        st.bcb = src.bcb
+        st.bcl = src.bcl
+        st.border_style = src.border_style
+        st.bs_r = src.bs_r
+        st.bs_b = src.bs_b
+        st.bs_l = src.bs_l
+    elsif prop == "border-width" is
+        st.bt = src.bt
+        st.br = src.br
+        st.bb = src.bb
+        st.bl = src.bl
+        st.border = src.border
+    elsif prop == "border-color" is
+        st.bct = src.bct
+        st.bcr = src.bcr
+        st.bcb = src.bcb
+        st.bcl = src.bcl
+        st.border_color = src.border_color
+    elsif prop == "border-style" is
+        st.border_style = src.border_style
+        st.bs_r = src.bs_r
+        st.bs_b = src.bs_b
+        st.bs_l = src.bs_l
+    elsif prop == "border-top-style" is st.border_style = src.border_style
+    elsif prop == "border-right-style" is st.bs_r = src.bs_r
+    elsif prop == "border-bottom-style" is st.bs_b = src.bs_b
+    elsif prop == "border-left-style" is st.bs_l = src.bs_l
+    elsif prop == "border-top" || prop == "border-top-width" || prop == "border-top-color" is
+        st.bt = src.bt
+        st.bct = src.bct
+        st.border = src.border
+        st.border_color = src.border_color
+    elsif prop == "border-right" || prop == "border-right-width" || prop == "border-right-color" is
+        st.br = src.br
+        st.bcr = src.bcr
+    elsif prop == "border-bottom" || prop == "border-bottom-width" || prop == "border-bottom-color" is
+        st.bb = src.bb
+        st.bcb = src.bcb
+    elsif prop == "border-left" || prop == "border-left-width" || prop == "border-left-color" is
+        st.bl = src.bl
+        st.bcl = src.bcl
+    elsif prop == "border-radius" is
+        st.rad_tl = src.rad_tl
+        st.rad_tr = src.rad_tr
+        st.rad_br = src.rad_br
+        st.rad_bl = src.rad_bl
+    elsif prop == "border-top-left-radius" is st.rad_tl = src.rad_tl
+    elsif prop == "border-top-right-radius" is st.rad_tr = src.rad_tr
+    elsif prop == "border-bottom-right-radius" is st.rad_br = src.rad_br
+    elsif prop == "border-bottom-left-radius" is st.rad_bl = src.rad_bl
+    elsif prop == "box-shadow" is
+        st.has_shadow = src.has_shadow
+        st.sh_x = src.sh_x
+        st.sh_y = src.sh_y
+        st.sh_blur = src.sh_blur
+        st.sh_spread = src.sh_spread
+        st.sh_color = src.sh_color
+    elsif prop == "outline" || prop == "outline-width" || prop == "outline-color" || prop == "outline-style" || prop == "outline-offset" is
+        st.outline_w = src.outline_w
+        st.outline_color = src.outline_color
+        st.outline_style = src.outline_style
+        st.outline_offset = src.outline_offset
+    elsif prop == "gap" is
+        st.gap = src.gap
+        st.row_gap = src.row_gap
+    elsif prop == "column-gap" is st.gap = src.gap
+    elsif prop == "row-gap" is st.row_gap = src.row_gap
+    elsif prop == "flex-direction" is st.flex_dir = src.flex_dir
+    elsif prop == "flex-wrap" is st.flex_wrap = src.flex_wrap
+    elsif prop == "flex-flow" is
+        st.flex_dir = src.flex_dir
+        st.flex_wrap = src.flex_wrap
+    elsif prop == "flex" is
+        st.flex_grow = src.flex_grow
+        st.flex_shrink = src.flex_shrink
+        st.flex_basis = src.flex_basis
+    elsif prop == "flex-grow" is st.flex_grow = src.flex_grow
+    elsif prop == "flex-shrink" is st.flex_shrink = src.flex_shrink
+    elsif prop == "flex-basis" is st.flex_basis = src.flex_basis
+    elsif prop == "order" is st.order = src.order
+    elsif prop == "justify-content" is st.justify = src.justify
+    elsif prop == "align-items" is st.align = src.align
+    elsif prop == "align-self" is st.align_self = src.align_self
+    elsif prop == "align-content" is st.align_content = src.align_content
+    elsif prop == "justify-items" is st.justify_items = src.justify_items
+    elsif prop == "justify-self" is st.justify_self = src.justify_self
+    elsif prop == "grid-template-columns" is st.grid_cols = src.grid_cols
+    elsif prop == "grid-template-rows" is st.grid_rows = src.grid_rows
+    elsif prop == "grid-template-areas" is st.grid_areas = src.grid_areas
+    elsif prop == "grid-area" is
+        st.grid_area = src.grid_area
+        st.grid_row_start = src.grid_row_start
+        st.grid_row_span = src.grid_row_span
+        st.grid_col_start = src.grid_col_start
+        st.grid_col_span = src.grid_col_span
+    elsif prop == "grid-row" || prop == "grid-row-start" is
+        st.grid_row_start = src.grid_row_start
+        st.grid_row_span = src.grid_row_span
+    elsif prop == "grid-column" || prop == "grid-column-start" is
+        st.grid_col_start = src.grid_col_start
+        st.grid_col_span = src.grid_col_span
+    elsif prop == "grid-auto-flow" is st.grid_auto_flow = src.grid_auto_flow
+    elsif prop == "grid-auto-rows" is st.grid_auto_rows = src.grid_auto_rows
+    elsif prop == "grid-auto-columns" is st.grid_auto_cols = src.grid_auto_cols
+    elsif prop == "aspect-ratio" is st.aspect_ratio = src.aspect_ratio
+    elsif prop == "float" is st.float_side = src.float_side
+    elsif prop == "clear" is st.clear_side = src.clear_side
+    elsif prop == "opacity" is st.opacity = src.opacity
+    elsif prop == "object-fit" is st.object_fit = src.object_fit
+    elsif prop == "transform" || prop == "transform-origin" is
+        st.has_transform = src.has_transform
+        st.tr_tx = src.tr_tx
+        st.tr_ty = src.tr_ty
+        st.tr_tx_pct = src.tr_tx_pct
+        st.tr_ty_pct = src.tr_ty_pct
+        st.tr_sx = src.tr_sx
+        st.tr_sy = src.tr_sy
+        st.tr_rot = src.tr_rot
+        st.tr_m = src.tr_m
+        st.xp = copy_xkey(st.xp, src.xp, "x-m-transform")
+        st.origin_x = src.origin_x
+        st.origin_y = src.origin_y
+    elsif prop == "filter" is
+        st.has_filter = src.has_filter
+        st.f_gray = src.f_gray
+        st.f_bright = src.f_bright
+        st.f_contrast = src.f_contrast
+        st.f_invert = src.f_invert
+        st.f_sepia = src.f_sepia
+        st.f_opacity = src.f_opacity
+    elsif prop == "clip-path" is st.clip_path = src.clip_path
+    elsif prop == "pointer-events" is st.pointer_events = src.pointer_events
+    elsif prop == "user-select" is st.user_select = src.user_select
+    elsif prop == "resize" is st.resize = src.resize
+    elsif prop == "accent-color" is
+        st.accent = src.accent
+        st.has_accent = src.has_accent
+    elsif prop == "transition" || prop == "transition-duration" || prop == "transition-property" ||
+          prop == "transition-delay" || prop == "transition-timing-function" is
+        st.trans_ms = src.trans_ms
+        st.trans_prop = src.trans_prop
+        st.trans_delay = src.trans_delay
+        st.trans_ease = src.trans_ease
+    elsif string_starts_with(prop, "animation") is
+        st.anim_name = src.anim_name
+        st.anim_ms = src.anim_ms
+        st.anim_delay = src.anim_delay
+        st.anim_iter = src.anim_iter
+        st.anim_dir = src.anim_dir
+        st.anim_fill = src.anim_fill
+        st.anim_ease = src.anim_ease
+        st.anim_paused = src.anim_paused
+    elsif prop == "content" is
+        st.has_content = src.has_content
+        st.content = src.content
+    elsif props::known(prop) is
+        st.xp = copy_xkey(st.xp, src.xp, prop)
+        if prop == "rotate" || prop == "scale" || prop == "translate" is
+            st.xp = copy_xkey(st.xp, src.xp, "x-m-" + prop)
+        end
+    end
+    return st
+end
+
+fn copy_xkey(dst: string, src: string, key: string) -> string is
+    if props::xhas(src, key) is return props::xset(dst, key, props::xget(src, key)) end
+    return props::xdel(dst, key)
+end
+
+;; Słowa kluczowe całej kaskady: inherit / initial / unset / revert.
+fn apply_css_wide(st0: ComputedStyle, prop: string, kw: string, parent: ComputedStyle) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    if prop == "all" is
+        let keep: string = st.vars
+        if kw == "inherit" is
+            st = parent
+        else is
+            st = if kw == "initial" then root_style() else base_for(parent)
+        end
+        st.vars = keep
+        return st
+    end
+    if kw == "inherit" is return copy_prop(st, parent, prop) end
+    if kw == "initial" is return copy_prop(st, root_style(), prop) end
+    ;; unset / revert
+    if is_inherited_prop(prop) is return copy_prop(st, parent, prop) end
+    return copy_prop(st, root_style(), prop)
+end
+
+fn apply_border_style(st0: ComputedStyle, val: string) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    let toks: [string] = cssval::split_top(string_lower(val))
+    if array_len(toks) == 0 is return st end
+    let a: string = toks[0]
+    let b: string = if array_len(toks) >= 2 then toks[1] else a
+    let c: string = if array_len(toks) >= 3 then toks[2] else a
+    let d: string = if array_len(toks) >= 4 then toks[3] else b
+    st.border_style = a
+    st.bs_r = b
+    st.bs_b = c
+    st.bs_l = d
+    if a == "none" || a == "hidden" is
+        st.bt = 0
+        st.border = 0
+    end
+    if b == "none" || b == "hidden" is st.br = 0 end
+    if c == "none" || c == "hidden" is st.bb = 0 end
+    if d == "none" || d == "hidden" is st.bl = 0 end
+    return st
+end
+
+;; Właściwości spoza głównego łańcucha apply_decls.
+fn apply_extra(st0: ComputedStyle, prop: string, val: string, lower: string, env: cssval::LenEnv, parent: ComputedStyle) -> ComputedStyle is
+    let mut st: ComputedStyle = st0
+    if prop == "float" is
+        st.float_side = if lower == "inline-start" then "left" elsif lower == "inline-end" then "right" else lower
+    elsif prop == "clear" is st.clear_side = lower
+    elsif prop == "align-content" is st.align_content = grid_align_kw(lower)
+    elsif prop == "justify-items" is st.justify_items = grid_align_kw(lower)
+    elsif prop == "justify-self" is st.justify_self = if lower == "auto" then "" else grid_align_kw(lower)
+    elsif prop == "place-items" is
+        let t: [string] = cssval::split_top(lower)
+        st.align = grid_align_kw(t[0])
+        st.justify_items = grid_align_kw(if array_len(t) >= 2 then t[1] else t[0])
+    elsif prop == "place-content" is
+        let t: [string] = cssval::split_top(lower)
+        st.align_content = grid_align_kw(t[0])
+        st.justify = grid_align_kw(if array_len(t) >= 2 then t[1] else t[0])
+    elsif prop == "place-self" is
+        let t: [string] = cssval::split_top(lower)
+        st.align_self = grid_align_kw(t[0])
+        st.justify_self = grid_align_kw(if array_len(t) >= 2 then t[1] else t[0])
+    elsif prop == "grid-template-areas" is st.grid_areas = if lower == "none" then "" else parse_areas(val)
+    elsif prop == "grid-template" is
+        if string_find(val, "\"") >= 0 is st.grid_areas = parse_areas(val) end
+    elsif prop == "grid-area" is
+        if string_find(lower, "/") >= 0 is
+            let parts: [string] = string_split(lower, "/")
+            let rs: int = str_to_int(string_trim(parts[0]))
+            let cs: int = if array_len(parts) >= 2 then str_to_int(string_trim(parts[1])) else 0
+            let re: int = if array_len(parts) >= 3 then str_to_int(string_trim(parts[2])) else 0
+            let ce: int = if array_len(parts) >= 4 then str_to_int(string_trim(parts[3])) else 0
+            st.grid_row_start = rs
+            st.grid_col_start = cs
+            st.grid_row_span = if re > rs && rs > 0 then re - rs else 1
+            st.grid_col_span = if ce > cs && cs > 0 then ce - cs else 1
+            st.grid_area = ""
+        else is
+            st.grid_area = string_trim(lower)
+        end
+    elsif prop == "grid-row" || prop == "grid-row-start" is
+        let ls: [int] = parse_line_span(lower)
+        st.grid_row_start = ls[0]
+        st.grid_row_span = ls[1]
+    elsif prop == "grid-auto-flow" is st.grid_auto_flow = lower
+    elsif prop == "grid-auto-rows" is st.grid_auto_rows = val
+    elsif prop == "grid-auto-columns" is st.grid_auto_cols = val
+    elsif prop == "aspect-ratio" is st.aspect_ratio = parse_aspect(lower)
+    elsif prop == "transform" is
+        st = apply_transform_fns(st, val, env)
+        let tm: [int] = parse_transform_matrix(val, env)
+        st.xp = if array_len(tm) == 6 then props::xset(st.xp, "x-m-transform", mat_str(tm)) else props::xdel(st.xp, "x-m-transform")
+    elsif prop == "rotate" || prop == "scale" || prop == "translate" is
+        st.xp = props::xapply(st.xp, prop, val)
+        let toks: [string] = cssval::split_top(lower)
+        let mut mm: [int] = []
+        if lower != "none" && array_len(toks) > 0 is
+            if prop == "rotate" is
+                mm = mat_rotate(angle_deci(toks[array_len(toks) - 1]))
+            elsif prop == "scale" is
+                let sx: int = milli_of(num_f(toks[0]))
+                mm = [sx, 0, 0, if array_len(toks) >= 2 then milli_of(num_f(toks[1])) else sx, 0, 0]
+            else is
+                mm = [1000, 0, 0, 1000, px_milli(toks[0], env), if array_len(toks) >= 2 then px_milli(toks[1], env) else 0]
+            end
+        end
+        st.xp = if array_len(mm) == 6 then props::xset(st.xp, "x-m-" + prop, mat_str(mm)) else props::xdel(st.xp, "x-m-" + prop)
+    elsif prop == "transform-origin" is
+        let t: [string] = cssval::split_top(lower)
+        if array_len(t) >= 1 is
+            let first: string = t[0]
+            let vertical_first: bool = (first == "top" || first == "bottom") && array_len(t) >= 2
+            if vertical_first is
+                st.origin_y = origin_tok(t[0])
+                st.origin_x = origin_tok(t[1])
+            else is
+                st.origin_x = origin_tok(t[0])
+                if array_len(t) >= 2 is st.origin_y = origin_tok(t[1]) end
+            end
+        end
+    elsif prop == "filter" is st = apply_filter_fns(st, val)
+    elsif prop == "clip-path" is st.clip_path = if lower == "none" then "" else lower
+    elsif prop == "pointer-events" is st.pointer_events = lower != "none"
+    elsif prop == "user-select" is st.user_select = lower
+    elsif prop == "resize" is st.resize = lower
+    elsif prop == "scroll-behavior" is st.scroll_behavior = lower
+    elsif prop == "accent-color" is
+        if lower == "auto" is
+            st.has_accent = false
+        else is
+            st.accent = parse_color(val)
+            st.has_accent = true
+        end
+    elsif prop == "letter-spacing" is
+        st.letter_spacing = if lower == "normal" then 0 else len_px_or(val, env, 0, 0)
+    elsif prop == "word-spacing" is
+        st.word_spacing = if lower == "normal" then 0 else len_px_or(val, env, 0, 0)
+    elsif prop == "text-indent" is st.text_indent = len_px_or(val, env, 0, 0)
+    elsif prop == "text-shadow" is st = apply_text_shadow(st, val, env)
+    elsif prop == "vertical-align" is st = apply_vertical_align(st, lower, env)
+    elsif prop == "list-style" is
+        if lower == "none" is st.list_style = "none" else is st = apply_list_style(st, val) end
+    elsif prop == "list-style-type" is st.list_style = lower
+    elsif prop == "list-style-position" is st.list_pos = lower
+    elsif prop == "font-family" is
+        st.font_family = string_trim(strip_quotes(string_trim(val)))
+        st.font_key = family_key(val)
+    elsif prop == "text-decoration-color" is
+        st.deco_color = parse_color(val)
+        st.has_deco_color = true
+    elsif prop == "text-decoration-style" is st.deco_style = lower
+    elsif prop == "text-decoration-thickness" is st.deco_thick = len_px_or(val, env, 0, 0)
+    elsif prop == "direction" is st.direction = lower
+    elsif prop == "hyphens" is st.hyphens = lower
+    elsif prop == "border-spacing" is
+        let t: [string] = cssval::split_top(lower)
+        st.border_spacing = len_px_or(t[0], env, 0, 0)
+    elsif prop == "border-collapse" is st.border_collapse = lower == "collapse"
+    elsif prop == "table-layout" is st.table_fixed = lower == "fixed"
+    elsif prop == "tab-size" is
+        let n: int = str_to_int(lower)
+        if n > 0 && props::is_int(lower) is
+            st.tab_size = n
+            st.xp = props::xdel(st.xp, "tab-size")
+        else is
+            st.xp = props::xapply(st.xp, "tab-size", val)
+        end
+    elsif prop == "border-top-style" is st.border_style = lower
+    elsif prop == "border-right-style" is st.bs_r = lower
+    elsif prop == "border-bottom-style" is st.bs_b = lower
+    elsif prop == "border-left-style" is st.bs_l = lower
+    elsif prop == "outline-style" is st.outline_style = lower
+    elsif prop == "outline-offset" is st.outline_offset = len_px_or(val, env, 0, 0)
+    elsif prop == "background-repeat" is st.bg_repeat = lower
+    elsif prop == "background-position" is st.bg_pos = lower
+    elsif prop == "animation" is st = apply_animation(st, val)
+    elsif prop == "animation-name" is st.anim_name = if lower == "none" then "" else lower
+    elsif prop == "animation-duration" is st.anim_ms = first_duration_ms(val)
+    elsif prop == "animation-delay" is st.anim_delay = first_duration_ms(val)
+    elsif prop == "animation-iteration-count" is
+        st.anim_iter = if lower == "infinite" then -1 else parse_milli(lower)
+    elsif prop == "animation-direction" is st.anim_dir = lower
+    elsif prop == "animation-fill-mode" is st.anim_fill = lower
+    elsif prop == "animation-timing-function" is st.anim_ease = lower
+    elsif prop == "animation-play-state" is st.anim_paused = lower == "paused"
+    elsif prop == "transition-property" is st.trans_prop = string_replace(lower, " ", "")
+    elsif prop == "transition-delay" is st.trans_delay = first_duration_ms(val)
+    elsif prop == "transition-timing-function" is st.trans_ease = lower
+    elsif prop == "text-wrap" || prop == "text-wrap-mode" || prop == "text-wrap-style" is
+        st.xp = props::xapply(st.xp, prop, val)
+        if prop == "text-wrap" || prop == "text-wrap-mode" is
+            if lower == "nowrap" && st.white_space == "normal" is st.white_space = "nowrap" end
+            if lower == "wrap" && st.white_space == "nowrap" is st.white_space = "normal" end
+        end
+    elsif prop == "white-space-collapse" is
+        st.xp = props::xapply(st.xp, prop, val)
+        if lower == "preserve" || lower == "break-spaces" is st.white_space = "pre-wrap"
+        elsif lower == "preserve-breaks" is st.white_space = "pre-line"
+        elsif lower == "collapse" is st.white_space = if st.white_space == "pre" || st.white_space == "pre-wrap" || st.white_space == "pre-line" then "normal" else st.white_space end
+        end
+    elsif prop == "line-break" is
+        st.xp = props::xapply(st.xp, prop, val)
+        if lower == "anywhere" is st.break_words = true end
+    elsif prop == "background-position-x" || prop == "background-position-y" is
+        let toks: [string] = cssval::split_top(st.bg_pos)
+        let mut bx: string = if array_len(toks) >= 1 then toks[0] else "0%"
+        let mut by: string = if array_len(toks) >= 2 then toks[1] else "0%"
+        let v: string = if lower == "left" || lower == "top" then "0%" elsif lower == "center" then "50%" elsif lower == "right" || lower == "bottom" then "100%" else lower
+        if prop == "background-position-x" is bx = v else is by = v end
+        st.bg_pos = bx + " " + by
+        st.xp = props::xapply(st.xp, prop, val)
+    elsif prop == "columns" is
+        let t: [string] = cssval::split_top(lower)
+        let mut k: int = 0
+        while k < array_len(t) is
+            if props::is_int(t[k]) is st.xp = props::xset(st.xp, "column-count", t[k])
+            elsif t[k] == "auto" is st.xp = st.xp
+            elsif props::is_len(t[k]) is st.xp = props::xset(st.xp, "column-width", t[k]) end
+            k += 1
+        end
+    elsif prop == "column-rule" is
+        let t: [string] = cssval::split_top(lower)
+        let mut k: int = 0
+        while k < array_len(t) is
+            if is_line_style(t[k]) is st.xp = props::xset(st.xp, "column-rule-style", t[k])
+            elsif t[k] == "thin" || t[k] == "medium" || t[k] == "thick" || (props::is_len(t[k]) && !cssval::is_color(t[k])) is st.xp = props::xset(st.xp, "column-rule-width", t[k])
+            elsif cssval::is_color(t[k]) is st.xp = props::xset(st.xp, "column-rule-color", t[k]) end
+            k += 1
+        end
+    elsif prop == "container" is
+        let sl: int = string_find(val, "/")
+        let nm: string = string_trim(if sl >= 0 then string_slice(val, 0, sl) else val)
+        let ty: string = if sl >= 0 then string_trim(string_slice(val, sl + 1, string_len(val))) else "normal"
+        if props::valid("container-type", ty) is
+            st.xp = props::xset(st.xp, "container-type", string_lower(ty))
+            st.xp = if nm == "" || nm == "none" then props::xdel(st.xp, "container-name") else props::xset(st.xp, "container-name", nm)
+        end
+    else is
+        st.xp = props::xapply(st.xp, prop, val)
+        if prop == "contain" && (string_find(lower, "paint") >= 0 || string_find(lower, "strict") >= 0 || string_find(lower, "content") >= 0) is
+            if st.overflow_x == "visible" is st.overflow_x = "hidden" end
+            if st.overflow_y == "visible" is st.overflow_y = "hidden" end
+        end
+    end
+    return st
+end
+
+;; Klucz rodziny dla natywnego rejestru czcionek: hash pierwszej nazwy z listy font-family
+;; (1..32750); 0 dla rodzin ogólnych (sans-serif, monospace, …) — używają czcionki domyślnej.
+pub fn family_key(list: string) -> int is
+    let parts: [string] = cssval::split_commas(list)
+    if array_len(parts) == 0 is return 0 end
+    let mut first: string = string_lower(string_trim(parts[0]))
+    if string_len(first) >= 2 && (string_starts_with(first, "\"") || string_starts_with(first, "'")) is
+        first = string_trim(string_slice(first, 1, string_len(first) - 1))
+    end
+    if first == "" || first == "serif" || first == "sans-serif" || first == "monospace" || first == "cursive" || first == "fantasy" ||
+       first == "system-ui" || first == "ui-sans-serif" || first == "ui-serif" || first == "ui-monospace" || first == "ui-rounded" ||
+       first == "-apple-system" || first == "blinkmacsystemfont" || first == "inherit" || first == "initial" || first == "unset" is
+        return 0
+    end
+    let mut h: int = 5381
+    let mut i: int = 0
+    while i < string_len(first) is
+        h = (h * 33 + conv::char_to_int(string_at(first, i))) % 32749
+        i += 1
+    end
+    return h + 1
+end
+
 ;; Zbiera zmienne --x z deklaracji (dziedziczone po potomkach).
 fn collect_vars(inherited_vars: string, decls: [css::CssDecl]) -> string is
     let mut vars: string = inherited_vars
@@ -801,7 +2316,8 @@ fn collect_vars(inherited_vars: string, decls: [css::CssDecl]) -> string is
     return vars
 end
 
-pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix: css::InteractionState, parent: ComputedStyle) -> ComputedStyle is
+pub fn apply_decls(base: ComputedStyle, decls0: [css::CssDecl], em_base: int, ix: css::InteractionState, parent: ComputedStyle) -> ComputedStyle is
+    let decls: [css::CssDecl] = expand_logical(decls0, dir_is_rtl(decls0, parent.direction))
     let mut st: ComputedStyle = base
     st.vars = collect_vars(st.vars, decls)
     let basis: int = ix.viewport_w
@@ -811,29 +2327,29 @@ pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix:
         i += 1
         if string_starts_with(d.prop, "--") is continue end
         let val: string = string_trim(substitute_vars(d.val, st.vars))
-        let prop: string = d.prop
+        let prop: string = unprefix(d.prop)
         let lower: string = string_lower(val)
-        if lower == "inherit" is
-            if prop == "color" is st.color = parent.color end
-            if prop == "font-size" is st.font_size = parent.font_size end
+        if lower == "inherit" || lower == "initial" || lower == "unset" || lower == "revert" is
+            st = apply_css_wide(st, prop, lower, parent)
             continue
         end
-        if lower == "initial" || lower == "unset" is continue end
         let em: int = if prop == "font-size" then parent.font_size else st.font_size
         let env: cssval::LenEnv = env_for(if em > 0 then em else em_base, ix)
 
         if prop == "display" is
             st.display = lower
             if lower == "inline-flex" is st.display = "inline-flex" end
-            if lower == "table" || lower == "table-row-group" || lower == "flow-root" is st.display = "block" end
-            if lower == "table-row" is st.display = "flex" end
-            if lower == "table-cell" is st.display = "block" end
+            if lower == "inline-table" is st.display = "table" end
+            if lower == "table-caption" is st.display = "block" end
+            if lower == "table-column" || lower == "table-column-group" is st.display = "none" end
+            if lower == "inline-grid" is st.display = "grid" end
         elsif prop == "position" is st.position = lower
         elsif prop == "visibility" is st.visible = lower != "hidden" && lower != "collapse"
         elsif prop == "color" is
             if lower == "currentcolor" is st.color = st.color else is st.color = parse_color(val) end
         elsif prop == "background" is
             st = apply_background(st, val, em, env)
+            st = apply_bg_extras(st, val)
         elsif prop == "background-color" is
             st.background = parse_color(val)
             st.has_bg = st.background.a > 0
@@ -914,7 +2430,9 @@ pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix:
                           elsif lower == "larger" then parent.font_size * 120 / 100
                           else len_px_or(val, env, parent.font_size, st.font_size)
             st.font_size = if fs < 1 then 1 else fs
-        elsif prop == "font-weight" is st.bold = parse_font_weight(val)
+        elsif prop == "font-weight" is
+            st.bold = parse_font_weight(val)
+            st.font_weight = font_weight_num(lower, st.font_weight)
         elsif prop == "font-style" is st.italic = lower == "italic" || lower == "oblique"
         elsif prop == "font" is
             let toks: [string] = cssval::split_top(val)
@@ -932,9 +2450,11 @@ pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix:
                 end
             end
         elsif prop == "line-height" is st.line_height = parse_line_height(val, st.font_size, env)
-        elsif prop == "text-align" is st.text_align = if lower == "start" then "left" elsif lower == "end" then "right" else lower
+        elsif prop == "text-align" is st.text_align = if lower == "justify-all" then "justify" elsif lower == "match-parent" then parent.text_align else lower
         elsif prop == "text-transform" is st.text_transform = lower
-        elsif prop == "text-decoration" || prop == "text-decoration-line" is st = apply_text_decoration(st, val)
+        elsif prop == "text-decoration" || prop == "text-decoration-line" is
+            st = apply_text_decoration(st, val)
+            if prop == "text-decoration" is st = apply_deco_extras(st, val) end
         elsif prop == "text-overflow" is st.ellipsis = lower == "ellipsis"
         elsif prop == "white-space" is st.white_space = lower
         elsif prop == "word-break" || prop == "overflow-wrap" || prop == "word-wrap" is
@@ -946,6 +2466,11 @@ pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix:
         elsif prop == "border" is
             let b: BorderRes = parse_border_value(val, env, st.border_color)
             st = set_all_borders(st, b.w, b.color, true)
+            let bs: string = if b.bstyle == "" then "solid" else b.bstyle
+            st.border_style = bs
+            st.bs_r = bs
+            st.bs_b = bs
+            st.bs_l = bs
         elsif prop == "border-width" is
             let sides: BoxSides = parse_box_shorthand(val, env, 0)
             st.bt = sides.top
@@ -967,9 +2492,10 @@ pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix:
                 st.border_color = c1
             end
         elsif prop == "border-style" is
-            if lower == "none" || lower == "hidden" is st = set_all_borders(st, 0, st.border_color, false) end
+            st = apply_border_style(st, val)
         elsif prop == "border-top" is
             let b: BorderRes = parse_border_value(val, env, st.bct)
+            st.border_style = if b.bstyle == "" then "solid" else b.bstyle
             st.bt = b.w
             st.border = b.w
             if b.has_color is
@@ -978,14 +2504,17 @@ pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix:
             end
         elsif prop == "border-right" is
             let b: BorderRes = parse_border_value(val, env, st.bcr)
+            st.bs_r = if b.bstyle == "" then "solid" else b.bstyle
             st.br = b.w
             if b.has_color is st.bcr = b.color end
         elsif prop == "border-bottom" is
             let b: BorderRes = parse_border_value(val, env, st.bcb)
+            st.bs_b = if b.bstyle == "" then "solid" else b.bstyle
             st.bb = b.w
             if b.has_color is st.bcb = b.color end
         elsif prop == "border-left" is
             let b: BorderRes = parse_border_value(val, env, st.bcl)
+            st.bs_l = if b.bstyle == "" then "solid" else b.bstyle
             st.bl = b.w
             if b.has_color is st.bcl = b.color end
         elsif prop == "border-top-width" is
@@ -1021,7 +2550,10 @@ pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix:
             let toks: [string] = cssval::split_top(val)
             st.row_gap = box_px(toks[0], env, 0)
             st.gap = if array_len(toks) >= 2 then box_px(toks[1], env, 0) else st.row_gap
-        elsif prop == "column-gap" || prop == "grid-column-gap" is st.gap = box_px(val, env, 0)
+            st.xp = props::xset(st.xp, "column-gap", "set")
+        elsif prop == "column-gap" || prop == "grid-column-gap" is
+            st.gap = box_px(val, env, 0)
+            st.xp = if lower == "normal" then props::xdel(st.xp, "column-gap") else props::xset(st.xp, "column-gap", "set")
         elsif prop == "row-gap" || prop == "grid-row-gap" is st.row_gap = box_px(val, env, 0)
         elsif prop == "flex-direction" is st.flex_dir = lower
         elsif prop == "flex-wrap" is st.flex_wrap = lower == "wrap" || lower == "wrap-reverse"
@@ -1037,19 +2569,21 @@ pub fn apply_decls(base: ComputedStyle, decls: [css::CssDecl], em_base: int, ix:
         elsif prop == "grid-template-columns" is st.grid_cols = val
         elsif prop == "grid-template-rows" is st.grid_rows = val
         elsif prop == "grid-column" || prop == "grid-column-start" is
-            if string_find(lower, "span") >= 0 is
-                st.grid_col_span = str_to_int(string_trim(string_slice(lower, string_find(lower, "span") + 4, string_len(lower))))
-                if st.grid_col_span < 1 is st.grid_col_span = 1 end
-            end
+            let ls: [int] = parse_line_span(lower)
+            st.grid_col_start = ls[0]
+            st.grid_col_span = ls[1]
         elsif prop == "opacity" is st.opacity = parse_opacity(val)
         elsif prop == "object-fit" is st.object_fit = lower
-        elsif prop == "transition" || prop == "transition-duration" is st.trans_ms = first_duration_ms(val)
+        elsif prop == "transition" is st = apply_transition(st, val)
+        elsif prop == "transition-duration" is st.trans_ms = first_duration_ms(val)
         elsif prop == "content" is
             st.has_content = lower != "none" && lower != "normal"
             st.content = strip_quotes(val)
+        else is
+            st = apply_extra(st, prop, val, lower, env, parent)
         end
     end
-    return st
+    return finalize_transform(st)
 end
 
 ;; Główna funkcja: styl węzła z kaskady + dziedziczenie.
