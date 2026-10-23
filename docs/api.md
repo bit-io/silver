@@ -1,4 +1,4 @@
-# API H# (Silver 0.2)
+# API H# (Silver 0.3)
 
 ```h#
 use "bit -> silver" from "silver"     ;; jedna linia: moduły app::, ui::, data::, dialog::, ipc::, window::, edit::
