@@ -1,0 +1,266 @@
+mod props_data
+mod cssval
+mod dom
+use "std -> conv" from "conv"
+
+;; ---------- tokeny ----------
+fn is_digit(c: string) -> bool is
+    return c >= "0" && c <= "9"
+end
+
+;; Długość liczby na początku napisu (z opcjonalnym znakiem, kropką i wykładnikiem); 0 = brak liczby.
+fn num_prefix_len(s: string) -> int is
+    let n: int = string_len(s)
+    let mut i: int = 0
+    if i < n && (string_at(s, i) == "+" || string_at(s, i) == "-") is i += 1 end
+    let mut digits: int = 0
+    while i < n && is_digit(string_at(s, i)) is
+        i += 1
+        digits += 1
+    end
+    if i < n && string_at(s, i) == "." is
+        i += 1
+        while i < n && is_digit(string_at(s, i)) is
+            i += 1
+            digits += 1
+        end
+    end
+    if digits == 0 is return 0 end
+    if i < n && (string_at(s, i) == "e" || string_at(s, i) == "E") is
+        let mut j: int = i + 1
+        if j < n && (string_at(s, j) == "+" || string_at(s, j) == "-") is j += 1 end
+        let mut ed: int = 0
+        while j < n && is_digit(string_at(s, j)) is
+            j += 1
+            ed += 1
+        end
+        if ed > 0 is i = j end
+    end
+    return i
+end
+
+pub fn is_num(tok: string) -> bool is
+    let p: int = num_prefix_len(tok)
+    return p > 0 && p == string_len(tok)
+end
+
+pub fn is_int(tok: string) -> bool is
+    return is_num(tok) && string_find(tok, ".") < 0 && string_find(tok, "e") < 0 && string_find(tok, "E") < 0
+end
+
+fn unit_of(tok: string) -> string is
+    let p: int = num_prefix_len(tok)
+    if p == 0 is return "\u0001" end
+    return string_lower(string_slice(tok, p, string_len(tok)))
+end
+
+fn fn_name_in(low: string, names: string) -> bool is
+    let p: int = string_find(low, "(")
+    if p <= 0 is return false end
+    return string_find(names, " " + string_slice(low, 0, p) + " ") >= 0
+end
+
+pub fn is_len(tok: string) -> bool is
+    let low: string = string_lower(tok)
+    if fn_name_in(low, " calc min max clamp var env attr round mod rem abs sign ") is return true end
+    let u: string = unit_of(low)
+    if u == "\u0001" is return false end
+    if u == "" is return is_num(low) && str_to_float(low) == 0.0 end
+    return string_find(" px em rem vw vh vmin vmax svw svh lvw lvh dvw dvh pt pc cm mm in q ch ex lh rlh cap ic fr % ", " " + u + " ") >= 0
+end
+
+pub fn is_time(tok: string) -> bool is
+    let u: string = unit_of(tok)
+    return u == "s" || u == "ms"
+end
+
+pub fn is_ang(tok: string) -> bool is
+    let u: string = unit_of(tok)
+    if u == "" is return is_num(tok) && str_to_float(tok) == 0.0 end
+    return u == "deg" || u == "rad" || u == "grad" || u == "turn"
+end
+
+fn is_str(tok: string) -> bool is
+    return string_starts_with(tok, "\"") || string_starts_with(tok, "'")
+end
+
+fn is_url(tok: string) -> bool is
+    return string_starts_with(string_lower(tok), "url(") || string_starts_with(string_lower(tok), "image-set(") || string_starts_with(string_lower(tok), "src(")
+end
+
+fn tok_matches(tok: string, alts: [string]) -> bool is
+    let low: string = string_lower(tok)
+    if string_find(low, "var(") >= 0 || string_starts_with(low, "env(") is return true end
+    let mut i: int = 0
+    while i < array_len(alts) is
+        let a: string = alts[i]
+        i += 1
+        if a == "<any>" is return true end
+        if a == "<num>" is
+            if is_num(low) || string_starts_with(low, "calc(") is return true end
+        elsif a == "<int>" is
+            if is_int(low) || string_starts_with(low, "calc(") is return true end
+        elsif a == "<len>" is
+            if is_len(low) is return true end
+        elsif a == "<col>" is
+            if cssval::is_color(low) is return true end
+        elsif a == "<time>" is
+            if is_time(low) is return true end
+        elsif a == "<ang>" is
+            if is_ang(low) is return true end
+        elsif a == "<str>" is
+            if is_str(tok) is return true end
+        elsif a == "<url>" is
+            if is_url(tok) is return true end
+        elsif a == low is
+            return true
+        end
+    end
+    return false
+end
+
+;; ---------- rejestr ----------
+fn row_of(name: string) -> string is
+    let t: string = props_data::table()
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(t, key)
+    if idx < 0 is return "" end
+    let start: int = idx + 1
+    let e: int = dom::find_from(t, "\u0002", start)
+    return string_slice(t, start, if e < 0 then string_len(t) else e)
+end
+
+pub fn known(name: string) -> bool is
+    if string_starts_with(name, "--") is return true end
+    return row_of(name) != ""
+end
+
+fn field(name: string, n: int) -> string is
+    let parts: [string] = string_split(row_of(name), "\u0001")
+    if array_len(parts) <= n is return "" end
+    return parts[n]
+end
+
+pub fn inherited(name: string) -> bool is
+    return field(name, 1) == "1"
+end
+
+pub fn initial(name: string) -> string is
+    return field(name, 2)
+end
+
+pub fn grammar(name: string) -> string is
+    return field(name, 3)
+end
+
+;; Czy `val` jest poprawną wartością `name` (po podstawieniu var()). Nieznane nazwy → false.
+pub fn valid(name: string, val0: string) -> bool is
+    let val: string = string_trim(val0)
+    if val == "" is return false end
+    let g: string = grammar(name)
+    if g == "" is return false end
+    let low: string = string_lower(val)
+    if low == "inherit" || low == "initial" || low == "unset" || low == "revert" || low == "revert-layer" is return true end
+    let alts: [string] = string_split(g, "|")
+    let mut a: int = 0
+    while a < array_len(alts) is
+        if alts[a] == "<any>" is return true end
+        a += 1
+    end
+    let items: [string] = cssval::split_commas(val)
+    let mut i: int = 0
+    while i < array_len(items) is
+        let toks: [string] = cssval::split_top(items[i])
+        let mut j: int = 0
+        while j < array_len(toks) is
+            let t: string = toks[j]
+            j += 1
+            if t == "/" || t == "!important" is continue end
+            if !tok_matches(t, alts) is return false end
+        end
+        i += 1
+    end
+    return true
+end
+
+;; ---------- magazyn xp ----------
+pub fn xget(xp: string, name: string) -> string is
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(xp, key)
+    if idx < 0 is return "" end
+    let start: int = idx + string_len(key)
+    let e: int = dom::find_from(xp, "\u0002", start)
+    return string_slice(xp, start, if e < 0 then string_len(xp) else e)
+end
+
+pub fn xhas(xp: string, name: string) -> bool is
+    return string_find(xp, "\u0002" + name + "\u0001") >= 0
+end
+
+pub fn xset(xp: string, name: string, val: string) -> string is
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(xp, key)
+    if idx < 0 is return xp + key + val end
+    let start: int = idx + string_len(key)
+    let e: int = dom::find_from(xp, "\u0002", start)
+    let tail: string = if e < 0 then "" else string_slice(xp, e, string_len(xp))
+    return string_slice(xp, 0, idx) + key + val + tail
+end
+
+pub fn xdel(xp: string, name: string) -> string is
+    let key: string = "\u0002" + name + "\u0001"
+    let idx: int = string_find(xp, key)
+    if idx < 0 is return xp end
+    let start: int = idx + string_len(key)
+    let e: int = dom::find_from(xp, "\u0002", start)
+    let tail: string = if e < 0 then "" else string_slice(xp, e, string_len(xp))
+    return string_slice(xp, 0, idx) + tail
+end
+
+;; Wartość obliczona: ustawiona albo początkowa.
+pub fn xval(xp: string, name: string) -> string is
+    if xhas(xp, name) is return xget(xp, name) end
+    return initial(name)
+end
+
+;; Zostawia tylko wpisy właściwości dziedziczonych (stan startowy potomka).
+pub fn xinherit(xp: string) -> string is
+    if xp == "" is return "" end
+    let recs: [string] = string_split(xp, "\u0002")
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(recs) is
+        let r: string = recs[i]
+        i += 1
+        if r == "" is continue end
+        let k: int = string_find(r, "\u0001")
+        if k <= 0 is continue end
+        if inherited(string_slice(r, 0, k)) is out = out + "\u0002" + r end
+    end
+    return out
+end
+
+;; Ustawia wpis po walidacji; zwraca xp bez zmian dla wartości błędnej (deklaracja ignorowana).
+pub fn xapply(xp: string, name: string, val: string) -> string is
+    if !known(name) is return xp end
+    let v: string = string_trim(val)
+    if !valid(name, v) is return xp end
+    let low: string = string_lower(v)
+    if low == "initial" is return xdel(xp, name) end
+    if low == "inherit" || low == "unset" || low == "revert" || low == "revert-layer" is return xp end
+    return xset(xp, name, v)
+end
+
+;; Wartości słów kluczowych całej kaskady dla właściwości z xp.
+pub fn xcss_wide(xp: string, parent_xp: string, name: string, kw: string) -> string is
+    if kw == "initial" is return xdel(xp, name) end
+    if kw == "inherit" || (kw != "initial" && inherited(name)) is
+        if xhas(parent_xp, name) is return xset(xp, name, xget(parent_xp, name)) end
+        return xdel(xp, name)
+    end
+    return xdel(xp, name)
+end
+
+pub fn coverage() -> int is
+    return props_data::count()
+end
