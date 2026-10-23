@@ -16,7 +16,7 @@ bit            # = bit install → bit build → uruchomienie (sekcja [default-b
 ```
 Struktura:
 ```
-Bit.hk                manifest bit (zależność: -> silver => ^0.2)
+Bit.hk                manifest bit (zależność: -> silver => ^0.3)
 src/main.h#           backend H#
 frontend/index.html   widok
 frontend/style.css    style
