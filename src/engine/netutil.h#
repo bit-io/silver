@@ -1,0 +1,88 @@
+mod jsonlite
+
+pub fn css_alpha(a: int) -> string is
+    if a >= 255 is return "1" end
+    if a <= 0 is return "0" end
+    let thousandths: int = a * 1000 / 255
+    let mut s: string = to_string(thousandths)
+    while string_len(s) < 3 is s = "0" + s end
+    while string_len(s) > 1 && string_ends_with(s, "0") is s = string_slice(s, 0, string_len(s) - 1) end
+    return "0." + s
+end
+
+pub fn local_mime(path: string) -> string is
+    let p: string = string_lower(path)
+    if string_ends_with(p, ".json") is return "application/json" end
+    if string_ends_with(p, ".html") || string_ends_with(p, ".htm") is return "text/html" end
+    if string_ends_with(p, ".css") is return "text/css" end
+    if string_ends_with(p, ".js") || string_ends_with(p, ".mjs") is return "application/javascript" end
+    if string_ends_with(p, ".svg") is return "image/svg+xml" end
+    if string_ends_with(p, ".txt") || string_ends_with(p, ".md") is return "text/plain" end
+    return "application/octet-stream"
+end
+
+pub fn has_scheme(url: string) -> bool is
+    let at: int = string_find(url, "://")
+    if at <= 0 is return false end
+    let mut i: int = 0
+    while i < at is
+        let c: string = string_at(url, i)
+        if !((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "+" || c == "-" || c == ".") is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn parse_curl_output(out: string) -> string is
+    let mut rest: string = out
+    let mut head: string = ""
+    let mut guard: int = 0
+    while string_starts_with(rest, "HTTP/") && guard < 12 is
+        let mut sep: int = string_find(rest, "\r\n\r\n")
+        let mut sep_len: int = 4
+        if sep < 0 is
+            sep = string_find(rest, "\n\n")
+            sep_len = 2
+        end
+        if sep < 0 is
+            head = rest
+            rest = ""
+            break
+        end
+        head = string_slice(rest, 0, sep)
+        rest = string_slice(rest, sep + sep_len, string_len(rest))
+        guard += 1
+    end
+    let lines: [string] = string_split(string_replace(head, "\r", ""), "\n")
+    let mut status: int = 0
+    let mut text: string = ""
+    if array_len(lines) > 0 is
+        let first: [string] = string_split(lines[0], " ")
+        if array_len(first) >= 2 is status = str_to_int(first[1]) end
+        let sp: int = string_find(lines[0], " ")
+        if sp >= 0 && array_len(first) >= 3 is
+            let rest_line: string = string_slice(lines[0], sp + 1, string_len(lines[0]))
+            let sp2: int = string_find(rest_line, " ")
+            if sp2 >= 0 is text = string_slice(rest_line, sp2 + 1, string_len(rest_line)) end
+        end
+    end
+    let mut hdrs: string = jsonlite::object()
+    let mut i: int = 1
+    while i < array_len(lines) is
+        let colon: int = string_find(lines[i], ":")
+        if colon > 0 is
+            let k: string = string_lower(string_trim(string_slice(lines[i], 0, colon)))
+            let v: string = string_trim(string_slice(lines[i], colon + 1, string_len(lines[i])))
+            let prev: string = jsonlite::get_str(hdrs, k)
+            hdrs = jsonlite::set_str(hdrs, k, if jsonlite::has_key(hdrs, k) then prev + ", " + v else v)
+        end
+        i += 1
+    end
+    let mut r: string = jsonlite::object()
+    r = jsonlite::set_int(r, "status", status)
+    r = jsonlite::set_bool(r, "ok", status >= 200 && status < 300)
+    r = jsonlite::set_str(r, "statusText", text)
+    r = jsonlite::set_str(r, "body", rest)
+    r = jsonlite::set_raw(r, "headers", hdrs)
+    return r
+end
