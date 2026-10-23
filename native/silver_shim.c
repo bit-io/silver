@@ -19,7 +19,12 @@
 
 typedef struct { int code; char payload[SILVER_EV_PAYLOAD]; } SilverEv;
 
-typedef struct { int size; TTF_Font *font; } SilverFontSlot;
+typedef struct { int size; int tag; TTF_Font *font; } SilverFontSlot;
+
+/* 0.3: rodziny czcionek z @font-face — klucz 15-bitowy (hash nazwy liczony po stronie H#),
+ * cztery warianty: 0 regular, 1 bold, 2 italic, 3 bold-italic. */
+#define SILVER_MAX_FAMILIES 24
+typedef struct { int key; char *paths[4]; } SilverFamily;
 
 typedef struct {
     char        *key;
@@ -45,6 +50,8 @@ typedef struct {
     int           font_base;           /* rozmiar logiczny */
     SilverFontSlot fonts[SILVER_MAX_FONTS];
     int           font_count;
+    SilverFamily  fams[SILVER_MAX_FAMILIES];
+    int           fam_count;
     int           scale_pct;           /* 100 = brak HiDPI, 200 = Retina */
     SilverTextEntry texts[SILVER_TEXT_CACHE];
     SilverImage   images[SILVER_IMAGE_CACHE];
@@ -242,25 +249,54 @@ static void update_scale(SilverWindow *w) {
     SDL_RenderSetScale(w->ren, pct / 100.0f, pct / 100.0f);
 }
 
-/* font o rozmiarze logicznym `size` (0 = bazowy) w pikselach fizycznych */
-static TTF_Font *get_font(SilverWindow *w, int size) {
-    if (!w->font_path) return NULL;
+/* font o rozmiarze logicznym `size` (0 = bazowy) w pikselach fizycznych;
+ * `tag` odróżnia pliki (0 = bazowy, inaczej indeks rodziny*4+wariant+1) */
+static TTF_Font *get_font_tag(SilverWindow *w, int size, int tag, const char *path) {
+    if (!path) return NULL;
     if (size <= 0) size = w->font_base;
     int phys = (size * w->scale_pct + 50) / 100;
     if (phys < 4) phys = 4;
     for (int i = 0; i < w->font_count; i++)
-        if (w->fonts[i].size == phys) return w->fonts[i].font;
+        if (w->fonts[i].size == phys && w->fonts[i].tag == tag) return w->fonts[i].font;
     if (w->font_count >= SILVER_MAX_FONTS) {
         TTF_CloseFont(w->fonts[0].font);
         memmove(&w->fonts[0], &w->fonts[1], sizeof(SilverFontSlot) * (SILVER_MAX_FONTS - 1));
         w->font_count--;
     }
-    TTF_Font *f = TTF_OpenFont(w->font_path, phys);
+    TTF_Font *f = TTF_OpenFont(path, phys);
     if (!f) return NULL;
     w->fonts[w->font_count].size = phys;
+    w->fonts[w->font_count].tag = tag;
     w->fonts[w->font_count].font = f;
     w->font_count++;
     return f;
+}
+
+static TTF_Font *get_font(SilverWindow *w, int size) {
+    return get_font_tag(w, size, 0, w->font_path);
+}
+
+/* Wybiera font dla `style` (bity 0..7 = flagi, 8..22 = klucz rodziny). `eff_style` = flagi,
+ * które trzeba jeszcze zasymulować przez TTF (pogrubienie/kursywa, gdy brak prawdziwego kroju). */
+static TTF_Font *get_font_style(SilverWindow *w, int size, int style, int *eff_style) {
+    int key = (style >> 8) & 0x7FFF;
+    *eff_style = style & 0xFF;
+    if (key) {
+        int variant = (style & 1) | ((style & 2));
+        for (int fi = 0; fi < w->fam_count; fi++) {
+            if (w->fams[fi].key != key) continue;
+            const char *path = w->fams[fi].paths[variant];
+            int used = variant;
+            if (!path) { path = w->fams[fi].paths[0]; used = 0; }
+            if (!path) break;
+            if (used & 1) *eff_style &= ~1;
+            if (used & 2) *eff_style &= ~2;
+            TTF_Font *f = get_font_tag(w, size, fi * 4 + used + 1, path);
+            if (f) return f;
+            break;
+        }
+    }
+    return get_font(w, size);
 }
 
 /* ====================================================================
@@ -362,6 +398,273 @@ int silver_load_font(int h, const char *path, int size) {
     return get_font(w, 0) != NULL;
 }
 
+
+
+/* ====================================================================
+ *  0.3: backdrop-filter: blur() — rozmycie tego, co już narysowano pod prostokątem.
+ *  Odczyt pikseli renderera → trzy przebiegi rozmycia pudełkowego (≈ Gauss) → tekstura → rysunek.
+ * ==================================================================== */
+static void box_blur_axis(Uint8 *src, Uint8 *dst, int w, int h, int r, int horiz) {
+    int len = horiz ? w : h, lines = horiz ? h : w;
+    int stride = horiz ? 4 : w * 4, step = horiz ? w * 4 : 4;
+    for (int l = 0; l < lines; l++) {
+        Uint8 *sp = src + (size_t)l * step, *dp = dst + (size_t)l * step;
+        int acc[4] = {0, 0, 0, 0};
+        for (int i = -r; i <= r; i++) {
+            int k = i < 0 ? 0 : i >= len ? len - 1 : i;
+            for (int c = 0; c < 4; c++) acc[c] += sp[(size_t)k * stride + c];
+        }
+        int n = 2 * r + 1;
+        for (int i = 0; i < len; i++) {
+            for (int c = 0; c < 4; c++) dp[(size_t)i * stride + c] = (Uint8)(acc[c] / n);
+            int a = i - r, b = i + r + 1;
+            a = a < 0 ? 0 : a; b = b >= len ? len - 1 : b;
+            for (int c = 0; c < 4; c++) acc[c] += sp[(size_t)b * stride + c] - sp[(size_t)a * stride + c];
+        }
+    }
+}
+
+int silver_backdrop_blur(int h, int x, int y, int w, int hh, int radius) {
+    if (!VALID(h) || w <= 0 || hh <= 0 || radius <= 0) return 0;
+    SilverWindow *sw = &g_windows[h];
+    int sc = sw->scale_pct;
+    SDL_Rect rc = { x * sc / 100, y * sc / 100, w * sc / 100, hh * sc / 100 };
+    /* przytnij do powierzchni renderera */
+    int ow = 0, oh = 0;
+    SDL_GetRendererOutputSize(sw->ren, &ow, &oh);
+    if (rc.x < 0) { rc.w += rc.x; rc.x = 0; }
+    if (rc.y < 0) { rc.h += rc.y; rc.y = 0; }
+    if (rc.x + rc.w > ow) rc.w = ow - rc.x;
+    if (rc.y + rc.h > oh) rc.h = oh - rc.y;
+    if (rc.w < 2 || rc.h < 2 || (long)rc.w * rc.h > 8L * 1024 * 1024) return 0;
+    size_t bytes = (size_t)rc.w * rc.h * 4;
+    Uint8 *a = (Uint8 *)malloc(bytes), *b = (Uint8 *)malloc(bytes);
+    if (!a || !b) { free(a); free(b); return 0; }
+    if (SDL_RenderReadPixels(sw->ren, &rc, SDL_PIXELFORMAT_ABGR8888, a, rc.w * 4) != 0) { free(a); free(b); return 0; }
+    int r = radius * sc / 100 / 2;
+    if (r < 1) r = 1;
+    if (r > 40) r = 40;
+    for (int pass = 0; pass < 3; pass++) {
+        box_blur_axis(a, b, rc.w, rc.h, r, 1);
+        box_blur_axis(b, a, rc.w, rc.h, r, 0);
+    }
+    SDL_Texture *tex = SDL_CreateTexture(sw->ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, rc.w, rc.h);
+    if (!tex) { free(a); free(b); return 0; }
+    SDL_UpdateTexture(tex, NULL, a, rc.w * 4);
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
+    SDL_Rect dst = { rc.x * 100 / sc, rc.y * 100 / sc, rc.w * 100 / sc, rc.h * 100 / sc };
+    SDL_RenderCopy(sw->ren, tex, NULL, &dst);
+    SDL_DestroyTexture(tex);
+    free(a); free(b);
+    return 1;
+}
+
+/* ====================================================================
+ *  0.3: WOFF 1.0 → SFNT (TTF/OTF). SDL_ttf nie czyta WOFF, więc przy rejestracji kroju plik
+ *  jest dekompresowany (własny, mały inflate — bez zależności od zlib) do pliku tymczasowego.
+ *  WOFF2 wymaga Brotli i transformacji glifów — nieobsługiwane (rejestracja zwraca 0,
+ *  a silnik wybiera inny wpis `src`).
+ * ==================================================================== */
+typedef struct { const unsigned char *in; size_t inlen, pos; int bit, bitcnt; unsigned char *out; size_t outlen, outpos; int err; } Inf;
+
+static int inf_bit(Inf *s) {
+    if (s->bitcnt == 0) {
+        if (s->pos >= s->inlen) { s->err = 1; return 0; }
+        s->bit = s->in[s->pos++]; s->bitcnt = 8;
+    }
+    int b = s->bit & 1; s->bit >>= 1; s->bitcnt--;
+    return b;
+}
+static int inf_bits(Inf *s, int n) { int v = 0; for (int i = 0; i < n; i++) v |= inf_bit(s) << i; return v; }
+
+typedef struct { short count[16]; short sym[288]; } InfHuff;
+static void inf_build(InfHuff *h, const unsigned char *len, int n) {
+    short offs[16];
+    memset(h->count, 0, sizeof h->count);
+    for (int i = 0; i < n; i++) h->count[len[i]]++;
+    h->count[0] = 0;
+    offs[1] = 0;
+    for (int i = 1; i < 15; i++) offs[i + 1] = offs[i] + h->count[i];
+    for (int i = 0; i < n; i++) if (len[i]) h->sym[offs[len[i]]++] = (short)i;
+}
+static int inf_decode(Inf *s, const InfHuff *h) {
+    int code = 0, first = 0, index = 0;
+    for (int l = 1; l <= 15; l++) {
+        code |= inf_bit(s);
+        int cnt = h->count[l];
+        if (code - cnt < first) return h->sym[index + (code - first)];
+        index += cnt; first += cnt; first <<= 1; code <<= 1;
+        if (s->err) return -1;
+    }
+    return -1;
+}
+static int inf_codes(Inf *s, const InfHuff *lit, const InfHuff *dist) {
+    static const short lbase[] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+    static const short lext[]  = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    static const short dbase[] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+    static const short dext[]  = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+    for (;;) {
+        int sym = inf_decode(s, lit);
+        if (sym < 0 || s->err) return -1;
+        if (sym < 256) {
+            if (s->outpos >= s->outlen) return -1;
+            s->out[s->outpos++] = (unsigned char)sym;
+        } else if (sym == 256) return 0;
+        else {
+            sym -= 257;
+            if (sym >= 29) return -1;
+            int len = lbase[sym] + inf_bits(s, lext[sym]);
+            int ds = inf_decode(s, dist);
+            if (ds < 0 || ds >= 30) return -1;
+            size_t dd = (size_t)(dbase[ds] + inf_bits(s, dext[ds]));
+            if (dd > s->outpos || s->outpos + (size_t)len > s->outlen) return -1;
+            for (int i = 0; i < len; i++) { s->out[s->outpos] = s->out[s->outpos - dd]; s->outpos++; }
+        }
+    }
+}
+/* zlib (RFC 1950) → surowe bajty; zwraca liczbę bajtów albo -1 */
+static long inf_zlib(const unsigned char *in, size_t inlen, unsigned char *out, size_t outlen) {
+    if (inlen < 2) return -1;
+    Inf s; memset(&s, 0, sizeof s);
+    s.in = in; s.inlen = inlen; s.pos = 2; s.out = out; s.outlen = outlen;
+    int last;
+    do {
+        last = inf_bit(&s);
+        int type = inf_bits(&s, 2);
+        if (s.err) return -1;
+        if (type == 0) {
+            s.bitcnt = 0;
+            if (s.pos + 4 > s.inlen) return -1;
+            unsigned len = s.in[s.pos] | (s.in[s.pos + 1] << 8);
+            s.pos += 4;
+            if (s.pos + len > s.inlen || s.outpos + len > s.outlen) return -1;
+            memcpy(s.out + s.outpos, s.in + s.pos, len);
+            s.pos += len; s.outpos += len;
+        } else if (type == 1 || type == 2) {
+            InfHuff lit, dist;
+            unsigned char lens[320];
+            if (type == 1) {
+                int i = 0;
+                for (; i < 144; i++) lens[i] = 8;
+                for (; i < 256; i++) lens[i] = 9;
+                for (; i < 280; i++) lens[i] = 7;
+                for (; i < 288; i++) lens[i] = 8;
+                inf_build(&lit, lens, 288);
+                for (i = 0; i < 30; i++) lens[i] = 5;
+                inf_build(&dist, lens, 30);
+            } else {
+                static const unsigned char order[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+                int nlen = inf_bits(&s, 5) + 257, ndist = inf_bits(&s, 5) + 1, ncode = inf_bits(&s, 4) + 4;
+                if (nlen > 286 || ndist > 30) return -1;
+                unsigned char cl[19] = {0};
+                for (int i = 0; i < ncode; i++) cl[order[i]] = (unsigned char)inf_bits(&s, 3);
+                InfHuff ch; inf_build(&ch, cl, 19);
+                int idx = 0;
+                while (idx < nlen + ndist) {
+                    int sym = inf_decode(&s, &ch);
+                    if (sym < 0) return -1;
+                    if (sym < 16) lens[idx++] = (unsigned char)sym;
+                    else {
+                        int prev = 0, rep;
+                        if (sym == 16) { if (idx == 0) return -1; prev = lens[idx - 1]; rep = 3 + inf_bits(&s, 2); }
+                        else if (sym == 17) rep = 3 + inf_bits(&s, 3);
+                        else rep = 11 + inf_bits(&s, 7);
+                        if (idx + rep > nlen + ndist) return -1;
+                        while (rep--) lens[idx++] = (unsigned char)prev;
+                    }
+                }
+                inf_build(&lit, lens, nlen);
+                inf_build(&dist, lens + nlen, ndist);
+            }
+            if (inf_codes(&s, &lit, &dist) != 0) return -1;
+        } else return -1;
+    } while (!last);
+    return (long)s.outpos;
+}
+
+static unsigned be32(const unsigned char *p) { return ((unsigned)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
+static void put32(unsigned char *p, unsigned v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+static void put16(unsigned char *p, unsigned v) { p[0] = v >> 8; p[1] = v; }
+
+/* Konwertuje plik WOFF 1.0 `in_path` na SFNT w `out_path`. 1 = ok, 0 = błąd / nie WOFF / WOFF2. */
+int silver_woff_to_sfnt(const char *in_path, const char *out_path) {
+    FILE *f = fopen(in_path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 44 || n > 64 * 1024 * 1024) { fclose(f); return 0; }
+    unsigned char *buf = (unsigned char *)malloc((size_t)n);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return 0; }
+    fclose(f);
+    if (memcmp(buf, "wOFF", 4) != 0) { free(buf); return 0; }
+    unsigned flavor = be32(buf + 4), total = be32(buf + 16);
+    int nt = (buf[12] << 8) | buf[13];
+    if (nt <= 0 || nt > 64 || (long)(44 + nt * 20) > n || total < 12 || total > 128u * 1024 * 1024) { free(buf); return 0; }
+    unsigned char *out = (unsigned char *)calloc(1, (size_t)total + 8);
+    if (!out) { free(buf); return 0; }
+    int sr = 1, es = 0; while (sr * 2 <= nt) { sr *= 2; es++; }
+    put32(out, flavor); put16(out + 4, nt); put16(out + 6, sr * 16); put16(out + 8, es); put16(out + 10, nt * 16 - sr * 16);
+    size_t dpos = 12 + (size_t)nt * 16;
+    int ok = 1;
+    for (int i = 0; i < nt && ok; i++) {
+        const unsigned char *e = buf + 44 + i * 20;
+        unsigned off = be32(e + 4), comp = be32(e + 8), orig = be32(e + 12), sum = be32(e + 16);
+        if ((unsigned long)off + comp > (unsigned long)n || dpos + orig > total) { ok = 0; break; }
+        if (comp < orig) { if (inf_zlib(buf + off, comp, out + dpos, orig) != (long)orig) { ok = 0; break; } }
+        else if (comp == orig) memcpy(out + dpos, buf + off, orig);
+        else { ok = 0; break; }
+        unsigned char *rec = out + 12 + i * 16;
+        memcpy(rec, e, 4); put32(rec + 4, sum); put32(rec + 8, (unsigned)dpos); put32(rec + 12, orig);
+        dpos += (orig + 3u) & ~3u;
+    }
+    if (ok) {
+        FILE *o = fopen(out_path, "wb");
+        if (!o) ok = 0; else { ok = fwrite(out, 1, dpos < total ? dpos : total, o) == (dpos < total ? dpos : total); fclose(o); }
+    }
+    free(out); free(buf);
+    return ok;
+}
+
+/* Jeśli `path` to WOFF — zdekoduj do pliku tymczasowego i zwróć jego ścieżkę (strdup); inaczej strdup(path). */
+static char *woff_resolve(const char *path) {
+    FILE *f = fopen(path, "rb");
+    unsigned char magic[4] = {0};
+    if (f) { size_t r = fread(magic, 1, 4, f); (void)r; fclose(f); }
+    if (memcmp(magic, "wOF2", 4) == 0) return NULL;   /* WOFF2: wymaga Brotli — odrzucone, silnik wybierze inny wpis src */
+    if (memcmp(magic, "wOFF", 4) != 0) return strdup(path);
+    char tmp[1100];
+    const char *dir = getenv("TMPDIR"); if (!dir || !dir[0]) dir = "/tmp";
+    Uint32 hsh = 2166136261u; for (const char *c = path; *c; c++) { hsh ^= (unsigned char)*c; hsh *= 16777619u; }
+    snprintf(tmp, sizeof tmp, "%s/silver-woff-%08x.ttf", dir, (unsigned)hsh);
+    if (!silver_woff_to_sfnt(path, tmp)) return NULL;
+    return strdup(tmp);
+}
+
+/* 0.3: rejestruje plik czcionki dla rodziny `key` i wariantu (bold/italic).
+ * Zwraca 1 przy powodzeniu. Powtórna rejestracja tego samego wariantu go podmienia. */
+int silver_font_register(int h, int key, const char *path, int bold, int italic) {
+    if (!VALID(h) || key <= 0 || key > 0x7FFF || !path || !path[0]) return 0;
+    SilverWindow *w = &g_windows[h];
+    FILE *probe = fopen(path, "rb");
+    if (!probe) return 0;
+    fclose(probe);
+    int fi = -1;
+    for (int i = 0; i < w->fam_count; i++) if (w->fams[i].key == key) { fi = i; break; }
+    if (fi < 0) {
+        if (w->fam_count >= SILVER_MAX_FAMILIES) return 0;
+        fi = w->fam_count++;
+        memset(&w->fams[fi], 0, sizeof(SilverFamily));
+        w->fams[fi].key = key;
+    }
+    int variant = (bold ? 1 : 0) | (italic ? 2 : 0);
+    char *copy = woff_resolve(path);   /* WOFF → tymczasowy SFNT; WOFF2/uszkodzony → NULL */
+    if (!copy) return 0;
+    free(w->fams[fi].paths[variant]);
+    w->fams[fi].paths[variant] = copy;
+    flush_fonts(w);
+    flush_texts(w);
+    return 1;
+}
+
 int silver_is_open(int h) { return VALID(h) ? g_windows[h].open : 0; }
 
 int silver_get_width(int h) {
@@ -459,6 +762,8 @@ int silver_window_close(int h) {
         free(w->images[i].path);
     }
     free(w->font_path);
+    for (int fi = 0; fi < w->fam_count; fi++)
+        for (int vi = 0; vi < 4; vi++) free(w->fams[fi].paths[vi]);
     SDL_DestroyRenderer(w->ren);
     SDL_DestroyWindow(w->win);
     memset(w, 0, sizeof(*w));
@@ -805,7 +1110,7 @@ static Uint32 fnv(const char *s) {
 }
 
 static SilverTextEntry *text_entry(SilverWindow *w, TTF_Font *font, const char *text,
-                                   int size, int style, int r, int g, int b) {
+                                   int size, int style, int eff_style, int r, int g, int b) {
     size_t kl = strlen(text) + 48;
     char *key = (char *)malloc(kl);
     if (!key) return NULL;
@@ -824,8 +1129,8 @@ static SilverTextEntry *text_entry(SilverWindow *w, TTF_Font *font, const char *
     SilverTextEntry *e = &w->texts[slot];
     if (e->key) { SDL_DestroyTexture(e->tex); free(e->key); memset(e, 0, sizeof(*e)); }
 
-    TTF_SetFontStyle(font, (style & 1 ? TTF_STYLE_BOLD : 0) | (style & 2 ? TTF_STYLE_ITALIC : 0) |
-                           (style & 4 ? TTF_STYLE_UNDERLINE : 0) | (style & 8 ? TTF_STYLE_STRIKETHROUGH : 0));
+    TTF_SetFontStyle(font, (eff_style & 1 ? TTF_STYLE_BOLD : 0) | (eff_style & 2 ? TTF_STYLE_ITALIC : 0) |
+                           (eff_style & 4 ? TTF_STYLE_UNDERLINE : 0) | (eff_style & 8 ? TTF_STYLE_STRIKETHROUGH : 0));
     SDL_Color col = { (Uint8)r, (Uint8)g, (Uint8)b, 255 };
     SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, col);
     if (!surf) { free(key); return NULL; }
@@ -845,9 +1150,10 @@ int silver_draw_text_ex(int h, int x, int y, const char *text, int r, int g, int
     CNT(g_cnt_text);
     if (!VALID(h) || !text || !text[0]) return 0;
     SilverWindow *w = &g_windows[h];
-    TTF_Font *font = get_font(w, size);
+    int eff = 0;
+    TTF_Font *font = get_font_style(w, size, style, &eff);
     if (!font) return 0;
-    SilverTextEntry *e = text_entry(w, font, text, size, style, r, g, b);
+    SilverTextEntry *e = text_entry(w, font, text, size, style, eff, r, g, b);
     if (!e) return 0;
     float fw = e->w * 100.0f / w->scale_pct, fh = e->h * 100.0f / w->scale_pct;
     SDL_SetTextureAlphaMod(e->tex, (Uint8)a);
@@ -863,9 +1169,10 @@ int silver_draw_text(int h, int x, int y, const char *text, int r, int g, int b,
 int silver_measure_text_ex(int h, const char *text, int size, int style) {
     if (!VALID(h) || !text) return 0;
     SilverWindow *w = &g_windows[h];
-    TTF_Font *font = get_font(w, size);
+    int eff = 0;
+    TTF_Font *font = get_font_style(w, size, style, &eff);
     if (!font) return 0;
-    TTF_SetFontStyle(font, (style & 1 ? TTF_STYLE_BOLD : 0) | (style & 2 ? TTF_STYLE_ITALIC : 0));
+    TTF_SetFontStyle(font, (eff & 1 ? TTF_STYLE_BOLD : 0) | (eff & 2 ? TTF_STYLE_ITALIC : 0));
     int tw = 0, th = 0;
     TTF_SizeUTF8(font, text, &tw, &th);
     return (tw * 100 + w->scale_pct - 1) / w->scale_pct;
@@ -979,15 +1286,101 @@ int silver_image_forget(int h, const char *path) {
     return 0;
 }
 
+/* 0.3: image-rendering — 0 domyślne (bez zmian), 1 najbliższy sąsiad (pixelated/crisp-edges), 2 liniowe (smooth) */
+static int g_img_filter = 0;
+int silver_image_filter(int h, int mode) { (void)h; g_img_filter = mode; return 1; }
+
 int silver_draw_image(int h, const char *path, int x, int y, int w, int rh, int a) {
     CNT(g_cnt_image);
     if (!VALID(h) || !path) return 0;
     SilverImage *im = find_or_load_image(h, path);
     if (!im) return 0;
+    if (g_img_filter == 1) SDL_SetTextureScaleMode(im->tex, SDL_ScaleModeNearest);
+    else if (g_img_filter == 2) SDL_SetTextureScaleMode(im->tex, SDL_ScaleModeLinear);
     SDL_SetTextureBlendMode(im->tex, SDL_BLENDMODE_BLEND);
     SDL_SetTextureAlphaMod(im->tex, (Uint8)a);
     SDL_Rect dst = { x, y, w, rh };
     SDL_RenderCopy(g_windows[h].ren, im->tex, NULL, &dst);
+    return 1;
+}
+
+
+/* ====================================================================
+ *  0.3: warstwy z transformacją afiniczną (obrót, pochylenie, skala)
+ *  silver_layer_begin → zwykłe rysowanie (współrzędne okna) → silver_layer_end.
+ *  Zawartość trafia do tekstury docelowej, a end składa ją na ekranie macierzą
+ *  p' = pivot + A·(p − pivot) + (e,f), gdzie A = [[a c][b d]] (a–d ×1000).
+ * ==================================================================== */
+#define SILVER_LAYER_MAX 4
+typedef struct {
+    SDL_Texture *tex, *prev_target;
+    SDL_Rect     prev_vp, prev_clip;
+    int          had_clip, x, y, w, h, win;
+} SilverLayer;
+static SilverLayer g_layers[SILVER_LAYER_MAX];
+static int         g_layer_n = 0;
+
+int silver_layer_begin(int h, int x, int y, int w, int hh) {
+    if (!VALID(h) || g_layer_n >= SILVER_LAYER_MAX || w <= 0 || hh <= 0) return 0;
+    SilverWindow *sw = &g_windows[h];
+    if (w > 4096) w = 4096;
+    if (hh > 4096) hh = 4096;
+    int pw = (w * sw->scale_pct + 50) / 100, ph = (hh * sw->scale_pct + 50) / 100;
+    if (pw < 1) pw = 1;
+    if (ph < 1) ph = 1;
+    SDL_Texture *tex = SDL_CreateTexture(sw->ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, pw, ph);
+    if (!tex) return 0;
+    SilverLayer *L = &g_layers[g_layer_n];
+    L->tex = tex; L->x = x; L->y = y; L->w = w; L->h = hh; L->win = h;
+    L->prev_target = SDL_GetRenderTarget(sw->ren);
+    SDL_RenderGetViewport(sw->ren, &L->prev_vp);
+    L->had_clip = SDL_RenderIsClipEnabled(sw->ren) ? 1 : 0;
+    SDL_RenderGetClipRect(sw->ren, &L->prev_clip);
+    if (SDL_SetRenderTarget(sw->ren, tex) != 0) { SDL_DestroyTexture(tex); return 0; }
+    SDL_RenderSetClipRect(sw->ren, NULL);
+    SDL_SetRenderDrawBlendMode(sw->ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(sw->ren, 0, 0, 0, 0);
+    SDL_RenderClear(sw->ren);
+    SDL_Rect vp = { -x, -y, 16384, 16384 };
+    SDL_RenderSetViewport(sw->ren, &vp);
+    g_layer_n++;
+    return 1;
+}
+
+int silver_layer_end(int h, int a, int b, int c, int d, int e, int f, int ox, int oy, int alpha) {
+    if (!VALID(h) || g_layer_n <= 0) return 0;
+    SilverWindow *sw = &g_windows[h];
+    SilverLayer *L = &g_layers[--g_layer_n];
+    SDL_SetRenderTarget(sw->ren, L->prev_target);
+    SDL_RenderSetViewport(sw->ren, &L->prev_vp);
+    if (L->had_clip) SDL_RenderSetClipRect(sw->ren, &L->prev_clip);
+    else SDL_RenderSetClipRect(sw->ren, NULL);
+    float fa = a / 1000.0f, fb = b / 1000.0f, fc = c / 1000.0f, fd = d / 1000.0f;
+    float cx[4] = { (float)L->x, (float)(L->x + L->w), (float)(L->x + L->w), (float)L->x };
+    float cy[4] = { (float)L->y, (float)L->y, (float)(L->y + L->h), (float)(L->y + L->h) };
+    float tu[4] = { 0, 1, 1, 0 }, tv[4] = { 0, 0, 1, 1 };
+    Uint8 al = (Uint8)(alpha < 0 ? 0 : alpha > 255 ? 255 : alpha);
+    SDL_BlendMode pm = SDL_ComposeCustomBlendMode(SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD,
+                                                  SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD);
+    /* tekstura warstwy ma kolory przemnożone alfą → składanie (ONE, 1−srcA); renderer programowy
+     * nie zna trybów własnych — wtedy zwykłe BLEND i niemnożony kolor wierzchołków */
+    int premult = SDL_SetTextureBlendMode(L->tex, pm) == 0;
+    if (!premult) SDL_SetTextureBlendMode(L->tex, SDL_BLENDMODE_BLEND);
+    SDL_Vertex v[4];
+    for (int i = 0; i < 4; i++) {
+        float u = cx[i] - (float)ox, w2 = cy[i] - (float)oy;
+        v[i].position.x = (float)ox + fa * u + fc * w2 + (float)e;
+        v[i].position.y = (float)oy + fb * u + fd * w2 + (float)f;
+        Uint8 cm = premult ? al : 255;
+        v[i].color.r = cm; v[i].color.g = cm; v[i].color.b = cm; v[i].color.a = al;
+        v[i].tex_coord.x = tu[i]; v[i].tex_coord.y = tv[i];
+    }
+    int idx[6] = { 0, 1, 2, 0, 2, 3 };
+    SDL_SetTextureScaleMode(L->tex, SDL_ScaleModeLinear);
+    CNT(g_cnt_other);
+    SDL_RenderGeometry(sw->ren, L->tex, v, 4, idx, 6);
+    SDL_DestroyTexture(L->tex);
+    L->tex = NULL;
     return 1;
 }
 
