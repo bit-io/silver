@@ -12,6 +12,7 @@ use "std -> env"   from "env"
 use "std -> conv" from "conv"
 use "std -> time"  from "time"
 use "std -> http"  from "http"
+use "std -> process" from "process"
 use "std -> async" from "async_"
 
 pub struct Anim is
@@ -80,6 +81,30 @@ pub struct App is
     pub prev_op: [int]
     pub anims:   [Anim]
 
+    ;; 0.3: animacje @keyframes i przejścia geometrii/transformacji
+    pub kf_nodes:  [int]
+    pub kf_start:  [int]
+    pub kf_name:   [string]
+    pub prev_st:   [style::ComputedStyle]
+    pub tr_ids:    [int]
+    pub tr_from:   [style::ComputedStyle]
+    pub tr_start:  [int]
+    pub tr_dur:    [int]
+    pub tr_delay:  [int]
+    pub tr_ease:   [string]
+    pub anim_busy: bool
+    pub scroll_goal: int      ;; 0.3: cel płynnego przewijania (scroll-behavior: smooth); -1 = brak
+    pub has_motion: bool
+
+    ;; 0.3: most JS — układ dla getBoundingClientRect/obserwatorów i trwały localStorage
+    pub js_layout_watch: bool
+    pub js_watch_ids:    [int]
+    pub js_last_layout:  string
+    pub storage_path:    string
+    pub storage_data:    string
+    pub storage_dirty:   bool
+    pub storage_last:    int
+
     pub dev_mode:     bool
     pub mtimes:       [int]
     pub last_dev:     int
@@ -108,7 +133,7 @@ fn identity_event(a: App, name: string, payload: string) -> App is
 end
 
 pub fn version() -> string is
-    return "0.2.0"
+    return "0.3.0"
 end
 
 pub fn new(title: string, width: int, height: int) -> App is
@@ -118,7 +143,7 @@ pub fn new(title: string, width: int, height: int) -> App is
     end
     return App {
         win: win, dom: dom::empty(), sheet: css::empty_sheet(), router: ipc::new_router(),
-        font_path: "", font_size: 16, store: "{}", js_handle: -1, theme: "auto", dark: false,
+        font_path: "", font_size: 16, store: "{{}}", js_handle: -1, theme: "auto", dark: false,
         bg: style::Color { r: 255, g: 255, b: 255, a: 255 },
         html_src: "", html_path: "", css_files: [], css_texts: [], js_files: [], has_structural: false, state_css: false,
         scroll_y: 0, elem_scroll: [], doc_h: 0, viewport_w: width, viewport_h: height,
@@ -127,6 +152,9 @@ pub fn new(title: string, width: int, height: int) -> App is
         ime: "", caret_t0: 0, caret_phase: true, dragging: false, mouse_x: -1, mouse_y: -1,
         cur_cursor: "default", has_focus: true, text_input_on: false,
         prev_bg: [], prev_fg: [], prev_op: [], anims: [],
+        kf_nodes: [], kf_start: [], kf_name: [], prev_st: [], tr_ids: [], tr_from: [], tr_start: [], tr_dur: [], tr_delay: [], tr_ease: [],
+        anim_busy: false, scroll_goal: -1, has_motion: false,
+        js_layout_watch: false, js_watch_ids: [], js_last_layout: "", storage_path: "", storage_data: "{{}}", storage_dirty: false, storage_last: 0,
         dev_mode: false, mtimes: [], last_dev: 0, tick_ms: 100, last_tick: 0, last_theme: 0,
         running: false, title_set: false, js_map: [], js_loaded: 0, js_inline_done: false, js_ready: false, js_pending: 0, tasks: [],
         on_tick: identity_tick, on_event: identity_event
@@ -493,6 +521,44 @@ fn mtime_or_zero(path: string) -> int is
     return fs::modified_time(path)
 end
 
+;; Parsuje CSS i rozwija @import (rekurencyjnie, do 8 poziomów; tylko pliki lokalne).
+;; Zaimportowane reguły trafiają PRZED reguły arkusza (zgodnie ze specyfikacją).
+fn css_with_imports(text: string, base: string, depth: int) -> css::Stylesheet is
+    let mut own: css::Stylesheet = css::parse(text)
+    ;; ścieżki @font-face są względne wobec katalogu arkusza
+    let mut fixed_fonts: [css::FontFace] = []
+    let mut fi: int = 0
+    while fi < array_len(own.fonts) is
+        let mut ff: css::FontFace = own.fonts[fi]
+        fi += 1
+        if base != "" && !string_starts_with(ff.src, "/") && !string_starts_with(ff.src, "http://") && !string_starts_with(ff.src, "https://") is
+            ff.src = base + ff.src
+        end
+        fixed_fonts = array_push(fixed_fonts, ff)
+    end
+    own.fonts = fixed_fonts
+    let mut acc: css::Stylesheet = css::empty_sheet()
+    if depth < 8 is
+        let mut i: int = 0
+        while i < array_len(own.imports) is
+            let parts: [string] = string_split(own.imports[i], "\u0001")
+            let url: string = parts[0]
+            let media: string = if array_len(parts) >= 2 then string_trim(parts[1]) else ""
+            i += 1
+            if url == "" is continue end
+            if string_starts_with(url, "http://") || string_starts_with(url, "https://") is
+                log::warn("silver: @import ze zdalnego URL pominięty: " + url)
+                continue
+            end
+            let path: string = if string_starts_with(url, "/") || base == "" then url else base + url
+            let src: string = read_file_or_empty(path)
+            let wrapped: string = if media == "" || media == "all" then src else "@media " + media + " { " + src + " }"
+            acc = css::concat(acc, css_with_imports(wrapped, dir_of(path), depth + 1))
+        end
+    end
+    return css::concat(acc, own)
+end
+
 ;; Składa arkusz: <link rel=stylesheet>, <style> z HTML, potem pliki i teksty aplikacji.
 fn rebuild_sheet(app: App) -> App is
     let mut a: App = app
@@ -502,23 +568,181 @@ fn rebuild_sheet(app: App) -> App is
     while i < array_len(a.dom.stylesheets) is
         let href: string = a.dom.stylesheets[i]
         let path: string = if string_starts_with(href, "/") || base == "" then href else base + href
-        sheet = css::concat(sheet, css::parse(read_file_or_empty(path)))
+        sheet = css::concat(sheet, css_with_imports(read_file_or_empty(path), dir_of(path), 0))
         i += 1
     end
-    if a.dom.inline_css != "" is sheet = css::concat(sheet, css::parse(a.dom.inline_css)) end
+    if a.dom.inline_css != "" is sheet = css::concat(sheet, css_with_imports(a.dom.inline_css, base, 0)) end
     i = 0
     while i < array_len(a.css_files) is
-        sheet = css::concat(sheet, css::parse(read_file_or_empty(a.css_files[i])))
+        sheet = css::concat(sheet, css_with_imports(read_file_or_empty(a.css_files[i]), dir_of(a.css_files[i]), 0))
         i += 1
     end
     i = 0
     while i < array_len(a.css_texts) is
-        sheet = css::concat(sheet, css::parse(a.css_texts[i]))
+        sheet = css::concat(sheet, css_with_imports(a.css_texts[i], base, 0))
         i += 1
     end
     a.sheet = sheet
     a.state_css = sheet_uses_state(sheet)
+    a.has_motion = sheet_has_motion(sheet)
+    a = register_fonts(a)
     a.dirty_layout = true
+    return a
+end
+
+;; Rejestruje czcionki z @font-face w natywnej powłoce (rodzina = klucz z nazwy).
+fn register_fonts(app: App) -> App is
+    let a: App = app
+    if a.win.handle < 0 is return a end
+    let mut i: int = 0
+    while i < array_len(a.sheet.fonts) is
+        let ff: css::FontFace = a.sheet.fonts[i]
+        i += 1
+        let key: int = style::family_key(ff.family)
+        if key > 0 && !string_starts_with(ff.src, "http") is
+            let ok: int = ffi_shim::silver_font_register(a.win.handle, key, ff.src, if ff.bold then 1 else 0, if ff.italic then 1 else 0)
+            if ok == 0 is log::warn("silver: nie udało się załadować @font-face " + ff.family + ": " + ff.src) end
+        end
+    end
+    return a
+end
+
+;; Czy arkusz zawiera animacje @keyframes lub przejścia (wymaga śledzenia ruchu).
+fn sheet_has_motion(sheet: css::Stylesheet) -> bool is
+    if array_len(sheet.keyframes) > 0 is return true end
+    let mut i: int = 0
+    while i < array_len(sheet.rules) is
+        let ds: [css::CssDecl] = sheet.rules[i].decls
+        let mut j: int = 0
+        while j < array_len(ds) is
+            let p: string = ds[j].prop
+            if p == "transition" || p == "transition-property" || p == "-webkit-transition" is return true end
+            j += 1
+        end
+        i += 1
+    end
+    return false
+end
+
+;; Czy któryś element ma animację/przejście ustawione stylem inline (np. z JS).
+fn dom_has_motion(a: App) -> bool is
+    let mut i: int = 0
+    while i < array_len(a.dom.nodes) is
+        let st: string = a.dom.nodes[i].attr_style
+        if st != "" && (string_find(st, "transition") >= 0 || string_find(st, "animation") >= 0) is return true end
+        i += 1
+    end
+    return false
+end
+
+fn int_index(xs: [int], v: int) -> int is
+    let mut i: int = 0
+    while i < array_len(xs) is
+        if xs[i] == v is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; Kontekst animacji dla układu w chwili `now`.
+fn motion_ctx(a: App, now: int) -> anim::AnimCtx is
+    let mut starts: [int] = []
+    let mut i: int = 0
+    while i < array_len(a.kf_nodes) is
+        starts = array_push(starts, a.kf_nodes[i])
+        starts = array_push(starts, a.kf_start[i])
+        i += 1
+    end
+    return anim::AnimCtx { now: now, starts: starts, t_ids: a.tr_ids, t_from: a.tr_from, t_start: a.tr_start,
+                           t_dur: a.tr_dur, t_delay: a.tr_delay, t_ease: a.tr_ease }
+end
+
+;; Aktualizuje rejestr animacji na podstawie stylów BEZ nakładek (cel) w tej klatce.
+fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
+    let mut a: App = a0
+    let n: int = array_len(raw)
+    let had_prev: bool = array_len(a.prev_st) == n
+    let mut kn: [int] = []
+    let mut ks: [int] = []
+    let mut kname: [string] = []
+    let mut nt_ids: [int] = a.tr_ids
+    let mut nt_from: [style::ComputedStyle] = a.tr_from
+    let mut nt_start: [int] = a.tr_start
+    let mut nt_dur: [int] = a.tr_dur
+    let mut nt_delay: [int] = a.tr_delay
+    let mut nt_ease: [string] = a.tr_ease
+    let mut busy: bool = false
+    let mut id: int = 1
+    while id < n && id < array_len(a.dom.nodes) is
+        let node: dom::DomNode = a.dom.nodes[id]
+        let st: style::ComputedStyle = raw[id]
+        id += 1
+        if node.removed || node.tag == "text" is continue end
+        let nid: int = id - 1
+        if st.anim_name != "" && st.anim_ms > 0 && css::find_keyframes(a.sheet, st.anim_name) >= 0 is
+            let k: int = int_index(a.kf_nodes, nid)
+            let mut start: int = now
+            if k >= 0 && a.kf_name[k] == st.anim_name is start = a.kf_start[k] end
+            kn = array_push(kn, nid)
+            ks = array_push(ks, start)
+            kname = array_push(kname, st.anim_name)
+            if anim::anim_running(st, now - start) is busy = true end
+        end
+        if had_prev && anim::trans_covers_geometry(st) && anim::geometry_differs(a.prev_st[nid], st) is
+            let prev: style::ComputedStyle = a.prev_st[nid]
+            let mut from: style::ComputedStyle = prev
+            let ti: int = int_index(nt_ids, nid)
+            if ti >= 0 is
+                let el: int = now - nt_start[ti] - nt_delay[ti]
+                if nt_dur[ti] > 0 && el < nt_dur[ti] is
+                    let raw_t: int = if el <= 0 then 0 else el * 1000 / nt_dur[ti]
+                    from = anim::lerp_style(nt_from[ti], prev, anim::ease_apply(nt_ease[ti], raw_t), false)
+                end
+                nt_from[ti] = from
+                nt_start[ti] = now
+                nt_dur[ti] = st.trans_ms
+                nt_delay[ti] = st.trans_delay
+                nt_ease[ti] = st.trans_ease
+            else is
+                nt_ids = array_push(nt_ids, nid)
+                nt_from = array_push(nt_from, from)
+                nt_start = array_push(nt_start, now)
+                nt_dur = array_push(nt_dur, st.trans_ms)
+                nt_delay = array_push(nt_delay, st.trans_delay)
+                nt_ease = array_push(nt_ease, st.trans_ease)
+            end
+        end
+    end
+    ;; usuń zakończone przejścia
+    let mut t_ids: [int] = []
+    let mut t_from: [style::ComputedStyle] = []
+    let mut t_start: [int] = []
+    let mut t_dur: [int] = []
+    let mut t_delay: [int] = []
+    let mut t_ease: [string] = []
+    let mut i: int = 0
+    while i < array_len(nt_ids) is
+        if now - nt_start[i] - nt_delay[i] < nt_dur[i] is
+            t_ids = array_push(t_ids, nt_ids[i])
+            t_from = array_push(t_from, nt_from[i])
+            t_start = array_push(t_start, nt_start[i])
+            t_dur = array_push(t_dur, nt_dur[i])
+            t_delay = array_push(t_delay, nt_delay[i])
+            t_ease = array_push(t_ease, nt_ease[i])
+        end
+        i += 1
+    end
+    a.kf_nodes = kn
+    a.kf_start = ks
+    a.kf_name = kname
+    a.tr_ids = t_ids
+    a.tr_from = t_from
+    a.tr_start = t_start
+    a.tr_dur = t_dur
+    a.tr_delay = t_delay
+    a.tr_ease = t_ease
+    a.prev_st = raw
+    a.anim_busy = busy || array_len(t_ids) > 0
     return a
 end
 
@@ -1094,6 +1318,7 @@ fn ensure_js(a0: App) -> App is
         v = jsonlite::set_int(v, "scale", window::scale_percent(a.win))
         v = jsonlite::set_bool(v, "dark", a.dark)
         js::js_emit(a.js_handle, "__window_info", v)
+        a = storage_init(a)
     end
     let mut i: int = 0
     ;; <script src> z HTML, potem <script> inline, potem pliki z load_js
@@ -1236,6 +1461,15 @@ fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
             end
             continue
         end
+        if kind == "layoutwatch" is
+            a.js_layout_watch = true
+            a.js_last_layout = ""
+            continue
+        end
+        if kind == "watchstyle" is
+            if n > 0 && int_index(a.js_watch_ids, n) < 0 is a.js_watch_ids = array_push(a.js_watch_ids, n) end
+            continue
+        end
         if kind == "createtext" is
             a.dom = dom::create_text(a.dom, jsonlite::get_str(op, "v"))
             let real: int = array_len(a.dom.nodes) - 1
@@ -1286,6 +1520,9 @@ fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
             if a.focused_node == n is a = blur_current(a) end
         elsif kind == "click" is
             a = do_click(a, n, a.mouse_x, a.mouse_y)
+        elsif kind == "scrollinto" is
+            let ty: int = layout::scroll_into_y(a.boxes, n)
+            if ty >= 0 is a = scroll_page_auto(a, ty) end
         elsif kind == "scroll" is
             if n == 0 is
                 a.scroll_y = jsonlite::get_int(op, "v")
@@ -1330,15 +1567,261 @@ fn get_pair(pairs: [int], id: int) -> int is
 end
 
 ;; ---------- wbudowane komendy dla JS ----------
-fn builtin_fetch(args: string) -> string is
-    let url: string = jsonlite::get_str(args, "url")
-    let method: string = string_upper(jsonlite::get_str(args, "method"))
-    let body: string = jsonlite::get_str(args, "body")
+
+;; =====================================================================
+;; 0.3: most JS — układ (rects), computed style, storage, fetch z nagłówkami
+;; =====================================================================
+;; Jak dom_event, ale zwraca true, gdy JS anulował zdarzenie (preventDefault) — wymiana synchroniczna.
+fn dom_event_prevented(a: App, kind: string, node: int, extra: string) -> bool is
+    if a.js_handle < 0 is return false end
+    let mut j: string = if extra == "" then jsonlite::object() else extra
+    j = jsonlite::set_str(j, "type", kind)
+    j = jsonlite::set_int(j, "n", node)
+    return js::js_emit_ret(a.js_handle, "__dom_event", j) == 1
+end
+
+fn css_color_str(c: style::Color) -> string is
+    if c.a >= 255 is return "rgb(" + to_string(c.r) + ", " + to_string(c.g) + ", " + to_string(c.b) + ")" end
+    return "rgba(" + to_string(c.r) + ", " + to_string(c.g) + ", " + to_string(c.b) + ", " + netutil::css_alpha(c.a) + ")"
+end
+
+fn px_str(v: int) -> string is
+    return to_string(v) + "px"
+end
+
+;; Podzbiór stylu obliczonego eksponowany przez getComputedStyle (tylko dla „obserwowanych" węzłów).
+fn style_props_json(b: layout::LayoutBox) -> string is
+    let st: style::ComputedStyle = b.st
+    let mut j: string = jsonlite::object()
+    j = jsonlite::set_str(j, "display", st.display)
+    j = jsonlite::set_str(j, "position", st.position)
+    j = jsonlite::set_str(j, "visibility", if st.visible then "visible" else "hidden")
+    j = jsonlite::set_str(j, "opacity", if st.opacity >= 100 then "1" elsif st.opacity <= 0 then "0" else "0." + (if st.opacity < 10 then "0" else "") + to_string(st.opacity))
+    j = jsonlite::set_str(j, "z-index", if st.z_index == 0 then "auto" else to_string(st.z_index))
+    j = jsonlite::set_str(j, "overflow", st.overflow_x)
+    j = jsonlite::set_str(j, "color", css_color_str(st.color))
+    j = jsonlite::set_str(j, "background-color", if st.has_bg then css_color_str(st.background) else "rgba(0, 0, 0, 0)")
+    j = jsonlite::set_str(j, "font-size", px_str(st.font_size))
+    j = jsonlite::set_str(j, "font-weight", to_string(if st.bold && st.font_weight < 600 then 700 else st.font_weight))
+    j = jsonlite::set_str(j, "font-style", if st.italic then "italic" else "normal")
+    j = jsonlite::set_str(j, "font-family", if st.font_family == "" then "sans-serif" else st.font_family)
+    j = jsonlite::set_str(j, "text-align", st.text_align)
+    j = jsonlite::set_str(j, "cursor", st.cursor)
+    j = jsonlite::set_str(j, "pointer-events", if st.pointer_events then "auto" else "none")
+    j = jsonlite::set_str(j, "width", px_str(b.w))
+    j = jsonlite::set_str(j, "height", px_str(b.h))
+    j = jsonlite::set_str(j, "margin-top", px_str(if st.mar_top == style::auto_val() then 0 else st.mar_top))
+    j = jsonlite::set_str(j, "margin-right", px_str(if st.mar_right == style::auto_val() then 0 else st.mar_right))
+    j = jsonlite::set_str(j, "margin-bottom", px_str(if st.mar_bottom == style::auto_val() then 0 else st.mar_bottom))
+    j = jsonlite::set_str(j, "margin-left", px_str(if st.mar_left == style::auto_val() then 0 else st.mar_left))
+    j = jsonlite::set_str(j, "padding-top", px_str(st.pad_top))
+    j = jsonlite::set_str(j, "padding-right", px_str(st.pad_right))
+    j = jsonlite::set_str(j, "padding-bottom", px_str(st.pad_bottom))
+    j = jsonlite::set_str(j, "padding-left", px_str(st.pad_left))
+    j = jsonlite::set_str(j, "border-top-width", px_str(st.bt))
+    j = jsonlite::set_str(j, "border-right-width", px_str(st.br))
+    j = jsonlite::set_str(j, "border-bottom-width", px_str(st.bb))
+    j = jsonlite::set_str(j, "border-left-width", px_str(st.bl))
+    j = jsonlite::set_str(j, "box-sizing", if st.border_box then "border-box" else "content-box")
+    j = jsonlite::set_str(j, "flex-direction", st.flex_dir)
+    j = jsonlite::set_str(j, "transform", if st.has_transform then "matrix(" + to_string(st.tr_sx / 1000) + "." + to_string(st.tr_sx % 1000) + ", 0, 0, " + to_string(st.tr_sy / 1000) + "." + to_string(st.tr_sy % 1000) + ", " + to_string(st.tr_tx) + ", " + to_string(st.tr_ty) + ")" else "none")
+    j = jsonlite::set_str(j, "float", st.float_side)
+    j = jsonlite::set_str(j, "text-decoration", if st.underline then "underline" elsif st.strike then "line-through" else "none")
+    j = jsonlite::set_str(j, "letter-spacing", if st.letter_spacing == 0 then "normal" else px_str(st.letter_spacing))
+    return j
+end
+
+;; Wysyła do JS prostokąty z ostatniego układu (tylko gdy JS o nie prosił i tylko po zmianie).
+fn push_layout(app: App) -> App is
+    let mut a: App = app
+    if a.js_handle < 0 || !a.js_layout_watch is return a end
+    let mut r: string = "["
+    let mut first: bool = true
+    let mut i: int = 0
+    while i < array_len(a.boxes) is
+        let b: layout::LayoutBox = a.boxes[i]
+        i += 1
+        if b.kind == "box" && b.node_id > 0 is
+            let t: string = "[" + to_string(b.node_id) + "," + to_string(b.x) + "," + to_string(b.y) + "," + to_string(b.w) + "," + to_string(b.h) + "," +
+                            to_string(b.st.bl) + "," + to_string(b.st.br) + "," + to_string(b.st.bt) + "," + to_string(b.st.bb) + "," + to_string(b.content_h) + "]"
+            r = if first then r + t else r + "," + t
+            first = false
+        end
+    end
+    r = r + "]"
+    let mut s: string = "{"
+    let mut sfirst: bool = true
+    let mut w: int = 0
+    while w < array_len(a.js_watch_ids) is
+        let id: int = a.js_watch_ids[w]
+        w += 1
+        let mut k: int = 0
+        while k < array_len(a.boxes) is
+            if a.boxes[k].node_id == id && a.boxes[k].kind == "box" is
+                let entry: string = "\"" + to_string(id) + "\":" + style_props_json(a.boxes[k])
+                s = if sfirst then s + entry else s + "," + entry
+                sfirst = false
+                break
+            end
+            k += 1
+        end
+    end
+    s = s + "}"
+    let payload: string = "{\"sy\":" + to_string(a.scroll_y) + ",\"vw\":" + to_string(a.viewport_w) + ",\"vh\":" + to_string(a.viewport_h) + ",\"r\":" + r + ",\"s\":" + s + "}"
+    if payload == a.js_last_layout is return a end
+    a.js_last_layout = payload
+    js::js_emit(a.js_handle, "__layout", payload)
+    return a
+end
+
+;; ---------- localStorage: trwały zapis w katalogu danych użytkownika ----------
+fn storage_key(a: App) -> string is
+    let src: string = if a.html_path == "" then "app" else a.html_path
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < string_len(src) is
+        let c: string = string_at(src, i)
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9")
+        out = out + (if ok then c else "_")
+        i += 1
+    end
+    if string_len(out) > 80 is out = string_slice(out, string_len(out) - 80, string_len(out)) end
+    return out
+end
+
+fn storage_file(a: App) -> string is
+    let xdg: string = env::get("XDG_DATA_HOME")
+    let home: string = env::get("HOME")
+    let root: string = if xdg != "" then xdg elsif home != "" then home + "/.local/share" else "."
+    return root + "/silver/" + storage_key(a) + "/localStorage.json"
+end
+
+fn mkdir_chain(path: string) -> bool is
+    let parts: [string] = string_split(path, "/")
+    let mut cur: string = if string_starts_with(path, "/") then "" else "."
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" is
+            cur = cur + "/" + parts[i]
+            if !fs::exists(cur) is fs::mkdir(cur) end
+        end
+        i += 1
+    end
+    return fs::exists(path)
+end
+
+fn storage_init(app: App) -> App is
+    let mut a: App = app
+    if a.js_handle < 0 is return a end
+    a.storage_path = storage_file(a)
+    let mut data: string = "{{}}"
+    if fs::exists(a.storage_path) is
+        let raw: string = string_trim(fs::read(a.storage_path))
+        if string_starts_with(raw, "{") && string_ends_with(raw, "}") is data = raw end
+    end
+    a.storage_data = data
+    js::js_emit(a.js_handle, "__storage_init", "{\"local\":" + data + "}")
+    return a
+end
+
+fn storage_op(app: App, args: string) -> App is
+    let mut a: App = app
+    let op: string = jsonlite::get_str(args, "op")
+    if op == "set" is
+        a.storage_data = jsonlite::set_str(a.storage_data, jsonlite::get_str(args, "k"), jsonlite::get_str(args, "v"))
+    elsif op == "remove" is
+        a.storage_data = jsonlite::remove_key(a.storage_data, jsonlite::get_str(args, "k"))
+    elsif op == "clear" is
+        a.storage_data = "{{}}"
+    end
+    a.storage_dirty = true
+    return a
+end
+
+fn storage_flush(app: App, now: int, force: bool) -> App is
+    let mut a: App = app
+    if !a.storage_dirty || a.storage_path == "" is return a end
+    if !force && now - a.storage_last < 250 is return a end
+    let dir: string = dir_of(a.storage_path)
+    if mkdir_chain(dir) is
+        fs::write(a.storage_path, a.storage_data)
+    else is
+        log::warn("silver: nie można zapisać localStorage w " + dir)
+    end
+    a.storage_dirty = false
+    a.storage_last = now
+    return a
+end
+
+;; ---------- fetch: lokalne pliki, nagłówki żądania/odpowiedzi (przez curl, bez powłoki) ----------
+fn fetch_local(url: string, base: string) -> string is
+    let mut path: string = url
+    if string_starts_with(path, "file://") is path = string_slice(path, 7, string_len(path)) end
+    let q: int = string_find(path, "?")
+    if q >= 0 is path = string_slice(path, 0, q) end
+    let h: int = string_find(path, "#")
+    if h >= 0 is path = string_slice(path, 0, h) end
+    if !string_starts_with(path, "/") && base != "" is path = base + path end
     let mut r: string = jsonlite::object()
+    if !fs::exists(path) || fs::is_dir(path) is
+        r = jsonlite::set_int(r, "status", 404)
+        r = jsonlite::set_bool(r, "ok", false)
+        r = jsonlite::set_str(r, "body", "")
+        r = jsonlite::set_str(r, "statusText", "Not Found")
+        return r
+    end
+    r = jsonlite::set_int(r, "status", 200)
+    r = jsonlite::set_bool(r, "ok", true)
+    r = jsonlite::set_str(r, "body", fs::read(path))
+    r = jsonlite::set_raw(r, "headers", "{\"content-type\":\"" + netutil::local_mime(path) + "\"}")
+    return r
+end
+
+;; Rozbiera wynik `curl -i`: ostatni blok nagłówków (po przekierowaniach/100-continue) + treść.
+fn curl_fetch(url: string, method: string, body: string, headers: string) -> string is
+    let mut argv: [string] = ["-sS", "-i", "-L", "--max-time", "30"]
+    if method == "HEAD" is
+        argv = array_push(argv, "-I")
+    else is
+        argv = array_push(argv, "-X")
+        argv = array_push(argv, method)
+    end
+    let keys: [string] = jsonlite::keys(headers)
+    let mut i: int = 0
+    while i < array_len(keys) is
+        argv = array_push(argv, "-H")
+        argv = array_push(argv, keys[i] + ": " + jsonlite::get_str(headers, keys[i]))
+        i += 1
+    end
+    if body != "" && method != "GET" && method != "HEAD" is
+        argv = array_push(argv, "--data-binary")
+        argv = array_push(argv, body)
+    end
+    argv = array_push(argv, "--")
+    argv = array_push(argv, url)
+    let out: string = process::run_args("curl", argv)
+    if !string_starts_with(out, "HTTP/") is return "" end
+    return netutil::parse_curl_output(out)
+end
+
+fn builtin_fetch(args: string, base: string) -> string is
+    let url: string = jsonlite::get_str(args, "url")
+    let mut method: string = string_upper(jsonlite::get_str(args, "method"))
+    if method == "" is method = "GET" end
+    let body: string = jsonlite::get_str(args, "body")
+    let headers: string = if jsonlite::has_key(args, "headers") then jsonlite::get_raw(args, "headers") else "{{}}"
     if url == "" is
         return ipc::error_json("invalid_args", "fetch: brak url")
     end
-    if method == "" || method == "GET" is
+    if string_starts_with(url, "file://") || !netutil::has_scheme(url) is
+        return fetch_local(url, base)
+    end
+    if (string_starts_with(url, "http://") || string_starts_with(url, "https://")) && process::which("curl") != "" is
+        let via: string = curl_fetch(url, method, body, headers)
+        if via != "" is return via end
+    end
+    let mut r: string = jsonlite::object()
+    if method == "GET" is
         let resp = http::get_full(url)
         r = jsonlite::set_int(r, "status", resp.status)
         r = jsonlite::set_bool(r, "ok", resp.status >= 200 && resp.status < 300)
@@ -1451,16 +1934,21 @@ fn handle_js_invoke(a0: App, raw: string) -> App is
             js::js_emit(h, "__dom_subtree", "{\"n\":" + to_string(res.subtrees[i]) + ",\"nodes\":" + subtree_json(a.dom, res.subtrees[i]) + "}")
             i += 1
         end
-        js::js_resolve(h, call_id, "{}")
+        js::js_resolve(h, call_id, "{{}}")
         return a
     end
     if cmd == "__fetch" is
-        js::js_resolve(h, call_id, builtin_fetch(args))
+        js::js_resolve(h, call_id, builtin_fetch(args, dir_of(a.html_path)))
+        return a
+    end
+    if cmd == "__storage" is
+        a = storage_op(a, args)
+        js::js_resolve(h, call_id, "{{}}")
         return a
     end
     if cmd == "__window" is
         a = builtin_window(a, args)
-        js::js_resolve(h, call_id, "{}")
+        js::js_resolve(h, call_id, "{{}}")
         return a
     end
     if cmd == "__dialog" is
@@ -1470,7 +1958,7 @@ fn handle_js_invoke(a0: App, raw: string) -> App is
     if cmd == "__clip" is
         if jsonlite::get_str(args, "op") == "set" is
             window::clipboard_set(jsonlite::get_str(args, "text"))
-            js::js_resolve(h, call_id, "{}")
+            js::js_resolve(h, call_id, "{{}}")
         else is
             js::js_resolve(h, call_id, jsonlite::set_str(jsonlite::object(), "text", window::clipboard_get()))
         end
@@ -1756,8 +2244,9 @@ fn do_click(a0: App, hit: int, x: int, y: int) -> App is
     if hit < 0 || hit >= array_len(a.dom.nodes) is return a end
     let mut pos: string = jsonlite::set_int(jsonlite::object(), "x", x)
     pos = jsonlite::set_int(pos, "y", y)
-    dom_event(a, "click", hit, pos)
+    let click_prevented: bool = dom_event_prevented(a, "click", hit, pos)
     a = fire_hook(a, "click", jsonlite::set_int(pos, "node", hit))
+    if click_prevented is return a end
     let mut cur: int = hit
     while cur >= 0 is
         let n: dom::DomNode = a.dom.nodes[cur]
@@ -1797,6 +2286,19 @@ fn do_click(a0: App, hit: int, x: int, y: int) -> App is
         end
         if n.on_click != "" is
             return invoke_html(a, n.on_click, event_args(a, cur, "", ""))
+        end
+        if n.tag == "a" && string_starts_with(n.attr_href, "#") && string_len(n.attr_href) > 1 is
+            ;; kotwica na stronie: przewiń do elementu o tym id (z uwzględnieniem scroll-margin / scroll-padding)
+            let frag: string = string_slice(n.attr_href, 1, string_len(n.attr_href))
+            let mut fi: int = 0
+            while fi < array_len(a.dom.nodes) is
+                if !a.dom.nodes[fi].removed && a.dom.nodes[fi].attr_id == frag is
+                    let fy: int = layout::scroll_into_y(a.boxes, fi)
+                    if fy >= 0 is a = scroll_page_auto(a, fy) end
+                    break
+                end
+                fi += 1
+            end
         end
         if n.tag == "a" && n.attr_href != "" is
             a = fire_hook(a, "link", jsonlite::set_str(jsonlite::object(), "href", n.attr_href))
@@ -1979,7 +2481,7 @@ fn on_key_down(a0: App, ev: window::InputEvent) -> App is
     let mut a: App = a0
     let node: int = a.focused_node
     let payload: string = key_payload(ev)
-    dom_event(a, "keydown", if node >= 0 then node else 0, payload)
+    let key_prevented: bool = dom_event_prevented(a, "keydown", if node >= 0 then node else 0, payload)
     a = fire_hook(a, "keydown", payload)
     ;; on-keydown na polu z fokusem lub jego przodkach
     let mut cur: int = node
@@ -1990,6 +2492,7 @@ fn on_key_down(a0: App, ev: window::InputEvent) -> App is
         end
         cur = a.dom.nodes[cur].parent
     end
+    if key_prevented is return a end   ;; JS wywołał preventDefault() — pomijamy domyślną obsługę klawisza
     let cmd: bool = (ev.mods / 2) % 2 == 1 || (ev.mods / 8) % 2 == 1
     let shift: bool = ev.mods % 2 == 1
     let code: int = ev.code
@@ -2117,13 +2620,13 @@ fn handle_event(a0: App, ev: window::InputEvent) -> App is
     elsif k == "focus_gained" is
         a.has_focus = true
         a = reset_caret(a)
-        a = fire_hook(a, "window_focus", "{}")
-        emit(a, "silver://focus", "{}")
+        a = fire_hook(a, "window_focus", "{{}}")
+        emit(a, "silver://focus", "{{}}")
     elsif k == "focus_lost" is
         a.has_focus = false
         a.dirty_paint = true
-        a = fire_hook(a, "window_blur", "{}")
-        emit(a, "silver://blur", "{}")
+        a = fire_hook(a, "window_blur", "{{}}")
+        emit(a, "silver://blur", "{{}}")
     elsif k == "mouse_leave" is
         if a.hovered_node >= 0 is
             dom_event(a, "mouseleave", a.hovered_node, "")
@@ -2191,7 +2694,7 @@ fn detect_transitions(a0: App, now: int) -> App is
         nbg[b.node_id] = target_bg
         nfg[b.node_id] = st.color
         nop[b.node_id] = st.opacity
-        if had_prev && st.trans_ms > 0 is
+        if had_prev && st.trans_ms > 0 && int_index(a.kf_nodes, b.node_id) < 0 is
             let changed: bool = !same_color(a.prev_bg[b.node_id], target_bg) || !same_color(a.prev_fg[b.node_id], st.color) ||
                                 a.prev_op[b.node_id] != st.opacity
             if changed is
@@ -2286,8 +2789,27 @@ fn relayout(a0: App, now: int) -> App is
     let mut a: App = a0
     a.viewport_w = window::ffi_width(a.win)
     a.viewport_h = window::ffi_height(a.win)
-    let res: layout::LayoutResult = layout::layout_full(a.dom, a.sheet, a.viewport_w, a.viewport_h, a.win.handle,
-                                                        interaction_state(a), a.elem_scroll)
+    let ix_now: css::InteractionState = interaction_state(a)
+    let mut act: anim::AnimCtx = anim::no_anim()
+    if a.has_motion || dom_has_motion(a) is
+        let raw: [style::ComputedStyle] = layout::compute_styles(a.dom, a.sheet, ix_now)
+        a = update_motion(a, raw, now)
+        act = motion_ctx(a, now)
+    elsif array_len(a.prev_st) > 0 || a.anim_busy is
+        a.prev_st = []
+        a.kf_nodes = []
+        a.kf_start = []
+        a.kf_name = []
+        a.tr_ids = []
+        a.tr_from = []
+        a.tr_start = []
+        a.tr_dur = []
+        a.tr_delay = []
+        a.tr_ease = []
+        a.anim_busy = false
+    end
+    let res: layout::LayoutResult = layout::layout_full_a(a.dom, a.sheet, a.viewport_w, a.viewport_h, a.win.handle,
+                                                          ix_now, a.elem_scroll, act)
     a.boxes = res.boxes
     a.doc_h = res.height
     if debug_on() is
@@ -2299,6 +2821,7 @@ fn relayout(a0: App, now: int) -> App is
     a.dirty_layout = false
     a.dirty_paint = true
     a = detect_transitions(a, now)
+    a = push_layout(a)
     ;; IME: podpowiedz pozycję pola
     if a.focused_node >= 0 && a.focused_node < array_len(a.dom.nodes) is
         let b: layout::LayoutBox = box_of(a, a.focused_node)
@@ -2430,6 +2953,8 @@ pub fn next_wait_ms(a: App, now: int) -> int is
     let mut wait: int = 500
     if a.tick_ms > 0 && a.tick_ms < wait is wait = a.tick_ms end
     if array_len(a.anims) > 0 is wait = 8 end
+    if a.anim_busy is wait = 12 end
+    if a.scroll_goal >= 0 is wait = 8 end
     if a.focused_node >= 0 && a.has_focus && wait > 60 is wait = 60 end
     if a.dev_mode && wait > 200 is wait = 200 end
     if array_len(a.tasks) > 0 && wait > 30 is wait = 30 end
@@ -2459,9 +2984,12 @@ pub fn step(a0: App, wait_ms: int) -> App is
     a = pump_js(a)
     a = poll_tasks(a)
     a = run_tick(a, now)
+    a = smooth_scroll_step(a)
     a = update_theme(a, now)
     a = dev_reload(a, now)
     a = pump_js(a)
+    if a.anim_busy is a.dirty_layout = true end
+    a = storage_flush(a, now, false)
     if a.dirty_layout is a = relayout(a, now) end
     let blink_changed: bool = a.focused_node >= 0 && a.has_focus && (((now - a.caret_t0) / 530) % 2 == 0) != a.caret_phase
     if a.dirty_paint || array_len(a.anims) > 0 || blink_changed is
@@ -2481,12 +3009,13 @@ fn prepare(a0: App) -> App is
     a = update_theme(a, ffi_shim::silver_ticks())
     if array_len(a.boxes) == 0 is a = relayout(a, ffi_shim::silver_ticks()) end
     a = start_js_if_needed(a)
-    a = fire_hook(a, "ready", "{}")
+    a = fire_hook(a, "ready", "{{}}")
     return a
 end
 
 fn finish(a0: App) -> App is
     let mut a: App = a0
+    a = storage_flush(a, 0, true)
     if a.js_handle >= 0 is
         js::js_shutdown(a.js_handle)
         a.js_handle = -1
@@ -2569,6 +3098,41 @@ pub fn clipboard_set(text: string) -> bool is return window::clipboard_set(text)
 pub fn notify(title: string, body: string) -> bool is return window::notify(title, body) end
 
 ;; Przewija stronę do pozycji (z limitem).
+fn smooth_root(a: App) -> bool is
+    let mut i: int = 0
+    while i < array_len(a.boxes) && i < 6 is
+        if a.boxes[i].kind == "box" && a.boxes[i].node_id <= 1 && a.boxes[i].st.scroll_behavior == "smooth" is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Skok do pozycji: płynny przy `scroll-behavior: smooth` na korzeniu, inaczej natychmiastowy.
+fn scroll_page_auto(a0: App, y: int) -> App is
+    let mut a: App = a0
+    if !smooth_root(a) is return scroll_page_to(a, y) end
+    let mut v: int = y
+    if v > max_page_scroll(a) is v = max_page_scroll(a) end
+    if v < 0 is v = 0 end
+    a.scroll_goal = v
+    return a
+end
+
+;; Jeden krok płynnego przewijania (ok. 25% pozostałej drogi, min. 2 px).
+fn smooth_scroll_step(a0: App) -> App is
+    let mut a: App = a0
+    if a.scroll_goal < 0 is return a end
+    let delta: int = a.scroll_goal - a.scroll_y
+    if delta > -3 && delta < 3 is
+        let g: int = a.scroll_goal
+        a.scroll_goal = -1
+        return scroll_page_to(a, g)
+    end
+    let mut stp: int = delta / 4
+    if stp == 0 is stp = (if delta > 0 then 1 else -1) end
+    return scroll_page_to(a, a.scroll_y + stp)
+end
+
 pub fn scroll_to(app: App, y: int) -> App is
     return scroll_page_to(app, y)
 end
