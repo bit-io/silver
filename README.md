@@ -1,6 +1,6 @@
-# Silver 0.2
+# Silver 0.3
 
-Framework okienkowy w stylu Tauri **bez WebView**: frontend w HTML/CSS/JS (albo TypeScript, Preact, Svelte),
+Framework okienkowy w stylu Tauri **bez WebView**: frontend w HTML/CSS/JS (albo TypeScript, React, Vue, Solid, Preact, Svelte),
 backend w [H#](https://github.com/HackerOS-Linux-System/H-Sharp). Własny silnik układu i rysowania na SDL2,
 JavaScript przez QuickJS. Pakiety zarządzane przez [bit](https://github.com/bit-io/bit).
 
@@ -51,16 +51,16 @@ document.querySelector('#btn').addEventListener('click', async () => {
 });
 ```
 
-## Co potrafi (0.2)
+## Co potrafi (0.3)
 
 | Obszar | Zakres |
 |---|---|
 | **HTML** | parser stosowy: encje, komentarze, `<!DOCTYPE>`, atrybuty w `"…"`/`'…'`/bez cudzysłowów, tagi void, `<script>`/`<style>`/`<link>`, formularze (`input`, `textarea`, `select`, checkbox, radio, `button`, `label`, `form`), `data-*` |
-| **CSS** | kolory (148 nazw, `#rgb`, `rgb()/hsl()`), `%`/`em`/`rem`/`vw`/`vh`/`calc()`, `var(--x)`, `!important`, `@media`, selektory atrybutów/kombinatorów/pseudo-klas, `::before/::after`, `border-radius`, `box-shadow`, gradienty, `transition`, `overflow`, `position`, `box-sizing`, … → [docs/css.md](docs/css.md) |
-| **Układ** | blok, inline, inline-block, zawijanie tekstu, flexbox, grid, `position`, listy, tabele (uproszczone), przewijanie kontenerów |
+| **CSS** | kolory, jednostki, `calc()/clamp()`, `var()`, `inherit/initial/unset` dla każdej właściwości, właściwości logiczne, `@media` (zakresy, `or`, `not`), `@supports`, `@layer`, `@import`, `@font-face`, **`@keyframes`/`animation`**, `transition` geometrii, **`transform`**, `filter`, `clip-path`, **`float`**, **`z-index`**, `position: sticky`, `aspect-ratio`, `letter-spacing`, `text-shadow`, ramki `dashed/dotted`, `::before/::after` z `attr()`/`counter()`, `:has()`, `:nth-child(… of S)`, … → [docs/css.md](docs/css.md) |
+| **Układ** | blok z `float` i zwijaniem marginesów, inline, inline-block, flexbox (`align-content`), grid (obszary, linie, auto-placement), **prawdziwe tabele** (`colspan`, `rowspan`), `position`, listy, przewijanie kontenerów |
 | **Interakcja** | edycja pól (kursor, zaznaczenie, schowek, UTF-8, IME), Tab, kursory CSS, drag & drop plików, `on-click/input/change/submit/keydown/hover` |
-| **JS** | QuickJS ES2020+: `await`, timery, `fetch`, `console`, lustro DOM, zdarzenia, polyfille → [docs/javascript.md](docs/javascript.md) |
-| **TypeScript / frameworki** | esbuild + npm; `silver.d.ts`; sprawdzone: TypeScript, Preact, Svelte 4/5 → [docs/typescript.md](docs/typescript.md) |
+| **JS** | QuickJS ES2020+: moduły ES, `await`, timery, `fetch` z nagłówkami, lustro DOM z układem (`getBoundingClientRect`, `getComputedStyle`), obserwatory, synchroniczne `preventDefault`, `Intl`, trwały `localStorage`, `Worker`, `WebSocket`, Shadow DOM, Custom Elements, source mapy → [docs/javascript.md](docs/javascript.md) |
+| **TypeScript / frameworki** | esbuild + npm; `silver.d.ts`; sprawdzone: TypeScript, Preact, Svelte 4/5, React 18, Vue 3, Solid → [docs/typescript.md](docs/typescript.md) |
 | **Backend H#** | komendy z uprawnieniami (`capabilities`), dyrektywy UI (`ui.h#`), szablony `{{klucz}}`/`if`/`each`, zadania w tle, wiele okien, cykliczny `on_tick` |
 | **System** | schowek, powiadomienia, dialogi plików, ikona, pełny ekran, motyw jasny/ciemny |
 | **Dystrybucja** | `silver bundle`: AppImage, `.deb`, `.app`/`.dmg`, Windows `.zip`/instalator → [docs/packaging.md](docs/packaging.md) |
@@ -100,12 +100,19 @@ silver bundle <appimage|deb|macos|dmg|windows>
 
 ## Co jest zweryfikowane, a co nie
 
-Środowisko, w którym powstało 0.2, nie miało kompilatora H# (LLVM), więc:
+Środowisko, w którym powstało 0.3, nie miało kompilatora H# (LLVM), więc:
 
-- **Sprawdzone realnie:** parsowanie i sprawdzanie typów całej biblioteki parserem i type-checkerem H#;
-  138 testów silnika (DOM, CSS, style, layout, szablony, edycja, IPC) wykonanych interpreterem H# — 133 przechodzi, 5 (enum w polu struktury, `jsonval`) wymaga skompilowanego H#;
-  warstwa natywna (SDL2 pod Xvfb, QuickJS, DOM, polyfille) i budowa frontendów
-  TypeScript/Preact/Svelte prawdziwym npm+esbuild uruchomiona w QuickJS (`native/tests/run.sh`, `run-js.sh`).
-- **Niesprawdzone:** skompilowanie i uruchomienie całej aplikacji H# z oknem (`h# compile`), działanie na
-  macOS/Windows (CI buduje shimy, nie uruchamia okien), skrypty pakujące poza `.deb`.
+- **Sprawdzone realnie:**
+  - parsowanie i sprawdzanie typów całej biblioteki parserem i type-checkerem H# (w tym `app.h#`, `paint.h#`);
+  - **287 testów silnika** (DOM, CSS, style, układ, tabele, grid, kolumny, `@container`, zagnieżdżanie, transformacje, animacje, pseudo-elementy, szablony, edycja, IPC)
+    wykonanych interpreterem H#: 283 przechodzi, 4 (enum w polu struktury w `ipc`, UTF-8 przez FFI w edycji) wymaga skompilowanego H#;
+  - **warstwy transformacji, `backdrop blur` i dekoder WOFF** sprawdzone na pikselach / bajtach (`native/tests/run-layer.sh`, `run-woff.sh`; renderer programowy SDL);
+  - warstwa natywna: SDL2 pod Xvfb (`native/tests/run.sh`), rodziny czcionek na prawdziwym SDL_ttf (`fonts_test.c`), QuickJS z DOM, polyfillami, modułami ES,
+    **WebSocket względem prawdziwego serwera**, 20 kontroli API JS, frontendy TypeScript/Preact/Svelte oraz **React 18, Vue 3, Solid** zbudowane
+    prawdziwym npm + esbuild i uruchomione w QuickJS (`native/tests/run-all.sh`, `run-js.sh`, `run-ext.sh`).
+- **Niesprawdzone:** skompilowanie i uruchomienie całej aplikacji H# z oknem (`h# compile`), więc **rysowanie** (`paint.h#`: m.in. ramki `dashed/dotted`,
+  nowe: obrócone poddrzewa, `text-underline-offset`, `background-origin/clip`, `object-position`, `caret-color`, `scrollbar-*`, płynne przewijanie, kotwice `#id`; warstwa natywna pod nimi jest przetestowana,
+  ale połączenie H# → shim nie było uruchomione,
+  `text-shadow`, `letter-spacing`, tło z powtarzaniem, `sticky`) i **integracja animacji w `app.h#`** przeszły parser i type-checker, ale nigdy nie zostały
+  wyrenderowane; działanie na macOS/Windows (CI buduje shimy, nie uruchamia okien), skrypty pakujące poza `.deb`, `curl` jako klient `fetch` w pakietach.
   Oczekuj pierwszych poprawek po pierwszym `bit build`.
