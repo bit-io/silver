@@ -9,6 +9,7 @@ extern static [c, "silverjs"] is
     fn js_resolve(js_handle: int, call_id: string, result_json: string) -> bool
     fn js_reject(js_handle: int, call_id: string, message: string) -> bool
     fn js_emit(js_handle: int, event_name: string, payload_json: string) -> bool
+    fn js_emit_ret(js_handle: int, event_name: string, payload_json: string) -> int  ;; 1 = zdarzenie anulowane (preventDefault)
     fn js_tick(js_handle: int) -> int                 ;; odpala timery + Promise
     fn js_next_timer_ms(js_handle: int) -> int        ;; -1 brak, 0 teraz
     fn js_has_jobs(js_handle: int) -> bool
