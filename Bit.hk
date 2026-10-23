@@ -1,6 +1,6 @@
 [package]
 -> name        => silver
--> version     => 0.2.0
+-> version     => 0.3.0
 -> description => Tauri-podobny framework okienkowy z własnym silnikiem renderującym (bez WebView)
 -> authors     => ["Bit Developers"]
 -> license     => MIT
