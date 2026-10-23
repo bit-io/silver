@@ -4,7 +4,7 @@ use "std -> env"     from "env"
 use "std -> process" from "process"
 
 fn version() -> string is
-    return "0.2.0"
+    return "0.3.0"
 end
 
 ;; ---------- pomocnicze ----------
@@ -72,7 +72,7 @@ fn project_name() -> string is
 end
 
 fn project_version() -> string is
-    if !fs::exists("Bit.hk") is return "0.2.0" end
+    if !fs::exists("Bit.hk") is return "0.3.0" end
     let lines: [string] = string_split(fs::read("Bit.hk"), "\n")
     let mut i: int = 0
     while i < array_len(lines) is
@@ -83,7 +83,7 @@ fn project_version() -> string is
             if eq > 0 is return string_trim(string_slice(l, eq + 2, string_len(l))) end
         end
     end
-    return "0.2.0"
+    return "0.3.0"
 end
 
 fn has_frontend_build() -> bool is
@@ -187,7 +187,7 @@ pub fn cmd_new(args: [string]) -> int is
 end
 
 fn cmd_list() -> int is
-    write("Szablony Silver 0.2:")
+    write("Szablony Silver 0.3:")
     let names: [string] = templates_data::names()
     let mut i: int = 0
     while i < array_len(names) is
