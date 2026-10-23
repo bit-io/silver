@@ -1,5 +1,7 @@
 mod dom
 mod cssval
+mod props
+use "std -> conv" from "conv"
 
 pub struct CssDecl is
     pub prop:      string
@@ -33,10 +35,34 @@ pub struct CssRule is
     pub comps:    [Compound]   ;; od lewej do prawej
     pub combs:    [string]     ;; combs[i] = kombinator między comps[i-1] a comps[i]
     pub pelem:    string       ;; "" | "before" | "after"
+    pub layer:    int          ;; 0 = bez @layer; 1.. = kolejność warstwy (późniejsza wygrywa)
+    pub cq:       string       ;; warunki @container (rozdzielone \u0002), "" = brak
+end
+
+;; @font-face
+pub struct FontFace is
+    pub family: string
+    pub src:    string         ;; ścieżka/URL pliku czcionki
+    pub bold:   bool
+    pub italic: bool
+end
+
+;; Jeden przystanek @keyframes (`from` = 0, `to` = 100).
+pub struct KfStop is
+    pub pct:   int
+    pub decls: [CssDecl]
+end
+
+pub struct Keyframes is
+    pub name:  string
+    pub stops: [KfStop]
 end
 
 pub struct Stylesheet is
-    pub rules: [CssRule]
+    pub rules:     [CssRule]
+    pub imports:   [string]      ;; @import: "url\u0001warunek-media" (jeszcze nierozwiązane)
+    pub fonts:     [FontFace]
+    pub keyframes: [Keyframes]
 end
 
 pub struct SelectorPath is
@@ -53,26 +79,29 @@ pub struct InteractionState is
     pub viewport_w:  int
     pub viewport_h:  int
     pub dark:        bool
+    pub cq_w:        [int]     ;; @container: szerokość zawartości kontenera wg id węzła (-1 = nie jest kontenerem)
+    pub cq_h:        [int]     ;; wysokość (-1 = brak / kontener tylko w osi inline)
+    pub cq_names:    [string]  ;; nazwy kontenerów wg id węzła, spacjami
 end
 
 pub fn no_interaction() -> InteractionState is
     return InteractionState { hovered_id: -1, focused_id: "", active_id: -1, focused_node: -1,
-                              viewport_w: 800, viewport_h: 600, dark: false }
+                              viewport_w: 800, viewport_h: 600, dark: false, cq_w: [], cq_h: [], cq_names: [] }
 end
 
 pub fn interaction(hovered: int, focused_node: int, active: int) -> InteractionState is
     return InteractionState { hovered_id: hovered, focused_id: "", active_id: active,
-                              focused_node: focused_node, viewport_w: 800, viewport_h: 600, dark: false }
+                              focused_node: focused_node, viewport_w: 800, viewport_h: 600, dark: false, cq_w: [], cq_h: [], cq_names: [] }
 end
 
 ;; Zgodność z 0.1: fokus po attr_id zamiast id węzła.
 pub fn ix_legacy(hovered: int, focused_id: string, active: int) -> InteractionState is
     return InteractionState { hovered_id: hovered, focused_id: focused_id, active_id: active, focused_node: -1,
-                              viewport_w: 800, viewport_h: 600, dark: false }
+                              viewport_w: 800, viewport_h: 600, dark: false, cq_w: [], cq_h: [], cq_names: [] }
 end
 
 pub fn empty_sheet() -> Stylesheet is
-    return Stylesheet { rules: [] }
+    return Stylesheet { rules: [], imports: [], fonts: [], keyframes: [] }
 end
 
 ;; ---------- pomocnicze ----------
@@ -452,7 +481,7 @@ pub fn compile_rule(selector: string, decls: [CssDecl], media: string, order: in
     end
     return CssRule {
         selector: selector, decls: decls, media: media, order: order,
-        spec: selector_specificity(selector), comps: comps, combs: path.combs, pelem: pelem
+        spec: selector_specificity(selector), comps: comps, combs: path.combs, pelem: pelem, layer: 0, cq: ""
     }
 end
 
@@ -463,7 +492,225 @@ fn combine_media(outer: string, inner: string) -> string is
     return outer + " and " + inner
 end
 
-fn parse_into(css: string, media: string, rules: [CssRule]) -> [CssRule] is
+;; ---------- @supports ----------
+;; Lista właściwości, które silnik rozumie (do ewaluacji @supports).
+fn supports_term(t: string) -> bool is
+    let inner: string = string_trim(string_slice(t, 1, string_len(t) - 1))
+    if string_starts_with(inner, "selector(") is return true end
+    let colon: int = string_find(inner, ":")
+    if colon < 0 is return false end
+    let name: string = string_lower(string_trim(string_slice(inner, 0, colon)))
+    if string_starts_with(name, "--") is return true end
+    let bare: string = if string_starts_with(name, "-webkit-") then string_slice(name, 8, string_len(name)) elsif string_starts_with(name, "-moz-") then string_slice(name, 5, string_len(name)) elsif string_starts_with(name, "-ms-") then string_slice(name, 4, string_len(name)) else name
+    let val: string = string_trim(string_slice(inner, colon + 1, string_len(inner)))
+    if string_ends_with(string_lower(val), "!important") is val = string_trim(string_slice(val, 0, string_len(val) - 10)) end
+    return props::known(bare) && props::valid(bare, val)
+end
+
+pub fn supports_matches(cond: string) -> bool is
+    let toks: [string] = cssval::split_top(string_trim(cond))
+    let mut result: bool = true
+    let mut have: bool = false
+    let mut op: string = "and"
+    let mut negate: bool = false
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = string_trim(toks[i])
+        i += 1
+        let tl: string = string_lower(t)
+        if tl == "not" is
+            negate = true
+        elsif tl == "and" || tl == "or" is
+            op = tl
+        elsif string_starts_with(t, "(") is
+            let inner: string = string_trim(string_slice(t, 1, string_len(t) - 1))
+            let mut v: bool = if string_starts_with(inner, "(") || string_starts_with(string_lower(inner), "not ") then supports_matches(inner) else supports_term(t)
+            if negate is v = !v end
+            negate = false
+            if !have is
+                result = v
+                have = true
+            elsif op == "or" is
+                result = result || v
+            else is
+                result = result && v
+            end
+        elsif string_starts_with(tl, "selector(") is
+            let v: bool = if negate then false else true
+            negate = false
+            if !have is
+                result = v
+                have = true
+            end
+        end
+    end
+    return result
+end
+
+;; ---------- @layer ----------
+fn list_has_name(lst: string, name: string) -> bool is
+    return string_find(lst, "\u0001" + name + "\u0001") >= 0
+end
+
+fn full_layer_name(outer: string, name: string) -> string is
+    if outer == "" is return name end
+    return outer + "." + name
+end
+
+;; Kolejność warstw wg pierwszego wystąpienia: "\u0001a\u0001b\u0001".
+fn scan_layers(css: string, outer: string, acc0: string) -> string is
+    let mut acc: string = acc0
+    let n: int = string_len(css)
+    let mut p: int = 0
+    while p < n is
+        while p < n && is_ws(string_at(css, p)) is p += 1 end
+        if p >= n is break end
+        if string_at(css, p) == "@" is
+            let mut q: int = p + 1
+            while q < n && is_ident_char(string_at(css, q)) is q += 1 end
+            let name: string = string_lower(string_slice(css, p + 1, q))
+            let brace: int = find_char(css, "{", q)
+            let semi: int = find_char(css, ";", q)
+            let block_first: bool = brace >= 0 && (semi < 0 || brace < semi)
+            if !block_first is
+                if name == "layer" is
+                    let end_at: int = if semi < 0 then n else semi
+                    let names: [string] = cssval::split_commas(string_slice(css, q, end_at))
+                    let mut k: int = 0
+                    while k < array_len(names) is
+                        let nm: string = string_trim(names[k])
+                        k += 1
+                        if nm != "" is
+                            let full: string = full_layer_name(outer, nm)
+                            if !list_has_name(acc, full) is
+                                acc = if acc == "" then "\u0001" + full + "\u0001" else acc + full + "\u0001"
+                            end
+                        end
+                    end
+                end
+                p = if semi < 0 then n else semi + 1
+                continue
+            end
+            let close: int = matching_brace(css, brace)
+            if close < 0 is break end
+            let prelude: string = string_trim(string_slice(css, q, brace))
+            let inner: string = string_slice(css, brace + 1, close)
+            if name == "layer" is
+                let nm: string = string_trim(prelude)
+                let full: string = if nm == "" then outer else full_layer_name(outer, nm)
+                if nm != "" && !list_has_name(acc, full) is
+                    acc = if acc == "" then "\u0001" + full + "\u0001" else acc + full + "\u0001"
+                end
+                acc = scan_layers(inner, full, acc)
+            elsif name == "media" || name == "supports" || name == "container" is
+                acc = scan_layers(inner, outer, acc)
+            end
+            p = close + 1
+            continue
+        end
+        let open: int = find_char(css, "{", p)
+        if open < 0 is break end
+        let close: int = matching_brace(css, open)
+        if close < 0 is break end
+        p = close + 1
+    end
+    return acc
+end
+
+;; Numer warstwy (1..) wg kolejności; 0 gdy poza warstwą / nieznana.
+fn layer_rank(lorder: string, name: string) -> int is
+    if name == "" is return 0 end
+    let at: int = string_find(lorder, "\u0001" + name + "\u0001")
+    if at < 0 is return 0 end
+    let before: string = string_slice(lorder, 0, at + 1)
+    let parts: [string] = string_split(before, "\u0001")
+    return array_len(parts) - 1
+end
+
+;; ---------- parser arkusza ----------
+fn combine_media(outer: string, inner: string) -> string is
+    if outer == "" is return inner end
+    if inner == "" is return outer end
+    return outer + " and " + inner
+end
+
+fn is_quote_c(c: string) -> bool is
+    return c == "\"" || c == "'"
+end
+
+;; Dzieli ciało reguły na tekst deklaracji ([0]) i zagnieżdżone bloki ("prelude\u0002treść"), CSS Nesting.
+fn split_nested(block: string) -> [string] is
+    let n: int = string_len(block)
+    let mut decl_text: string = ""
+    let mut nested: [string] = []
+    let mut cur: string = ""
+    let mut depth: int = 0
+    let mut quote: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(block, i)
+        if quote != "" is
+            if c == quote is quote = "" end
+            cur = cur + c
+        elsif is_quote_c(c) is
+            quote = c
+            cur = cur + c
+        elsif c == "(" is
+            depth += 1
+            cur = cur + c
+        elsif c == ")" is
+            depth -= 1
+            cur = cur + c
+        elsif c == ";" && depth <= 0 is
+            decl_text = decl_text + cur + ";"
+            cur = ""
+        elsif c == "{" && depth <= 0 && !string_starts_with(string_trim(cur), "--") is
+            let close: int = matching_brace(block, i)
+            if close < 0 is
+                i = n
+            else is
+                nested = array_push(nested, string_trim(cur) + "\u0002" + string_slice(block, i + 1, close))
+                cur = ""
+                i = close
+            end
+        else is
+            cur = cur + c
+        end
+        i += 1
+    end
+    let mut out: [string] = [decl_text + cur]
+    let mut k: int = 0
+    while k < array_len(nested) is
+        out = array_push(out, nested[k])
+        k += 1
+    end
+    return out
+end
+
+;; Selektor zagnieżdżony: `&` = selektor rodzica, bez `&` — potomek rodzica.
+pub fn nest_selector(parent: string, child: string) -> string is
+    let c: string = string_trim(child)
+    if string_find(c, "&") >= 0 is return string_replace(c, "&", parent) end
+    return parent + " " + c
+end
+
+fn join_list(items: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(items) is
+        out = if i == 0 then items[i] else out + sep + items[i]
+        i += 1
+    end
+    return out
+end
+
+fn combine_cq(outer: string, inner: string) -> string is
+    if outer == "" is return inner end
+    if inner == "" is return outer end
+    return outer + "\u0002" + inner
+end
+
+fn parse_into(css: string, media: string, cq: string, layer: string, lorder: string, rules: [CssRule]) -> [CssRule] is
     let mut acc: [CssRule] = rules
     let n: int = string_len(css)
     let mut p: int = 0
@@ -489,9 +736,16 @@ fn parse_into(css: string, media: string, rules: [CssRule]) -> [CssRule] is
             let prelude: string = string_trim(string_slice(css, q, brace))
             let inner: string = string_slice(css, brace + 1, close)
             if name == "media" is
-                acc = parse_into(inner, combine_media(media, string_lower(prelude)), acc)
-            elsif name == "supports" || name == "layer" || name == "container" is
-                acc = parse_into(inner, media, acc)
+                acc = parse_into(inner, combine_media(media, string_lower(prelude)), cq, layer, lorder, acc)
+            elsif name == "supports" is
+                if supports_matches(prelude) is acc = parse_into(inner, media, cq, layer, lorder, acc) end
+            elsif name == "layer" is
+                let nm: string = string_trim(prelude)
+                acc = parse_into(inner, media, cq, if nm == "" then layer else full_layer_name(layer, nm), lorder, acc)
+            elsif name == "container" is
+                acc = parse_into(inner, media, combine_cq(cq, string_lower(prelude)), layer, lorder, acc)
+            elsif name == "scope" is
+                acc = parse_into(inner, media, cq, layer, lorder, acc)
             end
             p = close + 1
             continue
@@ -501,14 +755,47 @@ fn parse_into(css: string, media: string, rules: [CssRule]) -> [CssRule] is
         let close: int = matching_brace(css, open)
         if close < 0 is break end
         let selector_group: string = string_trim(string_slice(css, p, open))
-        let decls: [CssDecl] = parse_decls(string_slice(css, open + 1, close))
+        let body: string = string_slice(css, open + 1, close)
+        let parts: [string] = if string_find(body, "{") >= 0 then split_nested(body) else [body]
+        let decls: [CssDecl] = parse_decls(parts[0])
         let group: [string] = cssval::split_commas(selector_group)
+        let rank: int = layer_rank(lorder, layer)
         let mut gi: int = 0
         while gi < array_len(group) is
             let sel: string = string_trim(group[gi])
             gi += 1
             if sel != "" is
-                acc = array_push(acc, compile_rule(sel, decls, media, array_len(acc)))
+                let mut r: CssRule = compile_rule(sel, decls, media, array_len(acc))
+                r.layer = rank
+                r.cq = cq
+                acc = array_push(acc, r)
+            end
+        end
+        ;; zagnieżdżone reguły i at-reguły warunkowe wewnątrz reguły
+        let mut ni: int = 1
+        while ni < array_len(parts) is
+            let np: [string] = string_split(parts[ni], "\u0002")
+            ni += 1
+            let prelude: string = string_trim(np[0])
+            let nbody: string = if array_len(np) >= 2 then np[1] else ""
+            if prelude == "" is continue end
+            if string_starts_with(prelude, "@") is
+                let text: string = prelude + " " + "{" + selector_group + " " + "{" + nbody + "}" + "}"
+                acc = parse_into(text, media, cq, layer, lorder, acc)
+            else is
+                let kids: [string] = cssval::split_commas(prelude)
+                let mut resolved: [string] = []
+                let mut pi: int = 0
+                while pi < array_len(group) is
+                    let mut ki: int = 0
+                    while ki < array_len(kids) is
+                        resolved = array_push(resolved, nest_selector(string_trim(group[pi]), kids[ki]))
+                        ki += 1
+                    end
+                    pi += 1
+                end
+                let text: string = join_list(resolved, ", ") + " " + "{" + nbody + "}"
+                acc = parse_into(text, media, cq, layer, lorder, acc)
             end
         end
         p = close + 1
@@ -516,8 +803,239 @@ fn parse_into(css: string, media: string, rules: [CssRule]) -> [CssRule] is
     return acc
 end
 
+;; Zbiera at-reguły `want` (na wszystkich poziomach zagnieżdżenia @media/@supports/@layer/@container).
+;; Zwraca elementy "prelude\u0002treść" (dla reguł instrukcyjnych treść = "").
+fn scan_at(css: string, want: string, acc0: [string]) -> [string] is
+    let mut acc: [string] = acc0
+    let n: int = string_len(css)
+    let mut p: int = 0
+    while p < n is
+        while p < n && is_ws(string_at(css, p)) is p += 1 end
+        if p >= n is break end
+        if string_at(css, p) == "@" is
+            let mut q: int = p + 1
+            while q < n && is_ident_char(string_at(css, q)) is q += 1 end
+            let name: string = string_lower(string_slice(css, p + 1, q))
+            let brace: int = find_char(css, "{", q)
+            let semi: int = find_char(css, ";", q)
+            let block_first: bool = brace >= 0 && (semi < 0 || brace < semi)
+            if !block_first is
+                if name == want is
+                    let end_at: int = if semi < 0 then n else semi
+                    acc = array_push(acc, string_trim(string_slice(css, q, end_at)) + "\u0002")
+                end
+                p = if semi < 0 then n else semi + 1
+                continue
+            end
+            let close: int = matching_brace(css, brace)
+            if close < 0 is break end
+            let prelude: string = string_trim(string_slice(css, q, brace))
+            let inner: string = string_slice(css, brace + 1, close)
+            if name == want is
+                acc = array_push(acc, prelude + "\u0002" + inner)
+            elsif name == "media" || name == "layer" || name == "container" is
+                acc = scan_at(inner, want, acc)
+            elsif name == "supports" is
+                if supports_matches(prelude) is acc = scan_at(inner, want, acc) end
+            end
+            p = close + 1
+            continue
+        end
+        let open: int = find_char(css, "{", p)
+        if open < 0 is break end
+        let close: int = matching_brace(css, open)
+        if close < 0 is break end
+        p = close + 1
+    end
+    return acc
+end
+
+;; "url(\"a.css\") screen" / "\"a.css\" (min-width: 600px)" -> "a.css\u0001screen"
+fn import_entry(raw: string) -> string is
+    let t: string = string_trim(raw)
+    let mut url: string = ""
+    let mut rest: string = ""
+    if string_starts_with(string_lower(t), "url(") is
+        let e: int = paren_end(t, 3)
+        url = string_trim(string_slice(t, 4, e))
+        rest = string_trim(string_slice(t, e + 1, string_len(t)))
+    elsif string_starts_with(t, "\"") || string_starts_with(t, "'") is
+        let q: string = string_slice(t, 0, 1)
+        let e: int = find_char(t, q, 1)
+        if e < 0 is return "" end
+        url = string_slice(t, 1, e)
+        rest = string_trim(string_slice(t, e + 1, string_len(t)))
+    else is
+        return ""
+    end
+    if string_starts_with(url, "\"") || string_starts_with(url, "'") is url = string_slice(url, 1, string_len(url) - 1) end
+    ;; `layer(...)` / `supports(...)` po URL-u pomijamy
+    if string_starts_with(string_lower(rest), "layer") || string_starts_with(string_lower(rest), "supports") is
+        let po: int = string_find(rest, "(")
+        if po >= 0 is rest = string_trim(string_slice(rest, paren_end(rest, po) + 1, string_len(rest))) end
+    end
+    return url + "\u0001" + rest
+end
+
+;; Preferencja formatu czcionki: TTF/OTF/TTC (3) > WOFF (2, dekodowany w warstwie natywnej) > reszta (WOFF2 — 0).
+pub fn font_src_score(u: string) -> int is
+    let mut lu: string = string_lower(u)
+    let q: int = string_find(lu, "?")
+    if q >= 0 is lu = string_slice(lu, 0, q) end
+    let h: int = string_find(lu, "#")
+    if h >= 0 is lu = string_slice(lu, 0, h) end
+    if string_ends_with(lu, ".ttf") || string_ends_with(lu, ".otf") || string_ends_with(lu, ".ttc") is return 3 end
+    if string_ends_with(lu, ".woff") is return 2 end
+    return 0
+end
+
+fn parse_font_face(body: string) -> FontFace is
+    let decls: [CssDecl] = parse_decls(body)
+    let mut ff: FontFace = FontFace { family: "", src: "", bold: false, italic: false }
+    let mut i: int = 0
+    while i < array_len(decls) is
+        let d: CssDecl = decls[i]
+        i += 1
+        let v: string = string_trim(d.val)
+        let lv: string = string_lower(v)
+        if d.prop == "font-family" is
+            let mut f: string = v
+            if string_starts_with(f, "\"") || string_starts_with(f, "'") is f = string_slice(f, 1, string_len(f) - 1) end
+            ff.family = string_lower(string_trim(f))
+        elsif d.prop == "font-weight" is
+            ff.bold = lv == "bold" || lv == "bolder" || str_to_int(lv) >= 600
+        elsif d.prop == "font-style" is
+            ff.italic = lv == "italic" || lv == "oblique"
+        elsif d.prop == "src" is
+            let cands: [string] = cssval::split_commas(v)
+            let mut k: int = 0
+            let mut best: string = ""
+            while k < array_len(cands) is
+                let c: string = string_trim(cands[k])
+                k += 1
+                let at: int = string_find(string_lower(c), "url(")
+                if at >= 0 is
+                    let e: int = paren_end(c, at + 3)
+                    let mut u: string = string_trim(string_slice(c, at + 4, e))
+                    if string_starts_with(u, "\"") || string_starts_with(u, "'") is u = string_slice(u, 1, string_len(u) - 1) end
+                    if best == "" || font_src_score(u) > font_src_score(best) is best = u end
+                end
+            end
+            ff.src = best
+        end
+    end
+    return ff
+end
+
+fn stop_pct(tok: string) -> int is
+    let t: string = string_lower(string_trim(tok))
+    if t == "from" is return 0 end
+    if t == "to" is return 100 end
+    if string_ends_with(t, "%") is return conv::float_to_int(conv::str_to_float(string_slice(t, 0, string_len(t) - 1))) end
+    return -1
+end
+
+fn parse_keyframes_body(name: string, body: string) -> Keyframes is
+    let mut stops: [KfStop] = []
+    let n: int = string_len(body)
+    let mut p: int = 0
+    while p < n is
+        let open: int = find_char(body, "{", p)
+        if open < 0 is break end
+        let close: int = matching_brace(body, open)
+        if close < 0 is break end
+        let sels: [string] = cssval::split_commas(string_trim(string_slice(body, p, open)))
+        let decls: [CssDecl] = parse_decls(string_slice(body, open + 1, close))
+        let mut k: int = 0
+        while k < array_len(sels) is
+            let pc: int = stop_pct(sels[k])
+            k += 1
+            if pc >= 0 is stops = array_push(stops, KfStop { pct: pc, decls: decls }) end
+        end
+        p = close + 1
+    end
+    ;; sortowanie przystanków rosnąco (stabilne, insertion sort)
+    let mut sorted: [KfStop] = []
+    let mut i: int = 0
+    while i < array_len(stops) is
+        let cur: KfStop = stops[i]
+        i += 1
+        let mut pos: int = array_len(sorted)
+        let mut j: int = 0
+        while j < array_len(sorted) is
+            if sorted[j].pct > cur.pct && pos == array_len(sorted) is pos = j end
+            j += 1
+        end
+        let mut out: [KfStop] = []
+        let mut m: int = 0
+        while m < array_len(sorted) is
+            if m == pos is out = array_push(out, cur) end
+            out = array_push(out, sorted[m])
+            m += 1
+        end
+        if pos == array_len(sorted) is out = array_push(out, cur) end
+        sorted = out
+    end
+    return Keyframes { name: string_lower(string_trim(name)), stops: sorted }
+end
+
 pub fn parse(css: string) -> Stylesheet is
-    return Stylesheet { rules: parse_into(strip_comments(css), "", []) }
+    let clean: string = strip_comments(css)
+    let lorder: string = scan_layers(clean, "", "")
+    let rules: [CssRule] = parse_into(clean, "", "", "", lorder, [])
+    let mut imports: [string] = []
+    let imp: [string] = scan_at(clean, "import", [])
+    let mut i: int = 0
+    while i < array_len(imp) is
+        let parts: [string] = string_split(imp[i], "\u0002")
+        let e: string = import_entry(parts[0])
+        i += 1
+        if e != "" is imports = array_push(imports, e) end
+    end
+    let mut fonts: [FontFace] = []
+    let faces: [string] = scan_at(clean, "font-face", [])
+    i = 0
+    while i < array_len(faces) is
+        let parts: [string] = string_split(faces[i], "\u0002")
+        i += 1
+        let ff: FontFace = parse_font_face(if array_len(parts) >= 2 then parts[1] else "")
+        if ff.family != "" && ff.src != "" is fonts = array_push(fonts, ff) end
+    end
+    let mut kfs: [Keyframes] = []
+    let mut names: [string] = ["keyframes", "-webkit-keyframes"]
+    let mut ni: int = 0
+    while ni < array_len(names) is
+        let blocks: [string] = scan_at(clean, names[ni], [])
+        ni += 1
+        let mut b: int = 0
+        while b < array_len(blocks) is
+            let parts: [string] = string_split(blocks[b], "\u0002")
+            b += 1
+            if array_len(parts) >= 2 && string_trim(parts[0]) != "" is
+                kfs = array_push(kfs, parse_keyframes_body(strip_quotes_css(parts[0]), parts[1]))
+            end
+        end
+    end
+    return Stylesheet { rules: rules, imports: imports, fonts: fonts, keyframes: kfs }
+end
+
+fn strip_quotes_css(v: string) -> string is
+    let t: string = string_trim(v)
+    if string_len(t) >= 2 && (string_starts_with(t, "\"") || string_starts_with(t, "'")) is
+        return string_slice(t, 1, string_len(t) - 1)
+    end
+    return t
+end
+
+pub fn find_keyframes(sheet: Stylesheet, name: string) -> int is
+    let want: string = string_lower(string_trim(name))
+    let mut found: int = -1
+    let mut i: int = 0
+    while i < array_len(sheet.keyframes) is
+        if sheet.keyframes[i].name == want is found = i end
+        i += 1
+    end
+    return found
 end
 
 ;; Łączy dwa arkusze (b ma wyższy priorytet przy remisie); przenumerowuje kolejność.
@@ -537,21 +1055,168 @@ pub fn concat(a: Stylesheet, b: Stylesheet) -> Stylesheet is
         rules = array_push(rules, r)
         i += 1
     end
-    return Stylesheet { rules: rules }
+    let mut imports: [string] = a.imports
+    i = 0
+    while i < array_len(b.imports) is
+        imports = array_push(imports, b.imports[i])
+        i += 1
+    end
+    let mut fonts: [FontFace] = a.fonts
+    i = 0
+    while i < array_len(b.fonts) is
+        fonts = array_push(fonts, b.fonts[i])
+        i += 1
+    end
+    let mut kfs: [Keyframes] = a.keyframes
+    i = 0
+    while i < array_len(b.keyframes) is
+        kfs = array_push(kfs, b.keyframes[i])
+        i += 1
+    end
+    return Stylesheet { rules: rules, imports: imports, fonts: fonts, keyframes: kfs }
 end
 
 ;; ---------- @media ----------
+fn media_len(val: string, ix: InteractionState) -> int is
+    let env: cssval::LenEnv = cssval::LenEnv { em: 16, rem: 16, vw: ix.viewport_w, vh: ix.viewport_h }
+    return cssval::parse_len(val, env).px
+end
+
+;; Wartość cechy (width/height/aspect-ratio/resolution) w tysięcznych lub px.
+fn media_metric(name: string, ix: InteractionState) -> int is
+    if name == "width" || name == "device-width" is return ix.viewport_w end
+    if name == "height" || name == "device-height" is return ix.viewport_h end
+    if name == "aspect-ratio" || name == "device-aspect-ratio" is
+        if ix.viewport_h <= 0 is return 0 end
+        return ix.viewport_w * 1000 / ix.viewport_h
+    end
+    if name == "resolution" is return 1000 end
+    return -1
+end
+
+fn media_operand(name: string, tok: string, ix: InteractionState) -> int is
+    let t: string = string_trim(tok)
+    if name == "aspect-ratio" || name == "device-aspect-ratio" is
+        let parts: [string] = string_split(t, "/")
+        let a: f64 = conv::str_to_float(string_trim(parts[0]))
+        let b: f64 = if array_len(parts) >= 2 then conv::str_to_float(string_trim(parts[1])) else 1.0
+        if b <= 0.0 is return 0 end
+        return conv::float_to_int(a / b * 1000.0)
+    end
+    if name == "resolution" is
+        if string_ends_with(t, "dppx") || string_ends_with(t, "x") is
+            let num: string = if string_ends_with(t, "dppx") then string_slice(t, 0, string_len(t) - 4) else string_slice(t, 0, string_len(t) - 1)
+            return conv::float_to_int(conv::str_to_float(num) * 1000.0)
+        end
+        if string_ends_with(t, "dpi") is return conv::float_to_int(conv::str_to_float(string_slice(t, 0, string_len(t) - 3)) / 96.0 * 1000.0) end
+        return 1000
+    end
+    return media_len(t, ix)
+end
+
+fn cmp_ok(a: int, op: string, b: int) -> bool is
+    if op == ">=" is return a >= b end
+    if op == "<=" is return a <= b end
+    if op == ">" is return a > b end
+    if op == "<" is return a < b end
+    if op == "=" is return a == b end
+    return false
+end
+
+fn flip_op(op: string) -> string is
+    if op == ">=" is return "<=" end
+    if op == "<=" is return ">=" end
+    if op == ">" is return "<" end
+    if op == "<" is return ">" end
+    return op
+end
+
+fn is_cmp_tok(t: string) -> bool is
+    return t == ">=" || t == "<=" || t == ">" || t == "<" || t == "="
+end
+
+;; Tokenizer zakresów: "width >= 600px" -> ["width", ">=", "600px"]
+fn range_tokens(inner: string) -> [string] is
+    let n: int = string_len(inner)
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(inner, i)
+        if c == ">" || c == "<" is
+            if cur != "" is out = array_push(out, cur) end
+            cur = ""
+            let two: bool = i + 1 < n && string_at(inner, i + 1) == "="
+            out = array_push(out, if two then c + "=" else c)
+            i += if two then 2 else 1
+            continue
+        end
+        if c == "=" is
+            if cur != "" is out = array_push(out, cur) end
+            cur = ""
+            out = array_push(out, "=")
+        elsif is_ws(c) is
+            if cur != "" is out = array_push(out, cur) end
+            cur = ""
+        else is
+            cur = cur + c
+        end
+        i += 1
+    end
+    if cur != "" is out = array_push(out, cur) end
+    return out
+end
+
+;; Składnia zakresów: (width >= 600px), (400px <= width <= 800px), (600px < width).
+fn media_range(inner: string, ix: InteractionState) -> bool is
+    let toks: [string] = range_tokens(inner)
+    let n: int = array_len(toks)
+    if n == 3 is
+        if is_cmp_tok(toks[1]) is
+            let a: string = toks[0]
+            let b: string = toks[2]
+            let a_is_name: bool = media_metric(a, ix) >= 0
+            if a_is_name is
+                return cmp_ok(media_metric(a, ix), toks[1], media_operand(a, b, ix))
+            end
+            return cmp_ok(media_metric(b, ix), flip_op(toks[1]), media_operand(b, a, ix))
+        end
+    end
+    if n == 5 is
+        let name: string = toks[2]
+        let cur: int = media_metric(name, ix)
+        if cur < 0 is return false end
+        let left_ok: bool = cmp_ok(media_operand(name, toks[0], ix), toks[1], cur)
+        let right_ok: bool = cmp_ok(cur, toks[3], media_operand(name, toks[4], ix))
+        return left_ok && right_ok
+    end
+    return false
+end
+
 fn media_feature(feat: string, ix: InteractionState) -> bool is
     let inner: string = string_trim(string_replace(string_replace(feat, "(", ""), ")", ""))
     let colon: int = string_find(inner, ":")
-    if colon < 0 is return inner == "color" || inner == "hover" end
+    if colon < 0 is
+        if string_find(inner, ">") >= 0 || string_find(inner, "<") >= 0 || string_find(inner, "=") >= 0 is
+            return media_range(inner, ix)
+        end
+        return inner == "color" || inner == "hover" || inner == "any-hover" || inner == "pointer" || inner == "any-pointer" ||
+               inner == "width" || inner == "height" || inner == "grid"
+    end
     let name: string = string_trim(string_slice(inner, 0, colon))
     let val: string = string_trim(string_slice(inner, colon + 1, string_len(inner)))
-    let env: cssval::LenEnv = cssval::LenEnv { em: 16, rem: 16, vw: ix.viewport_w, vh: ix.viewport_h }
-    if name == "min-width" is return ix.viewport_w >= cssval::parse_len(val, env).px end
-    if name == "max-width" is return ix.viewport_w <= cssval::parse_len(val, env).px end
-    if name == "min-height" is return ix.viewport_h >= cssval::parse_len(val, env).px end
-    if name == "max-height" is return ix.viewport_h <= cssval::parse_len(val, env).px end
+    if name == "min-width" is return ix.viewport_w >= media_len(val, ix) end
+    if name == "max-width" is return ix.viewport_w <= media_len(val, ix) end
+    if name == "min-height" is return ix.viewport_h >= media_len(val, ix) end
+    if name == "max-height" is return ix.viewport_h <= media_len(val, ix) end
+    if name == "width" is return ix.viewport_w == media_len(val, ix) end
+    if name == "height" is return ix.viewport_h == media_len(val, ix) end
+    if name == "min-aspect-ratio" is return media_metric("aspect-ratio", ix) >= media_operand("aspect-ratio", val, ix) end
+    if name == "max-aspect-ratio" is return media_metric("aspect-ratio", ix) <= media_operand("aspect-ratio", val, ix) end
+    if name == "aspect-ratio" is return media_metric("aspect-ratio", ix) == media_operand("aspect-ratio", val, ix) end
+    if name == "min-resolution" is return 1000 >= media_operand("resolution", val, ix) end
+    if name == "max-resolution" is return 1000 <= media_operand("resolution", val, ix) end
+    if name == "resolution" is return 1000 == media_operand("resolution", val, ix) end
     if name == "prefers-color-scheme" is
         return if ix.dark then val == "dark" else val == "light"
     end
@@ -559,39 +1224,89 @@ fn media_feature(feat: string, ix: InteractionState) -> bool is
         return if ix.viewport_w >= ix.viewport_h then val == "landscape" else val == "portrait"
     end
     if name == "prefers-reduced-motion" is return val == "no-preference" end
-    if name == "hover" || name == "pointer" is return true end
+    if name == "prefers-contrast" is return val == "no-preference" end
+    if name == "prefers-reduced-transparency" is return val == "no-preference" end
+    if name == "forced-colors" is return val == "none" end
+    if name == "display-mode" is return val == "standalone" || val == "browser" end
+    if name == "update" is return val == "fast" end
+    if name == "hover" || name == "any-hover" is return val == "hover" end
+    if name == "pointer" || name == "any-pointer" is return val == "fine" end
+    if name == "color" || name == "min-color" is return true end
+    if name == "scripting" is return val == "enabled" end
     return false
+end
+
+;; Wyrażenie: (a) and (b), (a) or (b), not (a), zagnieżdżone nawiasy.
+fn media_expr(expr: string, ix: InteractionState) -> bool is
+    let toks: [string] = cssval::split_top(string_trim(expr))
+    let n: int = array_len(toks)
+    if n == 0 is return true end
+    ;; or: dowolny człon prawdziwy
+    let mut has_or: bool = false
+    let mut i: int = 0
+    while i < n is
+        if string_lower(toks[i]) == "or" is has_or = true end
+        i += 1
+    end
+    if has_or is
+        let mut cur: string = ""
+        let mut result: bool = false
+        i = 0
+        while i < n is
+            let t: string = toks[i]
+            i += 1
+            if string_lower(t) == "or" is
+                if media_expr(cur, ix) is result = true end
+                cur = ""
+            else is
+                cur = if cur == "" then t else cur + " " + t
+            end
+        end
+        if cur != "" && media_expr(cur, ix) is result = true end
+        return result
+    end
+    ;; and: wszystkie człony prawdziwe; `not` neguje następny człon
+    let mut ok: bool = true
+    let mut negate: bool = false
+    i = 0
+    while i < n is
+        let t: string = toks[i]
+        let tl: string = string_lower(t)
+        i += 1
+        if tl == "and" || tl == "only" is
+            continue
+        end
+        if tl == "not" is
+            negate = true
+            continue
+        end
+        let mut v: bool = true
+        if tl == "print" || tl == "speech" || tl == "tty" || tl == "projection" is
+            v = false
+        elsif string_starts_with(t, "(") is
+            let inner: string = string_trim(string_slice(t, 1, string_len(t) - 1))
+            if string_starts_with(inner, "(") || string_starts_with(string_lower(inner), "not ") is
+                v = media_expr(inner, ix)
+            else is
+                v = media_feature(t, ix)
+            end
+        end
+        if negate is
+            v = !v
+            negate = false
+        end
+        if !v is ok = false end
+    end
+    return ok
 end
 
 pub fn media_matches(cond: string, ix: InteractionState) -> bool is
     if string_trim(cond) == "" is return true end
-    let alts: [string] = string_split(string_lower(cond), ",")
+    let alts: [string] = cssval::split_commas(string_lower(cond))
     let mut a: int = 0
     while a < array_len(alts) is
-        let part0: string = string_trim(alts[a])
+        if media_expr(alts[a], ix) is return true end
         a += 1
-        let negate: bool = string_starts_with(part0, "not ")
-        let part: string = if negate then string_trim(string_slice(part0, 4, string_len(part0))) else part0
-        let terms: [string] = string_split(string_replace(part, ") and (", ")\u0001("), "\u0001")
-        let mut all_ok: bool = true
-        let mut t: int = 0
-        while t < array_len(terms) is
-            let sub: [string] = string_split(string_trim(terms[t]), " and ")
-            let mut s: int = 0
-            while s < array_len(sub) is
-                let tok: string = string_trim(sub[s])
-                s += 1
-                if tok == "" || tok == "screen" || tok == "all" || tok == "only screen" is continue end
-                if tok == "print" || tok == "speech" is
-                    all_ok = false
-                elsif string_starts_with(tok, "(") is
-                    if !media_feature(tok, ix) is all_ok = false end
-                end
-            end
-            t += 1
-        end
-        let res: bool = if negate then !all_ok else all_ok
-        if res is return true end
     end
     return false
 end
@@ -747,12 +1462,22 @@ fn pseudo_matches(d: dom::Dom, node_id: int, ps: string, ix: InteractionState) -
     if ps == "read-only" is return n.readonly || n.tag != "input" && n.tag != "textarea" end
     if ps == "placeholder-shown" is return n.attr_placeholder != "" && n.attr_value == "" end
     if string_starts_with(ps, "nth-child(") is
-        let expr: NthExpr = parse_nth_expr(string_slice(ps, 10, string_len(ps) - 1))
+        let parts: [string] = split_of(string_slice(ps, 10, string_len(ps) - 1))
+        let expr: NthExpr = parse_nth_expr(parts[0])
+        if parts[1] != "" is
+            let idx2: int = sibling_index_of(d, node_id, parts[1], ix, false)
+            return idx2 > 0 && nth_matches(expr, idx2)
+        end
         let idx: int = sibling_index(d, node_id, false)
         return idx > 0 && nth_matches(expr, idx)
     end
     if string_starts_with(ps, "nth-last-child(") is
-        let expr: NthExpr = parse_nth_expr(string_slice(ps, 15, string_len(ps) - 1))
+        let parts: [string] = split_of(string_slice(ps, 15, string_len(ps) - 1))
+        let expr: NthExpr = parse_nth_expr(parts[0])
+        if parts[1] != "" is
+            let idx2: int = sibling_index_of(d, node_id, parts[1], ix, true)
+            return idx2 > 0 && nth_matches(expr, idx2)
+        end
         let idx: int = sibling_index(d, node_id, false)
         return idx > 0 && nth_matches(expr, sibling_count(d, node_id, false) - idx + 1)
     end
@@ -761,6 +1486,39 @@ fn pseudo_matches(d: dom::Dom, node_id: int, ps: string, ix: InteractionState) -
         let idx: int = sibling_index(d, node_id, true)
         return idx > 0 && nth_matches(expr, idx)
     end
+    if string_starts_with(ps, "nth-last-of-type(") is
+        let expr: NthExpr = parse_nth_expr(string_slice(ps, 17, string_len(ps) - 1))
+        let idx: int = sibling_index(d, node_id, true)
+        return idx > 0 && nth_matches(expr, sibling_count(d, node_id, true) - idx + 1)
+    end
+    if string_starts_with(ps, "has(") is return has_matches(d, node_id, string_slice(ps, 4, string_len(ps) - 1), ix) end
+    if string_starts_with(ps, "lang(") is
+        let want: string = string_lower(string_trim(string_slice(ps, 5, string_len(ps) - 1)))
+        let have: string = lang_of(d, node_id)
+        return have != "" && (have == want || string_starts_with(have, want + "-"))
+    end
+    if string_starts_with(ps, "dir(") is
+        return string_trim(string_slice(ps, 4, string_len(ps) - 1)) == "ltr"
+    end
+    if ps == "only-of-type" is return sibling_count(d, node_id, true) == 1 end
+    if ps == "focus-visible" is
+        return (ix.focused_node >= 0 && ix.focused_node == node_id) || (n.attr_id != "" && n.attr_id == ix.focused_id)
+    end
+    if ps == "read-write" is
+        return (n.tag == "input" || n.tag == "textarea") && !n.readonly && !n.disabled
+    end
+    if ps == "required" is return dom::has_attr(n, "required") end
+    if ps == "optional" is
+        return (n.tag == "input" || n.tag == "select" || n.tag == "textarea") && !dom::has_attr(n, "required")
+    end
+    if ps == "default" is return n.checked || (n.tag == "option" && dom::has_attr(n, "selected")) end
+    if ps == "indeterminate" is return dom::has_attr(n, "indeterminate") end
+    if ps == "valid" is return !(dom::has_attr(n, "required") && n.attr_value == "") end
+    if ps == "invalid" is return dom::has_attr(n, "required") && n.attr_value == "" end
+    if ps == "scope" is return node_id == 0 || (n.tag == "html" && n.parent == 0) end
+    if ps == "defined" is return true end
+    if ps == "any-link" is return n.tag == "a" && n.attr_href != "" end
+    if ps == "visited" || ps == "target" || ps == "fullscreen" || ps == "paused" || ps == "playing" is return false end
     return false
 end
 
@@ -768,11 +1526,124 @@ fn list_matches(d: dom::Dom, node_id: int, list: string, ix: InteractionState) -
     let items: [string] = cssval::split_commas(list)
     let mut i: int = 0
     while i < array_len(items) is
-        let pc: ParsedCompound = parse_compound(string_trim(items[i]))
-        if compound_matches_node(d, node_id, pc.comp, ix) is return true end
+        let sel: string = string_trim(items[i])
         i += 1
+        if sel == "" is continue end
+        let rule: CssRule = compile_rule(sel, [], "", 0)
+        if array_len(rule.comps) > 0 && path_matches_from(d, node_id, rule.comps, rule.combs, array_len(rule.comps) - 1, ix) is
+            return true
+        end
     end
     return false
+end
+
+;; Czy element-potomek/rodzeństwo `cand` pasuje do selektora względnego z :has().
+fn has_candidate_matches(d: dom::Dom, cand: int, sel: string, ix: InteractionState) -> bool is
+    return is_live_element(d, cand) && list_matches(d, cand, sel, ix)
+end
+
+fn has_descendant_matching(d: dom::Dom, node_id: int, sel: string, ix: InteractionState, depth: int) -> bool is
+    if depth > 60 is return false end
+    let kids: [int] = d.nodes[node_id].children
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let k: int = kids[i]
+        i += 1
+        if is_live_element(d, k) is
+            if has_candidate_matches(d, k, sel, ix) is return true end
+            if has_descendant_matching(d, k, sel, ix, depth + 1) is return true end
+        end
+    end
+    return false
+end
+
+;; :has(<selektor względny>) — `> a`, `+ a`, `~ a` albo potomek.
+fn has_matches(d: dom::Dom, node_id: int, arg: string, ix: InteractionState) -> bool is
+    let alts: [string] = cssval::split_commas(arg)
+    let mut a: int = 0
+    while a < array_len(alts) is
+        let rel: string = string_trim(alts[a])
+        a += 1
+        if rel == "" is continue end
+        let first: string = string_slice(rel, 0, 1)
+        if first == ">" is
+            let sel: string = string_trim(string_slice(rel, 1, string_len(rel)))
+            let kids: [int] = d.nodes[node_id].children
+            let mut i: int = 0
+            while i < array_len(kids) is
+                if has_candidate_matches(d, kids[i], sel, ix) is return true end
+                i += 1
+            end
+        elsif first == "+" is
+            let sel: string = string_trim(string_slice(rel, 1, string_len(rel)))
+            let nx: int = next_element_sibling(d, node_id)
+            if nx >= 0 && has_candidate_matches(d, nx, sel, ix) is return true end
+        elsif first == "~" is
+            let sel: string = string_trim(string_slice(rel, 1, string_len(rel)))
+            let mut nx: int = next_element_sibling(d, node_id)
+            while nx >= 0 is
+                if has_candidate_matches(d, nx, sel, ix) is return true end
+                nx = next_element_sibling(d, nx)
+            end
+        else is
+            if has_descendant_matching(d, node_id, rel, ix, 0) is return true end
+        end
+    end
+    return false
+end
+
+fn next_element_sibling(d: dom::Dom, node_id: int) -> int is
+    let parent: int = d.nodes[node_id].parent
+    if parent < 0 is return -1 end
+    let kids: [int] = d.nodes[parent].children
+    let mut seen: bool = false
+    let mut i: int = 0
+    while i < array_len(kids) is
+        if seen && is_live_element(d, kids[i]) is return kids[i] end
+        if kids[i] == node_id is seen = true end
+        i += 1
+    end
+    return -1
+end
+
+;; Indeks wśród rodzeństwa pasującego do `of S` (od 1); -1 gdy sam węzeł nie pasuje.
+fn sibling_index_of(d: dom::Dom, node_id: int, sel: string, ix: InteractionState, from_end: bool) -> int is
+    let parent: int = d.nodes[node_id].parent
+    if parent < 0 is return 1 end
+    if !list_matches(d, node_id, sel, ix) is return -1 end
+    let kids: [int] = d.nodes[parent].children
+    let mut idx: int = 0
+    let mut total: int = 0
+    let mut mine: int = 0
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let k: int = kids[i]
+        i += 1
+        if is_live_element(d, k) && list_matches(d, k, sel, ix) is
+            total += 1
+            if k == node_id is mine = total end
+        end
+    end
+    if from_end is return total - mine + 1 end
+    return mine
+end
+
+;; "2n+1 of .a, .b" -> [wyrażenie, selektor]
+fn split_of(arg: string) -> [string] is
+    let low: string = string_lower(arg)
+    let at: int = string_find(low, " of ")
+    if at < 0 is return [arg, ""] end
+    return [string_trim(string_slice(arg, 0, at)), string_trim(string_slice(arg, at + 4, string_len(arg)))]
+end
+
+fn lang_of(d: dom::Dom, node_id: int) -> string is
+    let mut cur: int = node_id
+    while cur >= 0 is
+        let l: string = dom::get_attr(d.nodes[cur], "lang")
+        if l != "" is return string_lower(l) end
+        cur = d.nodes[cur].parent
+    end
+    return ""
 end
 
 pub fn compound_matches_node(d: dom::Dom, node_id: int, c: Compound, ix: InteractionState) -> bool is
@@ -881,6 +1752,59 @@ end
 ;; Deklaracje pasujące do węzła, posortowane rosnąco wg (important, specyficzność,
 ;; kolejność) — kolejne nadpisują poprzednie. Węzły pseudo (before/after) dopasowują
 ;; reguły z ::before/::after do swojego rodzica. `inline_style` dodawany na końcu.
+
+;; ---------- @container ----------
+;; Warunek "[nazwa] (min-width: 400px)" → [nazwa, wyrażenie].
+fn cq_split(cond: string) -> [string] is
+    let c: string = string_trim(cond)
+    if string_starts_with(c, "(") || string_starts_with(c, "not ") || string_starts_with(c, "style(") is return ["", c] end
+    let sp: int = string_find(c, " ")
+    if sp < 0 is return ["", c] end
+    return [string_slice(c, 0, sp), string_trim(string_slice(c, sp + 1, string_len(c)))]
+end
+
+fn cq_find_container(d: dom::Dom, start: int, name: string, ix: InteractionState) -> int is
+    let mut cur: int = start
+    let mut guard: int = 0
+    while cur > 0 && guard < 256 is
+        guard += 1
+        if cur < array_len(ix.cq_w) && ix.cq_w[cur] >= 0 is
+            if name == "" is return cur end
+            if string_find(" " + ix.cq_names[cur] + " ", " " + name + " ") >= 0 is return cur end
+        end
+        cur = d.nodes[cur].parent
+    end
+    return -1
+end
+
+;; Wszystkie warunki `cqs` (rozdzielone \u0002) muszą być prawdziwe względem najbliższego pasującego kontenera
+;; przodka `start` (z samym `start` włącznie — pseudo-elementy pytają kontener swojego właściciela).
+pub fn cq_matches(cqs: string, d: dom::Dom, start: int, ix: InteractionState) -> bool is
+    let conds: [string] = string_split(cqs, "\u0002")
+    let mut i: int = 0
+    while i < array_len(conds) is
+        let parts: [string] = cq_split(conds[i])
+        i += 1
+        if string_starts_with(parts[1], "style(") is return false end
+        let c: int = cq_find_container(d, start, parts[0], ix)
+        if c < 0 is return false end
+        let mut ix2: InteractionState = ix
+        ix2.viewport_w = ix.cq_w[c]
+        ix2.viewport_h = if ix.cq_h[c] >= 0 then ix.cq_h[c] else 0
+        if !media_matches(parts[1], ix2) is return false end
+    end
+    return true
+end
+
+pub fn sheet_has_cq(sheet: Stylesheet) -> bool is
+    let mut i: int = 0
+    while i < array_len(sheet.rules) is
+        if sheet.rules[i].cq != "" is return true end
+        i += 1
+    end
+    return false
+end
+
 pub fn matching_decls_ctx(sheet: Stylesheet, d: dom::Dom, node_id: int, ix: InteractionState) -> [CssDecl] is
     ;; Przepisane bez insert_sorted/insert_key i bez `break` w pętli: w programie skompilowanym
     ;; poprzednia wersja zwracała tylko deklaracje PIERWSZEJ pasującej reguły (reszta ginęła przy
@@ -892,10 +1816,13 @@ pub fn matching_decls_ctx(sheet: Stylesheet, d: dom::Dom, node_id: int, ix: Inte
     let mut decls: [CssDecl] = []
     if target < 0 is return decls end
 
-    ;; 1) reguły pasujące do węzła: indeks reguły + klucz kaskady
+    ;; 1) reguły pasujące do węzła: indeks reguły + klucze kaskady
+    ;;    (zwykłe: bez warstwy > późniejsza warstwa; !important: odwrotnie)
     let count: int = array_len(sheet.rules)
     let mut midx: [int] = []
     let mut mkey: [int] = []
+    let mut ikey: [int] = []
+    let big: int = 10000000000000
     let mut i: int = 0
     while i < count is
         let rule: CssRule = sheet.rules[i]
@@ -903,25 +1830,34 @@ pub fn matching_decls_ctx(sheet: Stylesheet, d: dom::Dom, node_id: int, ix: Inte
         i += 1
         let mut ok: bool = rule.pelem == want_pelem
         if ok && rule.media != "" && !media_matches(rule.media, ix) is ok = false end
+        if ok && rule.cq != "" && !cq_matches(rule.cq, d, if want_pelem != "" then target else d.nodes[target].parent, ix) is ok = false end
         if ok && !rule_matches(d, target, rule, ix) is ok = false end
         if ok is
             midx = array_push(midx, this_i)
-            mkey = array_push(mkey, rule.spec * 100000 + rule.order)
+            let base_key: int = rule.spec * 100000 + rule.order
+            let ln: int = if rule.layer == 0 then 999 else rule.layer
+            let li: int = if rule.layer == 0 then 0 else 1000 - rule.layer
+            mkey = array_push(mkey, ln * big + base_key)
+            ikey = array_push(ikey, li * big + base_key)
         end
     end
 
     ;; 2) pozycja reguły w kaskadzie = liczba reguł o mniejszym kluczu (remis: wcześniejsza pierwsza)
     let m: int = array_len(midx)
-    let mut rank: [int] = []
+    let mut rank_n: [int] = []
+    let mut rank_i: [int] = []
     let mut k: int = 0
     while k < m is
         let mut rk: int = 0
+        let mut rki: int = 0
         let mut q: int = 0
         while q < m is
             if mkey[q] < mkey[k] || (mkey[q] == mkey[k] && q < k) is rk += 1 end
+            if ikey[q] < ikey[k] || (ikey[q] == ikey[k] && q < k) is rki += 1 end
             q += 1
         end
-        rank = array_push(rank, rk)
+        rank_n = array_push(rank_n, rk)
+        rank_i = array_push(rank_i, rki)
         k += 1
     end
 
@@ -929,6 +1865,7 @@ pub fn matching_decls_ctx(sheet: Stylesheet, d: dom::Dom, node_id: int, ix: Inte
     let mut pass: int = 0
     while pass < 2 is
         let want_imp: bool = pass == 1
+        let rank: [int] = if want_imp then rank_i else rank_n
         let mut r: int = 0
         while r < m is
             let mut p: int = 0
