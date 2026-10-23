@@ -7,7 +7,7 @@
     if (typeof v === 'string') return v;
     if (v === undefined) return 'undefined';
     if (v === null) return 'null';
-    if (v instanceof Error) return (v.name + ': ' + v.message) + (v.stack ? '\n' + v.stack : '');
+    if (v instanceof Error) return (v.name + ': ' + v.message) + (v.stack ? '\n' + (g.__silver_format_error ? g.__silver_format_error(String(v.stack)) : v.stack) : '');
     if (typeof v === 'function') return '[Function ' + (v.name || 'anonymous') + ']';
     if (typeof v === 'object') {
       if (depth > 3) return '[Object]';
@@ -94,7 +94,7 @@
   g.__silver_dispatch_event = function (name, json) {
     var payload = null;
     try { payload = json === '' ? null : JSON.parse(json); } catch (e) { payload = json; }
-    if (internal[name]) { try { internal[name](payload); } catch (e) { console.error(e); } return; }
+    if (internal[name]) { try { return internal[name](payload); } catch (e) { console.error(e); } return; }
     var set = listeners.get(name);
     if (!set) return;
     set.forEach(function (cb) { try { cb(payload); } catch (e) { console.error(e); } });
@@ -107,7 +107,7 @@
     return invoke('__window', a);
   }
   var silver = {
-    version: '0.2.0',
+    version: '0.3.0',
     invoke: invoke,
     listen: listen,
     once: once,
@@ -370,6 +370,7 @@
     r.k = [];
   }
   function insertRec(parent, child, before) {
+    if (parent.shadowRec !== undefined && child.t !== '#fragment' && !child.isShadowBox) { lightInsert(parent, child, before); return; }
     if (child.t === '#fragment') {
       var moving = child.k.slice();
       child.k = [];
@@ -382,15 +383,32 @@
       if (bi0 >= 0) parent.k.splice(bi0, 0, child.i); else parent.k.push(child.i);
       return;
     }
+    var wasConnected = isConnectedRec(child);
+    var oldParent = rec(child.p);
     detach(child);
     child.p = parent.i;
     var bi = before ? parent.k.indexOf(before.i) : -1;
-    if (bi >= 0) parent.k.splice(bi, 0, child.i); else parent.k.push(child.i);
+    var prevSib = null;
+    if (bi >= 0) { parent.k.splice(bi, 0, child.i); prevSib = bi > 0 ? rec(parent.k[bi - 1]) : null; }
+    else { prevSib = parent.k.length ? rec(parent.k[parent.k.length - 1]) : null; parent.k.push(child.i); }
     queueOp({ o: 'append', n: parent.i, c: child.i, b: bi >= 0 ? before.i : -1 });
+    if (oldParent && oldParent !== parent) mutNotify({ type: 'childList', target: oldParent, removed: [child] });
+    mutNotify({ type: 'childList', target: parent, added: [child], prev: prevSib, next: before || null });
+    if (!wasConnected && isConnectedRec(child)) customConnected(child, true);
   }
   function removeRec(r) {
+    var par = rec(r.p);
+    var wasConn = isConnectedRec(r);
+    if (r.slotHost !== undefined) {
+      var hh = rec(r.slotHost);
+      if (hh && hh.light) { var li = hh.light.indexOf(r.i); if (li >= 0) hh.light.splice(li, 1); }
+      par = hh || par;
+      r.slotHost = undefined;
+    }
     detach(r);
     queueOp({ o: 'remove', n: r.i });
+    if (par) mutNotify({ type: 'childList', target: par, removed: [r] });
+    if (wasConn) customConnected(r, false);
   }
 
 
@@ -469,7 +487,7 @@
   }
 
   // ---- klasa Element ----
-  function Element(r) { this.__r = r; r.el = this; }
+  function Element(r) { if (!r && pendingRec) r = pendingRec; if (!r) throw new TypeError('Illegal constructor'); this.__r = r; r.el = this; }
   function wrap(r) {
     if (!r) return null;
     return r.el || new Element(r);
@@ -483,13 +501,19 @@
     k = String(k).toLowerCase();
     var sv = String(v);
     if (k === 'disabled' || k === 'checked' || k === 'readonly') { if (v === false) { delete r.a[k]; queueOp({ o: 'attr', n: r.i, k: k, v: 'false' }); return; } sv = ''; }
+    var oldV = k in r.a ? r.a[k] : null;
     r.a[k] = sv;
     queueOp({ o: 'attr', n: r.i, k: k, v: sv });
+    mutNotify({ type: 'attributes', target: r, attributeName: k, oldValue: oldV });
+    if (r.customEl && r.customEl.observed[k]) customAttr(r, k, oldV, sv);
   }
   function removeAttr(r, k) {
     k = String(k).toLowerCase();
+    var oldV = k in r.a ? r.a[k] : null;
     delete r.a[k];
     queueOp({ o: 'rattr', n: r.i, k: k });
+    mutNotify({ type: 'attributes', target: r, attributeName: k, oldValue: oldV });
+    if (r.customEl && r.customEl.observed[k]) customAttr(r, k, oldV, null);
   }
   def('nodeType', function () { var t = this.__r.t; return t === 'text' ? 3 : (t === '#comment' ? 8 : (t === '#fragment' ? 11 : 1)); });
   def('nodeName', function () { var t = this.__r.t; return t === 'text' ? '#text' : (t[0] === '#' ? t : t.toUpperCase()); });
@@ -498,12 +522,15 @@
   def('className', function () { return this.__r.a['class'] || ''; }, function (v) { setAttr(this.__r, 'class', v); });
   def('textContent', function () { return textOf(this.__r); }, function (v) {
     var r = this.__r;
-    if (r.t === 'text') { r.x = String(v); queueOp({ o: 'text', n: r.i, v: r.x }); return; }
+    if (r.t === 'text') { var oldX = r.x; r.x = String(v); queueOp({ o: 'text', n: r.i, v: r.x }); mutNotify({ type: 'characterData', target: r, oldValue: oldX }); return; }
+    var oldKids = r.k.map(function (i) { return rec(i); }).filter(Boolean);
     dropSubtree(r);
     if (String(v) !== '') {
       var tr = newRec(++provSeq, 'text', String(v)); tr.p = r.i; r.k.push(tr.i);
     }
     queueOp({ o: 'text', n: r.i, v: String(v) });
+    var newKids = r.k.map(function (i) { return rec(i); }).filter(Boolean);
+    if (oldKids.length || newKids.length) mutNotify({ type: 'childList', target: r, added: newKids, removed: oldKids });
   });
   def('innerText', function () { return textOf(this.__r); }, function (v) { this.textContent = v; });
   def('data', function () { return this.__r.x; }, function (v) { this.textContent = v; });
@@ -533,7 +560,14 @@
     st = st.replace(/(^|;)\s*display\s*:[^;]*/g, '$1').replace(/^;+/, '');
     setAttr(this.__r, 'style', v ? (st ? st + ';' : '') + 'display:none' : st);
   });
-  def('type', function () { return this.__r.a.type || ''; }, function (v) { setAttr(this.__r, 'type', v); });
+  def('type', function () {
+    var r = this.__r, t = r.a.type;
+    if (r.t === 'input') return t ? String(t).toLowerCase() : 'text';
+    if (r.t === 'button') return t ? String(t).toLowerCase() : 'submit';
+    if (r.t === 'textarea') return 'textarea';
+    if (r.t === 'select') return 'a' in r && 'multiple' in r.a ? 'select-multiple' : 'select-one';
+    return t || '';
+  }, function (v) { setAttr(this.__r, 'type', v); });
   def('name', function () { return this.__r.a.name || ''; }, function (v) { setAttr(this.__r, 'name', v); });
   def('href', function () { return this.__r.a.href || ''; }, function (v) { setAttr(this.__r, 'href', v); });
   def('src', function () { return this.__r.a.src || ''; }, function (v) { setAttr(this.__r, 'src', v); });
@@ -649,7 +683,7 @@
   };
   P.getBoundingClientRect = function () { return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; };
   P.getClientRects = function () { return []; };
-  P.scrollIntoView = function () { };
+  P.scrollIntoView = function () { queueOp({ o: 'scrollinto', n: this.__r.i }); };
   P.attachShadow = function () { return this; };
   P.after = function () { var p = rec(this.__r.p); if (!p) return; var nx = sib(this.__r, 1, false); for (var i = 0; i < arguments.length; i++) { var a = arguments[i]; insertRec(p, unwrap(typeof a === 'object' ? a : document.createTextNode(String(a))), nx ? nx.__r : null); } };
   P.before = function () { var p = rec(this.__r.p); if (!p) return; for (var i = 0; i < arguments.length; i++) { var a = arguments[i]; insertRec(p, unwrap(typeof a === 'object' ? a : document.createTextNode(String(a))), this.__r); } };
@@ -661,6 +695,12 @@
   P.dispatchEvent = function (ev) { ev.target = this; fire(this.__r, ev, true); return true; };
 
   // ---- nasłuchiwanie ----
+  // currentTarget bywa przedefiniowany przez biblioteki (Solid) jako getter bez settera
+  function setCT(ev, v) {
+    try { ev.currentTarget = v; } catch (e) {
+      try { Object.defineProperty(ev, 'currentTarget', { value: v, configurable: true, writable: true }); } catch (e2) { }
+    }
+  }
   var winL = { l: null };
   function addL(r, type, fn, opts) {
     if (typeof fn !== 'function') return;
@@ -683,15 +723,21 @@
   }
   var NO_BUBBLE = { mouseenter: 1, mouseleave: 1, focus: 1, blur: 1, load: 1, DOMContentLoaded: 0 };
   function fire(target, ev, bubbles) {
-    ev.currentTarget = null;
+    // window.event: React/Vue wybierają priorytet aktualizacji na podstawie bieżącego zdarzenia
+    var prevEvent = g.event;
+    g.event = ev;
+    try { fireInner(target, ev, bubbles); } finally { g.event = prevEvent; }
+  }
+  function fireInner(target, ev, bubbles) {
+    setCT(ev, null);
     var r = target;
     while (r) {
-      ev.currentTarget = r.t === 'root' ? document : wrap(r);
+      setCT(ev, r.t === 'root' ? document : wrap(r));
       callL(r, ev);
       if (ev.__stop || !bubbles) return;
       r = rec(r.p);
     }
-    if (!ev.__stop) { ev.currentTarget = g; callL(winL, ev); }
+    if (!ev.__stop) { setCT(ev, g); callL(winL, ev); }
   }
   function makeEvent(type, d) {
     var ev = {
@@ -711,14 +757,17 @@
 
   // ---- document ----
   var readyState = 'loading';
+  var curTitle = '';
   var document = {
     get readyState() { return readyState; },
     get documentElement() { var r = rec(0); for (var i = 0; r && i < r.k.length; i++) { var c = rec(r.k[i]); if (c && c.t === 'html') return wrap(c); } return null; },
     get body() { var q = queryAll(rec(0), 'body', true)[0]; return q || null; },
     get head() { var q = queryAll(rec(0), 'head', true)[0]; return q || null; },
     get activeElement() { var r = rec(focusedId); return r ? wrap(r) : document.body; },
-    get title() { var t = queryAll(rec(0), 'title', true)[0]; return t ? t.textContent : ''; },
-    set title(v) { silver.window.setTitle(v); },
+    get title() { var t = queryAll(rec(0), 'title', true)[0]; return t ? t.textContent : curTitle; },
+    set title(v) { curTitle = String(v); silver.window.setTitle(curTitle); },
+    get defaultView() { return g; },
+    get ownerDocument() { return null; },
     get nodeType() { return 9; },
     getElementById: function (id) { var found = null; walk(rec(0), function (c) { if (c.a.id === id) { found = wrap(c); return false; } }); return found; },
     querySelector: function (s) { return queryAll(rec(0), s, true)[0] || null; },
@@ -793,7 +842,7 @@
   g.innerHeight = 0;
   g.devicePixelRatio = 1;
   g.location = { href: 'silver://app', origin: 'silver://app', pathname: '/', search: '', hash: '', protocol: 'silver:' };
-  g.navigator = { userAgent: 'Silver/0.2.0', platform: 'silver', language: 'pl-PL', onLine: true };
+  g.navigator = { userAgent: 'Silver/0.3.0', platform: 'silver', language: 'pl-PL', onLine: true };
   g.matchMedia = function (q) {
     var dark = /prefers-color-scheme\s*:\s*dark/.test(q) ? winInfo.dark : /prefers-color-scheme\s*:\s*light/.test(q) ? !winInfo.dark : false;
     return { matches: !!dark, media: q, addEventListener: function () { }, removeEventListener: function () { }, addListener: function () { }, removeListener: function () { } };
@@ -802,7 +851,7 @@
   g.scrollTo = function (x, y) { queueOp({ o: 'scroll', n: 0, v: (typeof x === 'object' ? x.top : y) | 0 }); };
   g.addEventListener = function (type, fn, o) { addL(winL, type, fn, o); };
   g.removeEventListener = function (type, fn) { removeL(winL, type, fn); };
-  g.dispatchEvent = function (ev) { ev.currentTarget = g; callL(winL, ev); return true; };
+  g.dispatchEvent = function (ev) { setCT(ev, g); callL(winL, ev); return true; };
 
   // ---- zdarzenia z H# ----
   internal['__dom_snapshot'] = function (nodes) {
@@ -853,16 +902,789 @@
       }
     }
     var ev = makeEvent(type, d);
+    if (type === 'scroll' && d.n === 0) { layout.sy = d.y | 0; g.scrollY = g.pageYOffset = layout.sy; runObservers(); }
     if (type === 'DOMContentLoaded' || type === 'load' || type === 'resize') {
       var root = rec(0);
       ev.target = type === 'resize' ? g : document;
       if (root) callL(root, ev);
-      ev.currentTarget = g;
+      setCT(ev, g);
       callL(winL, ev);
-      return;
+      if (type === 'resize') { layout.vw = d.w; layout.vh = d.h; runObservers(); }
+      return ev.defaultPrevented ? 1 : 0;
     }
-    if (!r) { ev.target = g; ev.currentTarget = g; callL(winL, ev); return; }
+    if (!r) { ev.target = g; setCT(ev, g); callL(winL, ev); return ev.defaultPrevented ? 1 : 0; }
     ev.target = r.t === 'root' ? document : wrap(r);
     fire(r, ev, ev.bubbles);
+    // Synchroniczna wymiana: H# odczytuje wynik i pomija domyślną akcję (klik, submit, klawisz…)
+    return ev.defaultPrevented ? 1 : 0;
   };
+
+  // =====================================================================
+  // 0.3: rozszerzenia — układ (rects), obserwatory, Shadow DOM, Custom Elements, storage,
+  //      fetch z nagłówkami, Worker, WebSocket, source mapy
+  // =====================================================================
+
+
+  // ---------- właściwości on* (onclick, oninput, …) ----------
+  // Biblioteki (React) wykrywają wsparcie zdarzeń przez `'oninput' in element`.
+  ['click', 'dblclick', 'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout', 'mouseenter', 'mouseleave', 'contextmenu',
+   'keydown', 'keyup', 'keypress', 'input', 'change', 'submit', 'reset', 'focus', 'blur', 'focusin', 'focusout', 'scroll', 'wheel',
+   'select', 'invalid', 'load', 'error', 'abort', 'resize', 'touchstart', 'touchend', 'touchmove', 'touchcancel',
+   'pointerdown', 'pointerup', 'pointermove', 'pointerenter', 'pointerleave', 'pointercancel', 'pointerover', 'pointerout',
+   'dragstart', 'drag', 'dragend', 'dragenter', 'dragleave', 'dragover', 'drop', 'copy', 'cut', 'paste', 'toggle', 'animationend',
+   'animationstart', 'animationiteration', 'transitionend', 'transitionstart', 'compositionstart', 'compositionend', 'compositionupdate',
+   'beforeinput', 'selectionchange', 'play', 'pause', 'ended', 'canplay', 'loadeddata', 'timeupdate', 'volumechange'
+  ].forEach(function (evName) {
+    var prop = 'on' + evName;
+    if (Object.getOwnPropertyDescriptor(P, prop)) return;
+    Object.defineProperty(P, prop, { configurable: true, enumerable: true,
+      get: function () {
+        var r0 = this.__r, h = r0.oh;
+        if (h && h[evName]) return h[evName];
+        // atrybut on<zdarzenie>="kod" kompiluje się do funkcji (wykrywanie wsparcia zdarzeń w React)
+        if (typeof r0.a[prop] === 'string') { try { this[prop] = new Function('event', r0.a[prop]); return r0.oh[evName]; } catch (e) { return null; } }
+        return null;
+      },
+      set: function (fn) {
+        var r = this.__r;
+        r.oh = r.oh || {};
+        var first = !r.oh.hasOwnProperty(evName);
+        r.oh[evName] = typeof fn === 'function' ? fn : null;
+        if (first) {
+          var self = this;
+          addL(r, evName, function (e) { var f = r.oh[evName]; if (typeof f === 'function') return f.call(self, e); });
+        }
+      } });
+  });
+  // document.on* (React: 'oninput' in document)
+  ['click', 'input', 'change', 'keydown', 'keyup', 'keypress', 'focus', 'blur', 'submit', 'scroll', 'select', 'selectionchange', 'wheel',
+   'mousedown', 'mouseup', 'mousemove', 'pointerdown', 'pointerup', 'touchstart', 'touchend', 'compositionstart', 'compositionend', 'beforeinput'
+  ].forEach(function (evName) {
+    var prop = 'on' + evName, stored = null;
+    Object.defineProperty(document, prop, { configurable: true, enumerable: true,
+      get: function () { return stored; },
+      set: function (fn) {
+        var first = stored === null && !document.__ons;
+        document.__ons = document.__ons || {};
+        var had = document.__ons[evName];
+        document.__ons[evName] = true;
+        stored = typeof fn === 'function' ? fn : null;
+        if (!had) document.addEventListener(evName, function (e) { if (typeof stored === 'function') return stored.call(document, e); });
+      } });
+  });
+
+  // ---------- układ z H# (cache ostatniej klatki) ----------
+  var layout = { r: new Map(), sy: 0, vw: 0, vh: 0, has: false };
+  var layoutWatch = false;
+  var computedCache = {};
+  var watchedStyle = {};
+  function wantLayout() {
+    if (!layoutWatch) { layoutWatch = true; queueOp({ o: 'layoutwatch' }); }
+  }
+  internal['__layout'] = function (p) {
+    layout.sy = p.sy | 0; layout.vw = p.vw | 0; layout.vh = p.vh | 0; layout.has = true;
+    g.scrollY = g.pageYOffset = layout.sy;
+    var m = new Map();
+    var arr = p.r || [];
+    for (var i = 0; i < arr.length; i++) if (!m.has(arr[i][0])) m.set(arr[i][0], arr[i]);
+    layout.r = m;
+    computedCache = p.s || {};
+    runObservers();
+  };
+  function lrect(r) { if (!r) return null; wantLayout(); return layout.r.get(r.i) || null; }
+
+  function DOMRectImpl(x, y, w, h) {
+    this.x = x; this.y = y; this.width = w; this.height = h;
+    this.top = h < 0 ? y + h : y; this.left = w < 0 ? x + w : x;
+    this.right = w < 0 ? x : x + w; this.bottom = h < 0 ? y : y + h;
+  }
+  DOMRectImpl.prototype.toJSON = function () {
+    return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+  };
+  if (typeof g.DOMRect !== 'function') {
+    g.DOMRect = function DOMRect(x, y, w, h) { return new DOMRectImpl(x || 0, y || 0, w || 0, h || 0); };
+    g.DOMRect.fromRect = function (o) { o = o || {}; return new DOMRectImpl(o.x || 0, o.y || 0, o.width || 0, o.height || 0); };
+    g.DOMRectReadOnly = g.DOMRect;
+  }
+  function clientRectOf(r) {
+    var t = lrect(r);
+    if (!t) return new DOMRectImpl(0, 0, 0, 0);
+    return new DOMRectImpl(t[1], t[2] - layout.sy, t[3], t[4]);
+  }
+  P.getBoundingClientRect = function () { return clientRectOf(this.__r); };
+  P.getClientRects = function () { var t = lrect(this.__r); return t ? [clientRectOf(this.__r)] : []; };
+  def('ownerDocument', function () { return document; });
+  def('offsetWidth', function () { var t = lrect(this.__r); return t ? t[3] : 0; });
+  def('offsetHeight', function () { var t = lrect(this.__r); return t ? t[4] : 0; });
+  def('offsetLeft', function () {
+    var t = lrect(this.__r); if (!t) return 0;
+    var pt = lrect(rec(this.__r.p)); return t[1] - (pt ? pt[1] : 0);
+  });
+  def('offsetTop', function () {
+    var t = lrect(this.__r); if (!t) return 0;
+    var pt = lrect(rec(this.__r.p)); return t[2] - (pt ? pt[2] : 0);
+  });
+  def('offsetParent', function () { var p = rec(this.__r.p); return p && p.t !== 'root' ? wrap(p) : null; });
+  def('clientWidth', function () { var t = lrect(this.__r); return t ? Math.max(0, t[3] - t[5] - t[6]) : 0; });
+  def('clientHeight', function () { var t = lrect(this.__r); return t ? Math.max(0, t[4] - t[7] - t[8]) : 0; });
+  def('clientLeft', function () { var t = lrect(this.__r); return t ? t[5] : 0; });
+  def('clientTop', function () { var t = lrect(this.__r); return t ? t[7] : 0; });
+  def('scrollWidth', function () { return this.clientWidth; });
+  def('scrollHeight', function () { var t = lrect(this.__r); return t ? Math.max(t[9] || 0, t[4] - t[7] - t[8]) : 0; });
+
+  // ---------- getComputedStyle ----------
+  function kebab(n) { return String(n).replace(/[A-Z]/g, function (c) { return '-' + c.toLowerCase(); }); }
+  function camel(n) { return String(n).replace(/-([a-z])/g, function (m, c) { return c.toUpperCase(); }); }
+  var STYLE_DEFAULTS = { display: 'block', position: 'static', visibility: 'visible', opacity: '1', 'z-index': 'auto', overflow: 'visible',
+    'font-size': '16px', 'font-weight': '400', 'font-style': 'normal', color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
+    'text-align': 'start', cursor: 'auto', 'pointer-events': 'auto', transform: 'none', filter: 'none' };
+  g.getComputedStyle = function (el) {
+    var r = el && el.__r;
+    if (r && !watchedStyle[r.i]) { watchedStyle[r.i] = 1; wantLayout(); queueOp({ o: 'watchstyle', n: r.i }); }
+    var inline = el && el.style;
+    var cs = r ? (computedCache[r.i] || {}) : {};
+    function read(name) {
+      var k = kebab(name);
+      if (k === 'float') k = 'float';
+      if (cs[k] !== undefined) return String(cs[k]);
+      var t = r ? layout.r.get(r.i) : null;
+      if (k === 'width' && t) return t[3] + 'px';
+      if (k === 'height' && t) return t[4] + 'px';
+      var iv = inline && typeof inline.getPropertyValue === 'function' ? inline.getPropertyValue(k) : '';
+      if (iv) return iv;
+      return STYLE_DEFAULTS[k] !== undefined ? STYLE_DEFAULTS[k] : '';
+    }
+    var target = {
+      getPropertyValue: function (n) { return read(n); },
+      getPropertyPriority: function () { return ''; },
+      item: function (i) { return Object.keys(cs)[i] || ''; },
+      get length() { return Object.keys(cs).length; },
+      get cssText() { return Object.keys(cs).map(function (k) { return k + ': ' + cs[k] + ';'; }).join(' '); }
+    };
+    return new Proxy(target, {
+      get: function (t, prop) {
+        if (prop in t) return t[prop];
+        if (typeof prop === 'symbol') return undefined;
+        return read(prop);
+      },
+      has: function () { return true; }
+    });
+  };
+
+  // ---------- MutationObserver ----------
+  var mutObservers = [];
+  function isDescendantRec(r, anc) {
+    var c = r, n = 0;
+    while (c && n++ < 1000) { if (c === anc) return true; c = rec(c.p); }
+    return false;
+  }
+  function isConnectedRec(r) {
+    var c = r, n = 0;
+    while (c && n++ < 1000) { if (c.t === 'root') return true; c = rec(c.p) || (c.slotHost !== undefined ? rec(c.slotHost) : null); }
+    return false;
+  }
+  function mutNotify(m) {
+    var host = shadowOwner(m.target);
+    if (host) scheduleSlots(host);
+    if (!mutObservers.length) return;
+    for (var oi = 0; oi < mutObservers.length; oi++) {
+      var ob = mutObservers[oi];
+      for (var ti = 0; ti < ob.targets.length; ti++) {
+        var t = ob.targets[ti], o = t.opts;
+        if (!(m.target === t.r || (o.subtree && isDescendantRec(m.target, t.r)))) continue;
+        if (m.type === 'attributes') {
+          if (!o.attributes) continue;
+          if (o.attributeFilter && o.attributeFilter.indexOf(m.attributeName) < 0) continue;
+        } else if (m.type === 'characterData') { if (!o.characterData) continue; }
+        else if (!o.childList) continue;
+        var rc = {
+          type: m.type, target: wrap(m.target), addedNodes: (m.added || []).map(wrap), removedNodes: (m.removed || []).map(wrap),
+          previousSibling: m.prev ? wrap(m.prev) : null, nextSibling: m.next ? wrap(m.next) : null,
+          attributeName: m.attributeName || null, attributeNamespace: null,
+          oldValue: (m.type === 'attributes' && o.attributeOldValue) || (m.type === 'characterData' && o.characterDataOldValue) ? (m.oldValue === undefined ? null : m.oldValue) : null
+        };
+        ob.records.push(rc);
+        if (!ob.queued) { ob.queued = true; (function (obs) { Promise.resolve().then(function () { deliverMutations(obs); }); })(ob); }
+        break;
+      }
+    }
+  }
+  function deliverMutations(ob) {
+    ob.queued = false;
+    if (!ob.records.length) return;
+    var recs2 = ob.records; ob.records = [];
+    try { ob.cb.call(ob.wrapper, recs2, ob.wrapper); } catch (e) { console.error(e); }
+  }
+  g.MutationObserver = function MutationObserver(cb) {
+    if (typeof cb !== 'function') throw new TypeError('MutationObserver: callback musi być funkcją');
+    this.__o = { cb: cb, targets: [], records: [], queued: false, wrapper: this };
+  };
+  g.MutationObserver.prototype.observe = function (node, opts) {
+    opts = opts || {};
+    var o = { childList: !!opts.childList, attributes: !!opts.attributes || !!opts.attributeOldValue || !!opts.attributeFilter,
+      characterData: !!opts.characterData || !!opts.characterDataOldValue, subtree: !!opts.subtree,
+      attributeOldValue: !!opts.attributeOldValue, characterDataOldValue: !!opts.characterDataOldValue, attributeFilter: opts.attributeFilter || null };
+    if (!o.childList && !o.attributes && !o.characterData) throw new TypeError('MutationObserver.observe: podaj childList, attributes lub characterData');
+    var ob = this.__o, r = node && node.__r;
+    if (!r) return;
+    for (var i = 0; i < ob.targets.length; i++) if (ob.targets[i].r === r) { ob.targets[i].opts = o; return; }
+    ob.targets.push({ r: r, opts: o });
+    if (mutObservers.indexOf(ob) < 0) mutObservers.push(ob);
+  };
+  g.MutationObserver.prototype.disconnect = function () {
+    var ob = this.__o; ob.targets = []; ob.records = [];
+    var i = mutObservers.indexOf(ob); if (i >= 0) mutObservers.splice(i, 1);
+  };
+  g.MutationObserver.prototype.takeRecords = function () { var ob = this.__o, r = ob.records; ob.records = []; return r; };
+
+  // ---------- ResizeObserver / IntersectionObserver ----------
+  var roList = [], ioList = [];
+  g.ResizeObserver = function ResizeObserver(cb) {
+    if (typeof cb !== 'function') throw new TypeError('ResizeObserver: callback musi być funkcją');
+    this.__cb = cb; this.__t = []; roList.push(this);
+  };
+  g.ResizeObserver.prototype.observe = function (el) {
+    if (!el || !el.__r) return;
+    for (var i = 0; i < this.__t.length; i++) if (this.__t[i].el === el) return;
+    wantLayout(); this.__t.push({ el: el, last: null });
+  };
+  g.ResizeObserver.prototype.unobserve = function (el) { this.__t = this.__t.filter(function (t) { return t.el !== el; }); };
+  g.ResizeObserver.prototype.disconnect = function () { this.__t = []; };
+  g.IntersectionObserver = function IntersectionObserver(cb, opts) {
+    if (typeof cb !== 'function') throw new TypeError('IntersectionObserver: callback musi być funkcją');
+    opts = opts || {};
+    this.__cb = cb; this.__t = []; this.root = opts.root || null;
+    var th = opts.threshold === undefined ? [0] : (Array.isArray(opts.threshold) ? opts.threshold.slice() : [opts.threshold]);
+    this.thresholds = th.sort(function (a, b) { return a - b; });
+    var mg = String(opts.rootMargin || '0px').split(/\s+/).map(function (v) { return parseFloat(v) || 0; });
+    this.__margin = [mg[0] || 0, mg[1] === undefined ? mg[0] || 0 : mg[1], mg[2] === undefined ? mg[0] || 0 : mg[2], mg[3] === undefined ? (mg[1] === undefined ? mg[0] || 0 : mg[1]) : mg[3]];
+    this.rootMargin = String(opts.rootMargin || '0px');
+    ioList.push(this);
+  };
+  g.IntersectionObserver.prototype.observe = function (el) {
+    if (!el || !el.__r) return;
+    for (var i = 0; i < this.__t.length; i++) if (this.__t[i].el === el) return;
+    wantLayout(); this.__t.push({ el: el, last: -2, lastIn: null });
+  };
+  g.IntersectionObserver.prototype.unobserve = function (el) { this.__t = this.__t.filter(function (t) { return t.el !== el; }); };
+  g.IntersectionObserver.prototype.disconnect = function () { this.__t = []; };
+  g.IntersectionObserver.prototype.takeRecords = function () { return []; };
+
+  function runObservers() {
+    if (!layout.has) return;
+    var i, j;
+    for (i = 0; i < roList.length; i++) {
+      var ro = roList[i], entries = [];
+      for (j = 0; j < ro.__t.length; j++) {
+        var t = ro.__t[j], q = layout.r.get(t.el.__r.i);
+        if (!q) continue;
+        var w = Math.max(0, q[3] - q[5] - q[6]), h = Math.max(0, q[4] - q[7] - q[8]);
+        if (!t.last || t.last.w !== w || t.last.h !== h) {
+          t.last = { w: w, h: h };
+          entries.push({ target: t.el, contentRect: new DOMRectImpl(q[5], q[7], w, h),
+            contentBoxSize: [{ inlineSize: w, blockSize: h }], borderBoxSize: [{ inlineSize: q[3], blockSize: q[4] }],
+            devicePixelContentBoxSize: [{ inlineSize: w, blockSize: h }] });
+        }
+      }
+      if (entries.length) { try { ro.__cb.call(ro, entries, ro); } catch (e) { console.error(e); } }
+    }
+    for (i = 0; i < ioList.length; i++) {
+      var io = ioList[i], out = [];
+      var rb;
+      if (io.root && io.root.__r) { var rr = layout.r.get(io.root.__r.i); rb = rr ? { l: rr[1], t: rr[2] - layout.sy, r: rr[1] + rr[3], b: rr[2] - layout.sy + rr[4] } : null; }
+      else rb = { l: 0, t: 0, r: layout.vw, b: layout.vh };
+      if (!rb) continue;
+      var m = io.__margin;
+      var root = { l: rb.l - m[3], t: rb.t - m[0], r: rb.r + m[1], b: rb.b + m[2] };
+      for (j = 0; j < io.__t.length; j++) {
+        var tg = io.__t[j], tq = layout.r.get(tg.el.__r.i);
+        if (!tq) continue;
+        var tl = tq[1], tt = tq[2] - layout.sy, tr = tl + tq[3], tb = tt + tq[4];
+        var il = Math.max(tl, root.l), it = Math.max(tt, root.t), ir = Math.min(tr, root.r), ib = Math.min(tb, root.b);
+        var iw = Math.max(0, ir - il), ih = Math.max(0, ib - it);
+        var area = tq[3] * tq[4];
+        var ratio = area > 0 ? (iw * ih) / area : (iw >= 0 && ir >= il && ib >= it && tl <= root.r && tr >= root.l && tt <= root.b && tb >= root.t ? 1 : 0);
+        var inter = area > 0 ? (iw > 0 && ih > 0) : ratio > 0;
+        var idx = -1;
+        for (var k = 0; k < io.thresholds.length; k++) if (ratio >= io.thresholds[k] && (ratio > 0 || io.thresholds[k] === 0)) idx = k;
+        if (!inter) idx = -1;
+        if (tg.last === -2 || tg.lastIn !== inter || (inter && tg.last !== idx)) {
+          var first = tg.last === -2;
+          tg.last = idx; tg.lastIn = inter;
+          if (first && !inter && false) continue;
+          out.push({ time: g.performance ? g.performance.now() : Date.now(), target: tg.el, isIntersecting: inter,
+            intersectionRatio: ratio, boundingClientRect: new DOMRectImpl(tl, tt, tq[3], tq[4]),
+            intersectionRect: new DOMRectImpl(il, it, iw, ih), rootBounds: new DOMRectImpl(root.l, root.t, root.r - root.l, root.b - root.t) });
+        }
+      }
+      if (out.length) { try { io.__cb.call(io, out, io); } catch (e) { console.error(e); } }
+    }
+  }
+
+  // ---------- Shadow DOM (spłaszczony: slotowanie fizycznie przenosi węzły light DOM) ----------
+  var slotTimers = {};
+  function shadowOwner(r) {
+    var c = r, n = 0;
+    while (c && n++ < 200) { if (c.shadowOf !== undefined) return rec(c.shadowOf); c = rec(c.p); }
+    return null;
+  }
+  function scheduleSlots(host) {
+    if (!host || slotTimers[host.i]) return;
+    slotTimers[host.i] = true;
+    Promise.resolve().then(function () { slotTimers[host.i] = false; assignSlots(host); });
+  }
+  function collectSlots(r, out) {
+    for (var i = 0; i < r.k.length; i++) {
+      var c = rec(r.k[i]); if (!c) continue;
+      if (c.t === 'slot') out.push(c);
+      collectSlots(c, out);
+    }
+    return out;
+  }
+  function assignSlots(h) {
+    var sc = rec(h.shadowRec); if (!sc) return;
+    var slots = collectSlots(sc, []);
+    var desired = new Map();
+    h.light.forEach(function (id) {
+      var c = rec(id); if (!c) return;
+      var nm = c.t === 'text' || c.t === '#comment' ? '' : (c.a.slot || '');
+      var tgt = null;
+      for (var i = 0; i < slots.length; i++) if ((slots[i].a.name || '') === nm) { tgt = slots[i]; break; }
+      if (tgt) { if (!desired.has(tgt.i)) desired.set(tgt.i, []); desired.get(tgt.i).push(c); }
+      else if (c.p !== -1) { detach(c); queueOp({ o: 'remove', n: c.i }); }
+    });
+    slots.forEach(function (sl) {
+      var want = desired.get(sl.i) || [];
+      var same = want.length === sl.k.length;
+      for (var i = 0; same && i < want.length; i++) if (sl.k[i] !== want[i].i) same = false;
+      if (same) return;
+      want.forEach(function (c) { var holder = c.slotHost; c.slotHost = undefined; insertRecRaw(sl, c); c.slotHost = holder; });
+    });
+  }
+  function insertRecRaw(parent, child) {
+    detach(child);
+    child.p = parent.i;
+    parent.k.push(child.i);
+    queueOp({ o: 'append', n: parent.i, c: child.i, b: -1 });
+  }
+  function lightInsert(host, child, before) {
+    var oldHost = child.slotHost !== undefined ? rec(child.slotHost) : null;
+    if (oldHost && oldHost.light) { var oi = oldHost.light.indexOf(child.i); if (oi >= 0) oldHost.light.splice(oi, 1); }
+    if (child.p !== -1) { var op = rec(child.p); detach(child); queueOp({ o: 'remove', n: child.i }); if (op) mutNotify({ type: 'childList', target: op, removed: [child] }); }
+    var bi = before ? host.light.indexOf(before.i) : -1;
+    if (bi >= 0) host.light.splice(bi, 0, child.i); else host.light.push(child.i);
+    child.slotHost = host.i;
+    assignSlots(host);
+    mutNotify({ type: 'childList', target: host, added: [child], next: before || null });
+  }
+  function lightKids(r) { return r.light.map(function (i) { return rec(i); }).filter(Boolean); }
+  [['childNodes', function (r) { return lightKids(r).map(wrap); }],
+   ['children', function (r) { return lightKids(r).filter(function (c) { return c.t !== 'text' && c.t !== '#comment'; }).map(wrap); }],
+   ['firstChild', function (r) { var k = lightKids(r); return k.length ? wrap(k[0]) : null; }],
+   ['lastChild', function (r) { var k = lightKids(r); return k.length ? wrap(k[k.length - 1]) : null; }]
+  ].forEach(function (d) {
+    var orig = Object.getOwnPropertyDescriptor(P, d[0]);
+    Object.defineProperty(P, d[0], { configurable: true, enumerable: true, get: function () {
+      return this.__r.light !== undefined && this.__r.shadowRec !== undefined ? d[1](this.__r) : orig.get.call(this);
+    } });
+  });
+  var origParentNode = Object.getOwnPropertyDescriptor(P, 'parentNode');
+  Object.defineProperty(P, 'parentNode', { configurable: true, enumerable: true, get: function () {
+    if (this.__r.slotHost !== undefined) return wrap(rec(this.__r.slotHost));
+    return origParentNode.get.call(this);
+  } });
+  var origParentEl = Object.getOwnPropertyDescriptor(P, 'parentElement');
+  Object.defineProperty(P, 'parentElement', { configurable: true, enumerable: true, get: function () {
+    if (this.__r.slotHost !== undefined) return wrap(rec(this.__r.slotHost));
+    return origParentEl.get.call(this);
+  } });
+  P.attachShadow = function (init) {
+    var h = this.__r;
+    if (h.shadowRec !== undefined) throw new Error('NotSupportedError: element już ma shadow root');
+    init = init || {};
+    var el = document.createElement('div');
+    var c = el.__r;
+    c.isShadowBox = true;
+    c.shadowOf = h.i;
+    setAttr(c, 'data-silver-shadow', '');
+    // dotychczasowe dzieci stają się light DOM
+    var existing = h.k.slice();
+    h.light = existing.slice();
+    existing.forEach(function (id) { var cc = rec(id); if (cc) { cc.slotHost = h.i; detach(cc); queueOp({ o: 'remove', n: cc.i }); } });
+    h.shadowRec = c.i;
+    var before = h.k.length ? rec(h.k[0]) : null;
+    insertRecRaw(h, c);
+    var root = el;
+    Object.defineProperty(root, 'host', { value: wrap(h), configurable: true });
+    Object.defineProperty(root, 'mode', { value: init.mode === 'closed' ? 'closed' : 'open', configurable: true });
+    Object.defineProperty(root, 'nodeType', { value: 11, configurable: true });
+    Object.defineProperty(root, 'nodeName', { value: '#document-fragment', configurable: true });
+    root.adoptedStyleSheets = [];
+    root.__isShadowRoot = true;
+    h.shadowEl = root;
+    if (init.mode !== 'closed') Object.defineProperty(this, 'shadowRoot', { get: function () { return root; }, configurable: true });
+    return root;
+  };
+  if (!Object.getOwnPropertyDescriptor(P, 'shadowRoot')) def('shadowRoot', function () { var r = this.__r; return r.shadowEl && r.shadowEl.mode === 'open' ? r.shadowEl : null; });
+  P.assignedNodes = function () { return this.__r.k.map(function (i) { return wrap(rec(i)); }).filter(function (n) { return n && n.__r.slotHost !== undefined; }); };
+  P.assignedElements = function () { return this.assignedNodes().filter(function (n) { return n.nodeType === 1; }); };
+  g.ShadowRoot = function ShadowRoot() { throw new TypeError('Illegal constructor'); };
+  Object.defineProperty(g.ShadowRoot, Symbol.hasInstance, { value: function (v) { return !!(v && v.__isShadowRoot); } });
+
+  // ---------- Custom Elements ----------
+  var ceRegistry = {};
+  var pendingRec = null;
+  var ceWaiters = {};
+  function customAttr(r, k, oldV, newV) {
+    var ce = r.customEl;
+    if (ce && typeof r.el.attributeChangedCallback === 'function') {
+      try { r.el.attributeChangedCallback(k, oldV, newV); } catch (e) { console.error(e); }
+    }
+  }
+  function customConnected(r, connected) {
+    var stack = [r];
+    while (stack.length) {
+      var c = stack.pop();
+      if (c.customEl && c.el) {
+        var fn = connected ? c.el.connectedCallback : c.el.disconnectedCallback;
+        if (typeof fn === 'function') { try { fn.call(c.el); } catch (e) { console.error(e); } }
+      }
+      for (var i = 0; i < c.k.length; i++) { var kk = rec(c.k[i]); if (kk) stack.push(kk); }
+      if (c.light) c.light.forEach(function (id) { var kk = rec(id); if (kk && kk.p === -1) stack.push(kk); });
+    }
+  }
+  function constructCustom(def, r) {
+    pendingRec = r;
+    var inst;
+    try { inst = Reflect.construct(def.ctor, [], def.ctor); } finally { pendingRec = null; }
+    r.el = inst; r.customEl = { observed: def.observed };
+    return inst;
+  }
+  g.customElements = {
+    define: function (name, ctor) {
+      name = String(name).toLowerCase();
+      if (ceRegistry[name]) throw new Error('NotSupportedError: element "' + name + '" jest już zdefiniowany');
+      if (name.indexOf('-') < 0) throw new Error('SyntaxError: nazwa custom elementu musi zawierać "-"');
+      var obs = {};
+      (ctor.observedAttributes || []).forEach(function (a) { obs[String(a).toLowerCase()] = 1; });
+      var def = { ctor: ctor, observed: obs };
+      ceRegistry[name] = def;
+      // upgrade istniejących elementów
+      recs.forEach(function (r) {
+        if (r.t === name && !r.customEl) {
+          var old = r.el;
+          constructCustom(def, r);
+          if (old) { /* referencje do starego wrappera pozostają ważne dla kodu, który go trzyma */ }
+          for (var k in r.a) customAttr(r, k, null, r.a[k]);
+          if (isConnectedRec(r)) customConnected(r, true);
+        }
+      });
+      if (ceWaiters[name]) { ceWaiters[name].forEach(function (f) { f(ctor); }); delete ceWaiters[name]; }
+    },
+    get: function (name) { var d = ceRegistry[String(name).toLowerCase()]; return d ? d.ctor : undefined; },
+    whenDefined: function (name) {
+      name = String(name).toLowerCase();
+      if (ceRegistry[name]) return Promise.resolve(ceRegistry[name].ctor);
+      return new Promise(function (res) { (ceWaiters[name] = ceWaiters[name] || []).push(res); });
+    },
+    upgrade: function () { }
+  };
+  var origCreate = document.createElement;
+  document.createElement = function (tag) {
+    var t = String(tag).toLowerCase();
+    var def = ceRegistry[t];
+    if (!def) return origCreate.call(document, tag);
+    var id = ++provSeq;
+    var r = newRec(id, t);
+    queueOp({ o: 'create', p: id, t: t });
+    return constructCustom(def, r);
+  };
+
+  // ---------- localStorage / sessionStorage ----------
+  var persistStore = new Map();
+  var sessionStore = new Map();
+  function makeStorage(map, persist) {
+    var api = {
+      getItem: function (k) { k = String(k); return map.has(k) ? map.get(k) : null; },
+      setItem: function (k, v) {
+        k = String(k); v = String(v);
+        map.set(k, v);
+        if (persist) invoke('__storage', { op: 'set', k: k, v: v }).catch(function () { });
+      },
+      removeItem: function (k) { k = String(k); map.delete(k); if (persist) invoke('__storage', { op: 'remove', k: k }).catch(function () { }); },
+      clear: function () { map.clear(); if (persist) invoke('__storage', { op: 'clear' }).catch(function () { }); },
+      key: function (i) { return Array.from(map.keys())[i] || null; }
+    };
+    return new Proxy(api, {
+      get: function (t, p) {
+        if (p === 'length') return map.size;
+        if (typeof p === 'string' && p in t) return t[p];
+        if (typeof p === 'string' && map.has(p)) return map.get(p);
+        return undefined;
+      },
+      set: function (t, p, v) { t.setItem(p, v); return true; },
+      deleteProperty: function (t, p) { t.removeItem(p); return true; },
+      has: function (t, p) { return p in t || map.has(p); },
+      ownKeys: function () { return Array.from(map.keys()); },
+      getOwnPropertyDescriptor: function (t, p) { return map.has(p) ? { value: map.get(p), enumerable: true, configurable: true, writable: true } : undefined; }
+    });
+  }
+  g.localStorage = makeStorage(persistStore, true);
+  g.sessionStorage = makeStorage(sessionStore, false);
+  internal['__storage_init'] = function (p) {
+    var loc = p && p.local ? p.local : {};
+    for (var k in loc) if (!persistStore.has(k)) persistStore.set(k, String(loc[k]));
+  };
+
+  // ---------- Headers / Request / Response / fetch ----------
+  if (typeof g.Headers !== 'function') {
+    g.Headers = function Headers(init) {
+      this._m = new Map();
+      var self = this;
+      if (init instanceof g.Headers) init.forEach(function (v, k) { self.append(k, v); });
+      else if (Array.isArray(init)) init.forEach(function (e) { self.append(e[0], e[1]); });
+      else if (init && typeof init === 'object') Object.keys(init).forEach(function (k) { self.append(k, init[k]); });
+    };
+    var HP = g.Headers.prototype;
+    HP.append = function (k, v) { k = String(k).toLowerCase(); v = String(v); this._m.set(k, this._m.has(k) ? this._m.get(k) + ', ' + v : v); };
+    HP.set = function (k, v) { this._m.set(String(k).toLowerCase(), String(v)); };
+    HP.get = function (k) { k = String(k).toLowerCase(); return this._m.has(k) ? this._m.get(k) : null; };
+    HP.has = function (k) { return this._m.has(String(k).toLowerCase()); };
+    HP.delete = function (k) { this._m.delete(String(k).toLowerCase()); };
+    HP.forEach = function (fn, th) { this._m.forEach(function (v, k) { fn.call(th, v, k); }); };
+    HP.keys = function () { return this._m.keys(); };
+    HP.values = function () { return this._m.values(); };
+    HP.entries = function () { return this._m.entries(); };
+    HP[Symbol.iterator] = HP.entries;
+  }
+  var blobUrls = {}, blobSeq = 0;
+  if (typeof g.URL === 'function' && typeof g.URL.createObjectURL !== 'function') {
+    g.URL.createObjectURL = function (b) { var u = 'blob:silver/' + (++blobSeq); blobUrls[u] = b; return u; };
+    g.URL.revokeObjectURL = function (u) { delete blobUrls[u]; };
+  }
+  function bodyToString(b) {
+    if (b == null) return '';
+    if (typeof b === 'string') return b;
+    if (typeof g.URLSearchParams === 'function' && b instanceof g.URLSearchParams) return b.toString();
+    if (b && typeof b._s === 'string') return b._s;
+    if (b instanceof ArrayBuffer) return new g.TextDecoder().decode(b);
+    if (b && b.buffer instanceof ArrayBuffer) return new g.TextDecoder().decode(b);
+    return String(b);
+  }
+  function makeResponse(r, url) {
+    var headers = new g.Headers(r.headers || {});
+    var used = false;
+    function take() { if (used) return Promise.reject(new TypeError('Body już został odczytany')); used = true; return Promise.resolve(r.body === undefined ? '' : r.body); }
+    var resp = {
+      ok: !!r.ok, status: r.status | 0, url: String(url), statusText: r.statusText || (r.ok ? 'OK' : ''), headers: headers, redirected: false, type: 'basic',
+      get bodyUsed() { return used; },
+      text: function () { return take(); },
+      json: function () { return take().then(function (t) { return JSON.parse(t); }); },
+      arrayBuffer: function () { return take().then(function (t) { return new g.TextEncoder().encode(t).buffer; }); },
+      blob: function () { return take().then(function (t) { return new g.Blob([t], { type: headers.get('content-type') || '' }); }); },
+      clone: function () { return makeResponse(r, url); }
+    };
+    return resp;
+  }
+  g.Response = function Response(body, init) {
+    init = init || {};
+    var st = init.status === undefined ? 200 : init.status;
+    var hd = {}; new g.Headers(init.headers).forEach(function (v, k) { hd[k] = v; });
+    return makeResponse({ ok: st >= 200 && st < 300, status: st, statusText: init.statusText || '', body: bodyToString(body), headers: hd }, '');
+  };
+  g.Request = function Request(url, init) {
+    init = init || {};
+    this.url = typeof url === 'object' && url && url.url ? url.url : String(url);
+    this.method = String(init.method || (url && url.method) || 'GET').toUpperCase();
+    this.headers = new g.Headers(init.headers || (url && url.headers));
+    this.body = init.body === undefined ? (url && url.body) : init.body;
+    this.signal = init.signal || null;
+  };
+  g.fetch = function (input, opts) {
+    var req = input instanceof g.Request ? input : null;
+    var url = req ? req.url : (typeof input === 'object' && input && input.href ? input.href : String(input));
+    opts = opts || {};
+    var method = String(opts.method || (req && req.method) || 'GET');
+    var headers = {};
+    new g.Headers(opts.headers || (req && req.headers)).forEach(function (v, k) { headers[k] = v; });
+    var body = bodyToString(opts.body !== undefined ? opts.body : (req && req.body));
+    var signal = opts.signal || (req && req.signal);
+    if (signal && signal.aborted) return Promise.reject(signal.reason !== undefined ? signal.reason : Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }));
+    if (blobUrls[url]) {
+      var bl = blobUrls[url];
+      return Promise.resolve(makeResponse({ ok: true, status: 200, body: bodyToString(bl), headers: { 'content-type': bl.type || '' } }, url));
+    }
+    var p = invoke('__fetch', { url: url, method: method, body: body, headers: headers })
+      .then(function (r) { return makeResponse(r, url); });
+    if (!signal) return p;
+    return new Promise(function (resolve, reject) {
+      signal.addEventListener('abort', function () { reject(signal.reason !== undefined ? signal.reason : Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })); });
+      p.then(resolve, reject);
+    });
+  };
+
+  // ---------- Worker (w tym samym wątku, bez izolacji) ----------
+  var workerSeq = 0;
+  g.Worker = function Worker(url, opts) {
+    if (!(this instanceof g.Worker)) throw new TypeError("Worker: użyj 'new'");
+    g.EventTarget.call(this);
+    var self = this, id = ++workerSeq;
+    this.onmessage = null; this.onerror = null; this.onmessageerror = null;
+    var dead = false, ready = false, queue = [];
+    var inner = new g.EventTarget();
+    var scope = Object.create(g);
+    scope.onmessage = null; scope.onerror = null;
+    scope.self = scope; scope.name = (opts && opts.name) || '';
+    scope.postMessage = function (data) {
+      var copy = g.structuredClone(data);
+      setTimeout(function () {
+        if (dead) return;
+        var ev = new g.Event('message'); ev.data = copy; ev.target = self;
+        if (typeof self.onmessage === 'function') { try { self.onmessage(ev); } catch (e) { console.error(e); } }
+        self.dispatchEvent(ev);
+      }, 0);
+    };
+    scope.addEventListener = function (t, f, o) { inner.addEventListener(t, f, o); };
+    scope.removeEventListener = function (t, f) { inner.removeEventListener(t, f); };
+    scope.close = function () { dead = true; };
+    scope.importScripts = function () { throw new Error('importScripts nie jest dostępne (Worker działa w tym samym wątku) — użyj bundla'); };
+    function deliver(data) {
+      var ev = new g.Event('message'); ev.data = data; ev.target = scope;
+      if (typeof scope.onmessage === 'function') { try { scope.onmessage(ev); } catch (e) { reportErr(e); } }
+      inner.dispatchEvent(ev);
+    }
+    function reportErr(e) {
+      var ev = new g.Event('error'); ev.message = String(e && e.message || e); ev.error = e;
+      if (typeof self.onerror === 'function') self.onerror(ev);
+      self.dispatchEvent(ev);
+      console.error(e);
+    }
+    this.postMessage = function (data) {
+      if (dead) return;
+      var copy = g.structuredClone(data);
+      if (!ready) { queue.push(copy); return; }
+      setTimeout(function () { if (!dead) deliver(copy); }, 0);
+    };
+    this.terminate = function () { dead = true; queue = []; };
+    g.fetch(String(url)).then(function (r) { return r.text(); }).then(function (code) {
+      if (dead) return;
+      try { new Function('scope', 'with (scope) {\n' + code + '\n}').call(scope, scope); }
+      catch (e) { reportErr(e); return; }
+      ready = true;
+      queue.splice(0).forEach(function (d) { setTimeout(function () { if (!dead) deliver(d); }, 0); });
+    }).catch(reportErr);
+  };
+  g.Worker.prototype = Object.create(g.EventTarget.prototype);
+  g.Worker.prototype.constructor = g.Worker;
+
+  // ---------- WebSocket (natywny klient ws://) ----------
+  var wsSeq = 0, wsMap = new Map();
+  g.WebSocket = function WebSocket(url, protocols) {
+    if (!(this instanceof g.WebSocket)) throw new TypeError("WebSocket: użyj 'new'");
+    g.EventTarget.call(this);
+    this.url = String(url); this.readyState = 0; this.bufferedAmount = 0; this.extensions = ''; this.protocol = '';
+    this.binaryType = 'blob';
+    this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+    this.__id = ++wsSeq;
+    wsMap.set(this.__id, this);
+    var self = this;
+    var ok = typeof __silver_ws_open === 'function' ? __silver_ws_open(this.__id, this.url) : false;
+    if (!ok) setTimeout(function () { g.__silver_ws_event(self.__id, 'error', 'nie można otworzyć połączenia'); g.__silver_ws_event(self.__id, 'close', '1006'); }, 0);
+  };
+  g.WebSocket.prototype = Object.create(g.EventTarget.prototype);
+  g.WebSocket.prototype.constructor = g.WebSocket;
+  g.WebSocket.CONNECTING = g.WebSocket.prototype.CONNECTING = 0;
+  g.WebSocket.OPEN = g.WebSocket.prototype.OPEN = 1;
+  g.WebSocket.CLOSING = g.WebSocket.prototype.CLOSING = 2;
+  g.WebSocket.CLOSED = g.WebSocket.prototype.CLOSED = 3;
+  g.WebSocket.prototype.send = function (data) {
+    if (this.readyState !== 1) throw new Error('InvalidStateError: WebSocket nie jest otwarty');
+    __silver_ws_send(this.__id, bodyToString(data));
+  };
+  g.WebSocket.prototype.close = function (code, reason) {
+    if (this.readyState >= 2) return;
+    this.readyState = 2;
+    __silver_ws_close(this.__id, code === undefined ? 1000 : code);
+  };
+  g.__silver_ws_event = function (id, type, data) {
+    var ws = wsMap.get(+id);
+    if (!ws) return;
+    var ev;
+    if (type === 'open') { ws.readyState = 1; ev = new g.Event('open'); ev.target = ws; if (typeof ws.onopen === 'function') ws.onopen(ev); ws.dispatchEvent(ev); }
+    else if (type === 'message' || type === 'binary') {
+      ev = new g.Event('message'); ev.target = ws;
+      ev.data = type === 'binary' ? new g.TextEncoder().encode(data).buffer : data;
+      ev.origin = ws.url; ev.lastEventId = ''; ev.ports = [];
+      if (typeof ws.onmessage === 'function') ws.onmessage(ev); ws.dispatchEvent(ev);
+    } else if (type === 'error') {
+      ev = new g.Event('error'); ev.target = ws; ev.message = data;
+      if (typeof ws.onerror === 'function') ws.onerror(ev); ws.dispatchEvent(ev);
+    } else if (type === 'close') {
+      ws.readyState = 3; wsMap.delete(+id);
+      ev = new g.Event('close'); ev.target = ws; ev.code = parseInt(data, 10) || 1005; ev.reason = ''; ev.wasClean = ev.code === 1000;
+      if (typeof ws.onclose === 'function') ws.onclose(ev); ws.dispatchEvent(ev);
+    }
+  };
+
+  // ---------- source mapy (TypeScript → czytelne stosy błędów) ----------
+  var B64V = {};
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.split('').forEach(function (c, i) { B64V[c] = i; });
+  var smaps = [];
+  function decodeMappings(str) {
+    var lines = [], segs = [], i = 0, gc = 0, si = 0, sl = 0, sc = 0, ni = 0;
+    function vlq() {
+      var result = 0, shift = 0, c, digit;
+      do { c = str[i++]; digit = B64V[c]; result += (digit & 31) << shift; shift += 5; } while (digit & 32);
+      return result & 1 ? -(result >> 1) : result >> 1;
+    }
+    while (i < str.length) {
+      var ch = str[i];
+      if (ch === ';') { lines.push(segs); segs = []; gc = 0; i++; continue; }
+      if (ch === ',') { i++; continue; }
+      gc += vlq();
+      if (i >= str.length || str[i] === ',' || str[i] === ';') { segs.push([gc]); continue; }
+      si += vlq(); sl += vlq(); sc += vlq();
+      var seg = [gc, si, sl, sc];
+      if (i < str.length && str[i] !== ',' && str[i] !== ';') { ni += vlq(); seg.push(ni); }
+      segs.push(seg);
+    }
+    lines.push(segs);
+    return lines;
+  }
+  g.__silver_register_map = function (name, payload, isB64) {
+    try {
+      var json = isB64 === '1' ? (function () {
+        var bin = g.atob(payload), bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new g.TextDecoder().decode(bytes);
+      })() : payload;
+      var m = JSON.parse(json);
+      smaps.push({ name: String(name), sources: m.sources || [], names: m.names || [], lines: decodeMappings(m.mappings || ''), root: m.sourceRoot || '' });
+    } catch (e) { console.error('silver: błędna source mapa dla ' + name + ': ' + (e && e.message)); }
+  };
+  function mapPos(file, line, col) {
+    for (var i = 0; i < smaps.length; i++) {
+      var sm = smaps[i];
+      if (!(file === sm.name || file.slice(-sm.name.length) === sm.name || sm.name.slice(-file.length) === file)) continue;
+      var segs = sm.lines[line - 1]; if (!segs) return null;
+      var best = null;
+      for (var j = 0; j < segs.length; j++) { if (segs[j][0] <= col - 1) best = segs[j]; else break; }
+      if (!best || best.length < 4) return null;
+      return { source: (sm.root ? sm.root.replace(/\/?$/, '/') : '') + sm.sources[best[1]], line: best[2] + 1, col: best[3] + 1, name: best.length > 4 ? sm.names[best[4]] : '' };
+    }
+    return null;
+  }
+  g.__silver_format_error = function (stack) {
+    if (!smaps.length) return stack;
+    return String(stack).replace(/\(?([^\s()]+?):(\d+):(\d+)\)?/g, function (m, file, ln, cl) {
+      var p = mapPos(file, +ln, +cl);
+      if (!p) return m;
+      var txt = p.source + ':' + p.line + ':' + p.col;
+      return m[0] === '(' ? '(' + txt + ')' : txt;
+    });
+  };
+  silver.registerSourceMap = function (name, json) { g.__silver_register_map(name, typeof json === 'string' ? json : JSON.stringify(json), '0'); };
+  silver.version = '0.3.0';
+  g.navigator.userAgent = 'Silver/0.3.0';
+
 })(globalThis);
