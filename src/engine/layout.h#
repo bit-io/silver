@@ -2,7 +2,9 @@ mod ffi_shim
 mod dom
 mod css
 mod style
+mod anim
 mod cssval
+use "std -> conv" from "conv"
 
 pub struct LayoutBox is
     pub node_id: int
@@ -22,6 +24,12 @@ pub struct LayoutBox is
     pub fixed:   bool     ;; position: fixed — nie przewija się z dokumentem
     pub content_h: int    ;; pełna wysokość treści (dla pasków przewijania)
     pub scroll_y:  int    ;; zastosowane przesunięcie przewijania kontenera
+    pub sticky:    bool   ;; position: sticky — przesunięcie liczone przy rysowaniu
+    pub stk_top:   int    ;; odstęp od góry okna, przy którym element „przykleja się"
+    pub stk_y:     int    ;; naturalne y elementu
+    pub stk_max:   int    ;; maksymalne dodatkowe przesunięcie (do końca rodzica)
+    pub xf_id:     int    ;; 0.3: id elementu z transformacją macierzową (obrót/pochylenie), do której należy box; 0 = brak
+    pub xf:        [int]  ;; [a,b,c,d,e,f, pivot_x,pivot_y, x,y,w,h warstwy] (a-d x1000, e/f px x1000)
 end
 
 pub struct LayoutResult is
@@ -36,6 +44,7 @@ pub struct LayoutCtx is
     pub vw:     int
     pub vh:     int
     pub scrolls: [int]    ;; płaskie pary [id, offset, id, offset, …]
+    pub floats: [int]     ;; aktywne floaty: rekordy [strona(0=lewa,1=prawa), góra, dół, x0, x1]
 end
 
 struct BlockRes is
@@ -71,7 +80,8 @@ fn auto_v() -> int is return style::auto_val() end
 pub fn no_clip_box(node_id: int, x: int, y: int, w: int, h: int, st: style::ComputedStyle, kind: string) -> LayoutBox is
     return LayoutBox {
         node_id: node_id, x: x, y: y, w: w, h: h, st: st, text: "", img_src: "", kind: kind,
-        has_clip: false, cx: 0, cy: 0, cw: 0, ch: 0, fixed: false, content_h: 0, scroll_y: 0
+        has_clip: false, cx: 0, cy: 0, cw: 0, ch: 0, fixed: false, content_h: 0, scroll_y: 0,
+        sticky: false, stk_top: 0, stk_y: 0, stk_max: 0, xf_id: 0, xf: []
     }
 end
 
@@ -143,7 +153,7 @@ fn style_flags(st: style::ComputedStyle) -> int is
     if st.italic is f += 2 end
     if st.underline is f += 4 end
     if st.strike is f += 8 end
-    return f
+    return f + st.font_key * 256
 end
 
 pub fn est_text_width(text: string, font_size: int) -> int is
@@ -151,6 +161,12 @@ pub fn est_text_width(text: string, font_size: int) -> int is
 end
 
 fn text_w(cx: LayoutCtx, text: string, st: style::ComputedStyle) -> int is
+    let base: int = text_w0(cx, text, st)
+    if st.letter_spacing == 0 || text == "" is return base end
+    return base + st.letter_spacing * ffi_shim::silver_utf8_len(text)
+end
+
+fn text_w0(cx: LayoutCtx, text: string, st: style::ComputedStyle) -> int is
     if text == "" is return 0 end
     if cx.win < 0 is
         let chars: int = ffi_shim::silver_utf8_len(text)
@@ -162,6 +178,10 @@ fn text_w(cx: LayoutCtx, text: string, st: style::ComputedStyle) -> int is
 end
 
 fn space_w(cx: LayoutCtx, st: style::ComputedStyle) -> int is
+    return space_w0(cx, st) + st.word_spacing + st.letter_spacing
+end
+
+fn space_w0(cx: LayoutCtx, st: style::ComputedStyle) -> int is
     if cx.win < 0 is return st.font_size * 3 / 10 + 1 end
     let w: int = ffi_shim::silver_measure_text_ex(cx.win, "a a", st.font_size, style_flags(st)) -
                  ffi_shim::silver_measure_text_ex(cx.win, "aa", st.font_size, style_flags(st))
@@ -215,6 +235,11 @@ end
 
 ;; Styl każdego węzła (indeks = id węzła), dziedziczenie od rodzica.
 pub fn compute_styles(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionState) -> [style::ComputedStyle] is
+    return compute_styles_a(d, sheet, ix, anim::no_anim())
+end
+
+pub fn compute_styles_a(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionState, act: anim::AnimCtx) -> [style::ComputedStyle] is
+    let animating: bool = array_len(act.starts) > 0 || array_len(act.t_ids) > 0
     let n: int = array_len(d.nodes)
     let mut styles: [style::ComputedStyle] = []
     let mut i: int = 0
@@ -242,6 +267,7 @@ pub fn compute_styles(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionS
             styles[id] = style::text_style(parent_st)
         else is
             styles[id] = style::resolve_ctx(sheet, d, id, parent_st, ix)
+            if animating is styles[id] = anim::animate_style(sheet, styles[id], parent_st, act, id) end
         end
         let mut c: int = array_len(node.children) - 1
         while c >= 0 is
@@ -270,6 +296,7 @@ fn is_inline_level(cx: LayoutCtx, id: int) -> bool is
     if n.tag == "text" is return n.text != "" end
     let st: style::ComputedStyle = cx.styles[id]
     if st.display == "none" || is_out_of_flow(st) is return false end
+    if st.float_side != "none" is return false end
     return st.display == "inline" || st.display == "inline-block" || st.display == "inline-flex"
 end
 
@@ -397,6 +424,7 @@ fn max_content(cx: LayoutCtx, id: int, depth: int) -> int is
     if st.width_mode == "px" is
         return if st.border_box then st.width else st.width + own
     end
+    if st.display == "table" is return table_max_content(cx, id) end
     if is_replaced(n.tag) is
         let nat: style::BoxSides = replaced_natural(cx, id)
         let mut w: int = nat.right
@@ -447,15 +475,56 @@ fn nowrap_of(st: style::ComputedStyle) -> bool is
     return st.white_space == "nowrap" || st.white_space == "pre"
 end
 
+;; tab-size: liczba kolumn (liczba całkowita) albo długość przeliczona na szerokość spacji.
+fn tab_columns(st: style::ComputedStyle, space_px: int) -> int is
+    let v: string = props::xget(st.xp, "tab-size")
+    if v == "" is return (if st.tab_size < 1 then 8 else st.tab_size) end
+    if props::is_len(v) && space_px > 0 is
+        let px: int = len_px_of(v, st)
+        let n: int = px / space_px
+        return if n < 1 then 1 else n
+    end
+    return 8
+end
+
+;; Tabulatory → spacje do następnego znacznika tabulacji (liczone od początku wiersza).
+pub fn expand_tabs(text: string, cols: int) -> string is
+    let n: int = string_len(text)
+    let mut out: string = ""
+    let mut col: int = 0
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(text, i)
+        i += 1
+        if c == "\t" is
+            let pad: int = cols - (col % cols)
+            let mut k: int = 0
+            while k < pad is
+                out = out + " "
+                k += 1
+            end
+            col += pad
+        elsif c == "\n" is
+            out = out + c
+            col = 0
+        else is
+            out = out + c
+            col += 1
+        end
+    end
+    return out
+end
+
 ;; Atomy z tekstu węzła tekstowego (słowa; "pre" → linie; nowrap → jeden atom).
 fn text_atoms(cx: LayoutCtx, text_id: int, owner: int, deco: int, avail_w: int, out: [Atom]) -> [Atom] is
     let mut acc: [Atom] = out
     let n: dom::DomNode = cx.dom.nodes[text_id]
     let st: style::ComputedStyle = cx.styles[owner]
-    let t: string = apply_transform(n.text, st.text_transform)
+    let pre: bool = st.white_space == "pre" || st.white_space == "pre-wrap"
+    let t0: string = apply_transform(n.text, st.text_transform)
     let lh: int = line_h_of(st)
     let sw: int = space_w(cx, st)
-    let pre: bool = st.white_space == "pre" || st.white_space == "pre-wrap"
+    let t: string = if pre && string_find(t0, "\t") >= 0 then expand_tabs(t0, tab_columns(st, sw)) else t0
     if pre is
         let lines: [string] = string_split(t, "\n")
         let mut li: int = 0
@@ -587,6 +656,45 @@ fn collect_atoms(cx: LayoutCtx, ids: [int], owner: int, deco: int, avail_w: int,
     return acc
 end
 
+;; Przesunięcie pionowe atomu wg vertical-align (względem wyśrodkowania w wierszu).
+fn valign_y(st: style::ComputedStyle, line_h: int, atom_h: int) -> int is
+    let centered: int = (line_h - atom_h) / 2
+    if st.valign == "top" || st.valign == "text-top" is return 0 end
+    if st.valign == "bottom" || st.valign == "text-bottom" is return line_h - atom_h end
+    if st.valign == "super" is return centered - st.font_size / 3 end
+    if st.valign == "sub" is return centered + st.font_size / 4 end
+    if st.valign_px != 0 is return centered - st.valign_px end
+    return centered
+end
+
+;; Efektywne wyrównanie: "<akapit>|<ostatni wiersz>|<l|r>" (start/end zależne od `direction`).
+fn resolve_align(a: string, rtl: bool) -> string is
+    if a == "start" || a == "match-parent" || a == "" is
+        if rtl is return "right" end
+        return "left"
+    end
+    if a == "end" is
+        if rtl is return "left" end
+        return "right"
+    end
+    if a == "justify-all" is return "justify" end
+    return a
+end
+
+pub fn align_spec(st: style::ComputedStyle) -> string is
+    let rtl: bool = st.direction == "rtl"
+    let base: string = resolve_align(st.text_align, rtl)
+    let last_raw: string = props::xget(st.xp, "text-align-last")
+    let mut last: string = base
+    if last_raw == "" || last_raw == "auto" is
+        if base == "justify" is last = resolve_align("start", rtl) end
+    else is
+        last = resolve_align(last_raw, rtl)
+    end
+    let tag: string = if rtl then "r" else "l"
+    return base + "|" + last + "|" + tag
+end
+
 fn align_dx(text_align: string, inner_w: int, used_w: int) -> int is
     if text_align == "center" is return (inner_w - used_w) / 2 end
     if text_align == "right" || text_align == "end" is return inner_w - used_w end
@@ -594,8 +702,12 @@ fn align_dx(text_align: string, inner_w: int, used_w: int) -> int is
 end
 
 ;; Kończy wiersz: emituje boksy tekstu / dekoracji / fragmenty inline-block.
-fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs: [int], line_y: int, inner_x: int, inner_w: int,
-             text_align: string, boxes: [LayoutBox]) -> InlineRes is
+fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs0: [int], line_y: int, inner_x: int, inner_w: int,
+             text_align0: string, last_line: bool, boxes: [LayoutBox]) -> InlineRes is
+    let spec: [string] = string_split(text_align0, "|")
+    let text_align: string = if last_line && array_len(spec) >= 2 then spec[1] else spec[0]
+    let rtl: bool = array_len(spec) >= 3 && spec[2] == "r"
+    let mut xs: [int] = xs0
     let mut acc: [LayoutBox] = boxes
     let n: int = array_len(idxs)
     if n == 0 is return InlineRes { boxes: acc, height: 0, used_w: 0 } end
@@ -611,8 +723,37 @@ fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs: [int], line_y: int, 
         i += 1
     end
     let first_x: int = xs[0] + (if atoms[idxs[0]].sp then 0 else 0)
-    let used: int = right - first_x
-    let dx: int = align_dx(text_align, inner_w, used)
+    let mut used: int = right - first_x
+    ;; justify: dodatkowe miejsce rozdzielone równo między odstępy między słowami
+    if text_align == "justify" && used < inner_w is
+        let mut gaps: int = 0
+        let mut g: int = 1
+        while g < n is
+            if atoms[idxs[g]].sp is gaps += 1 end
+            g += 1
+        end
+        if gaps > 0 is
+            let extra: int = inner_w - used
+            let mut seen: int = 0
+            g = 1
+            while g < n is
+                if atoms[idxs[g]].sp is seen += 1 end
+                xs[g] = xs[g] + extra * seen / gaps
+                g += 1
+            end
+            used = inner_w
+        end
+    end
+    ;; RTL: odbicie kolejności słów w wierszu (bez kształtowania pisma i bez bidi mieszanych przebiegów)
+    if rtl && n > 1 is
+        let span_end: int = first_x + used
+        let mut g: int = 0
+        while g < n is
+            xs[g] = first_x + (span_end - (xs[g] + atoms[idxs[g]].w))
+            g += 1
+        end
+    end
+    let dx: int = align_dx(if text_align == "justify" then "left" else text_align, inner_w, used)
     let base_x: int = inner_x + dx
 
     ;; tła elementów inline (po jednym na deco w wierszu)
@@ -665,14 +806,14 @@ fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs: [int], line_y: int, 
                 end_x = xs[j] + nxt.w
                 j += 1
             end
-            let mut b: LayoutBox = no_clip_box(a.owner, base_x + xs[i], line_y + (line_h - a.h) / 2, end_x - xs[i], a.h, ost, "text")
+            let mut b: LayoutBox = no_clip_box(a.owner, base_x + xs[i], line_y + valign_y(ost, line_h, a.h), end_x - xs[i], a.h, ost, "text")
             b.text = text
             acc = array_push(acc, b)
             i = j
             continue
         end
         if a.kind == "box" is
-            let by: int = line_y + (line_h - a.h) / 2
+            let by: int = line_y + valign_y(cx.styles[a.owner], line_h, a.h)
             acc = concat_boxes(acc, shift_boxes(a.frag, base_x + xs[i], by))
         end
         i += 1
@@ -680,18 +821,202 @@ fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs: [int], line_y: int, 
     return InlineRes { boxes: acc, height: line_h, used_w: used }
 end
 
+
+;; ---------- float / BFC / zwijanie marginesów ----------
+fn is_float(st: style::ComputedStyle) -> bool is
+    return st.float_side != "none" && !is_out_of_flow(st) && st.display != "none"
+end
+
+fn is_bfc_root(st: style::ComputedStyle) -> bool is
+    if style::is_scroll_container(st) is return true end
+    if st.display == "flex" || st.display == "inline-flex" || st.display == "grid" || st.display == "inline-block" ||
+       st.display == "table" || st.display == "table-cell" || st.display == "flow-root" is return true end
+    if st.float_side != "none" || is_out_of_flow(st) is return true end
+    if contains_any(st, " layout paint strict content ") is return true end
+    return false
+end
+
+;; Czy `contain` zawiera któreś ze słów z listy (spacjami).
+fn contains_any(st: style::ComputedStyle, words: string) -> bool is
+    let v: string = props::xget(st.xp, "contain")
+    if v == "" || v == "none" is return false end
+    let toks: [string] = cssval::split_top(string_lower(v))
+    let mut i: int = 0
+    while i < array_len(toks) is
+        if string_find(words, " " + toks[i] + " ") >= 0 is return true end
+        i += 1
+    end
+    return false
+end
+
+fn with_floats(cx: LayoutCtx, fls: [int]) -> LayoutCtx is
+    return LayoutCtx { dom: cx.dom, styles: cx.styles, win: cx.win, vw: cx.vw, vh: cx.vh, scrolls: cx.scrolls, floats: fls }
+end
+
+;; Granice poziome w pasie [y0, y1): [lewa, prawa, czy_kolizja(0/1)] we współrzędnych bezwzględnych.
+fn float_bounds(fls: [int], y0: int, y1: int, left_edge: int, right_edge: int) -> [int] is
+    let mut l: int = left_edge
+    let mut r: int = right_edge
+    let mut hit: int = 0
+    let mut i: int = 0
+    while i + 4 < array_len(fls) is
+        let top: int = fls[i + 1]
+        let bot: int = fls[i + 2]
+        if bot > y0 && top < (if y1 > y0 then y1 else y0 + 1) is
+            if fls[i] == 0 is
+                if fls[i + 4] > l is l = fls[i + 4] end
+            else is
+                if fls[i + 3] < r is r = fls[i + 3] end
+            end
+            hit = 1
+        end
+        i += 5
+    end
+    return [l, r, hit]
+end
+
+;; Najniższy dół floatów danej strony (0 = lewe, 1 = prawe, 2 = oba); -1000000 gdy brak.
+fn float_bottom(fls: [int], side: int) -> int is
+    let mut best: int = -1000000
+    let mut i: int = 0
+    while i + 4 < array_len(fls) is
+        if (side == 2 || fls[i] == side) && fls[i + 2] > best is best = fls[i + 2] end
+        i += 5
+    end
+    return best
+end
+
+;; Najmniejszy dół floatu większy od y (-1 gdy brak).
+fn float_next_bottom(fls: [int], y: int) -> int is
+    let mut best: int = -1
+    let mut i: int = 0
+    while i + 4 < array_len(fls) is
+        let b: int = fls[i + 2]
+        if b > y && (best < 0 || b < best) is best = b end
+        i += 5
+    end
+    return best
+end
+
+fn clear_side_code(st: style::ComputedStyle) -> int is
+    if st.clear_side == "left" is return 0 end
+    if st.clear_side == "right" is return 1 end
+    if st.clear_side == "both" is return 2 end
+    return -1
+end
+
+;; Element blokowy w normalnym przepływie (kandydat do zwijania marginesów z dziećmi).
+fn is_block_flow(cx: LayoutCtx, id: int) -> bool is
+    if id <= 0 is return false end
+    let n: dom::DomNode = cx.dom.nodes[id]
+    if n.tag == "text" || is_replaced(n.tag) is return false end
+    let st: style::ComputedStyle = cx.styles[id]
+    if st.display != "block" && st.display != "list-item" is return false end
+    if is_bfc_root(st) is return false end
+    if n.parent >= 0 is
+        let pd: string = cx.styles[n.parent].display
+        if pd == "flex" || pd == "inline-flex" || pd == "grid" is return false end
+    end
+    return true
+end
+
+fn is_block_level_child(cx: LayoutCtx, cid: int) -> bool is
+    if !is_rendered(cx, cid) is return false end
+    if cx.dom.nodes[cid].tag == "text" is return false end
+    let cst: style::ComputedStyle = cx.styles[cid]
+    if is_out_of_flow(cst) || is_float(cst) is return false end
+    return !is_inline_level(cx, cid)
+end
+
+;; Pierwsze dziecko blokowe w przepływie; -1, gdy treść zaczyna się od tekstu/inline albo brak dzieci.
+fn first_flow_child(cx: LayoutCtx, id: int, from_end: bool) -> int is
+    let kids: [int] = cx.dom.nodes[id].children
+    let nk: int = array_len(kids)
+    let mut i: int = 0
+    while i < nk is
+        let cid: int = if from_end then kids[nk - 1 - i] else kids[i]
+        i += 1
+        if !is_rendered(cx, cid) is continue end
+        if cx.dom.nodes[cid].tag != "text" is
+            let cst: style::ComputedStyle = cx.styles[cid]
+            if is_out_of_flow(cst) || is_float(cst) is continue end
+        end
+        if is_block_level_child(cx, cid) is return cid end
+        return -1
+    end
+    return -1
+end
+
+;; Margines górny, który „przecieka" przez ten blok z jego pierwszego dziecka (0, gdy brak zwijania).
+fn collapsed_child_margin(cx: LayoutCtx, id: int, bottom: bool, depth: int) -> int is
+    if depth > 30 || !is_block_flow(cx, id) is return 0 end
+    let st: style::ComputedStyle = cx.styles[id]
+    if bottom is
+        if st.pad_bottom > 0 || st.bb > 0 || st.height_mode != "auto" || st.min_height > 0 is return 0 end
+    else is
+        if st.pad_top > 0 || st.bt > 0 is return 0 end
+    end
+    let c: int = first_flow_child(cx, id, bottom)
+    if c < 0 is return 0 end
+    let cst: style::ComputedStyle = cx.styles[c]
+    let own: int = m_or_zero(if bottom then cst.mar_bottom else cst.mar_top)
+    let inner: int = collapsed_child_margin(cx, c, bottom, depth + 1)
+    return collapse_margin(own, inner)
+end
+
+;; Granice linii w pasie [y, y+lh) wokół floatów: [x, szerokość].
+fn line_bounds(fls: [int], y: int, lh: int, base_x: int, base_w: int) -> [int] is
+    if array_len(fls) == 0 is return [base_x, base_w] end
+    let b: [int] = float_bounds(fls, y, y + lh, base_x, base_x + base_w)
+    return [b[0], b[1] - b[0]]
+end
+
 ;; Układa ciąg węzłów inline w wierszach szerokości `inner_w`.
 fn flow_inline(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: int, inner_w: int,
                text_align: string, boxes: [LayoutBox]) -> InlineRes is
+    return flow_inline_f(cx, ids, owner, inner_x, start_y, inner_w, text_align, boxes, [], 0)
+end
+
+;; Jak flow_inline, ale wiersze omijają floaty `fls`, a pierwszy wiersz ma wcięcie `indent`.
+fn flow_inline_f(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: int, inner_w: int,
+                 text_align: string, boxes: [LayoutBox], fls: [int], indent: int) -> InlineRes is
+    let ost0: style::ComputedStyle = cx.styles[owner]
+    let bal: bool = props::xget(ost0.xp, "text-wrap") == "balance" || props::xget(ost0.xp, "text-wrap-style") == "balance"
+    if !bal || array_len(fls) > 0 || inner_w < 40 is
+        return flow_inline_f0(cx, ids, owner, inner_x, start_y, inner_w, text_align, boxes, fls, indent)
+    end
+    ;; text-wrap: balance — najwęższa szerokość dająca tę samą liczbę wierszy
+    let r0: InlineRes = flow_inline_f0(cx, ids, owner, inner_x, start_y, inner_w, text_align, [], fls, indent)
+    if r0.height <= line_h_of(ost0) is
+        return flow_inline_f0(cx, ids, owner, inner_x, start_y, inner_w, text_align, boxes, fls, indent)
+    end
+    let mut lo: int = inner_w / 3
+    let mut hi: int = inner_w
+    let mut guard: int = 0
+    while lo < hi && guard < 9 is
+        let mid: int = (lo + hi) / 2
+        let rm: InlineRes = flow_inline_f0(cx, ids, owner, inner_x, start_y, mid, text_align, [], fls, indent)
+        if rm.height == r0.height is hi = mid else is lo = mid + 1 end
+        guard += 1
+    end
+    let base: string = string_split(text_align, "|")[0]
+    let off: int = if base == "center" then (inner_w - hi) / 2 elsif base == "right" then inner_w - hi else 0
+    return flow_inline_f0(cx, ids, owner, inner_x + off, start_y, hi, text_align, boxes, fls, indent)
+end
+
+fn flow_inline_f0(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: int, inner_w: int,
+                  text_align: string, boxes: [LayoutBox], fls: [int], indent: int) -> InlineRes is
     let atoms: [Atom] = collect_atoms(cx, ids, owner, -1, inner_w, [], 0)
     let ost: style::ComputedStyle = cx.styles[owner]
     let nowrap: bool = nowrap_of(ost)
+    let guess_lh: int = line_h_of(ost)
     let mut acc: [LayoutBox] = boxes
     let mut y: int = start_y
     let mut line_idx: [int] = []
     let mut line_x: [int] = []
-    let mut x: int = 0
+    let mut x: int = indent
     let mut max_used: int = 0
+    let mut lb: [int] = line_bounds(fls, y, guess_lh, inner_x, inner_w)
     let total: int = array_len(atoms)
     let mut i: int = 0
     while i < total is
@@ -699,25 +1024,37 @@ fn flow_inline(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: int
         if a.kind == "br" is
             line_idx = array_push(line_idx, i)
             line_x = array_push(line_x, x)
-            let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, inner_x, inner_w, text_align, acc)
+            let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, lb[0], lb[1], text_align, true, acc)
             acc = r.boxes
             y = y + r.height
             if r.used_w > max_used is max_used = r.used_w end
             line_idx = []
             line_x = []
             x = 0
+            lb = line_bounds(fls, y, guess_lh, inner_x, inner_w)
             i += 1
             continue
         end
+        ;; pusty wiersz, a atom nie mieści się obok floatu: zejdź poniżej floatu
+        if array_len(line_idx) == 0 && array_len(fls) > 0 && a.w > lb[1] is
+            let mut guard: int = 0
+            while guard < 20 && a.w > lb[1] is
+                let nb: int = float_next_bottom(fls, y)
+                if nb < 0 is break end
+                y = nb
+                lb = line_bounds(fls, y, guess_lh, inner_x, inner_w)
+                guard += 1
+            end
+        end
         let gap: int = if a.sp && array_len(line_idx) > 0 then a.sw else 0
-        if !nowrap && array_len(line_idx) > 0 && x + gap + a.w > inner_w && a.kind != "close" is
-            let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, inner_x, inner_w, text_align, acc)
+        if !nowrap && array_len(line_idx) > 0 && x + gap + a.w > lb[1] && a.kind != "close" is
+            let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, lb[0], lb[1], text_align, false, acc)
             acc = r.boxes
             y = y + r.height
             if r.used_w > max_used is max_used = r.used_w end
             line_idx = []
             line_x = []
-            x = 0
+            lb = line_bounds(fls, y, guess_lh, inner_x, inner_w)
             line_idx = array_push(line_idx, i)
             line_x = array_push(line_x, 0)
             x = a.w
@@ -730,7 +1067,7 @@ fn flow_inline(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: int
         i += 1
     end
     if array_len(line_idx) > 0 is
-        let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, inner_x, inner_w, text_align, acc)
+        let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, lb[0], lb[1], text_align, true, acc)
         acc = r.boxes
         y = y + r.height
         if r.used_w > max_used is max_used = r.used_w end
@@ -752,20 +1089,88 @@ fn flow_inline(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: int
 end
 
 ;; ---------- blok ----------
-fn li_marker(cx: LayoutCtx, id: int) -> string is
+fn roman_of(n0: int, upper: bool) -> string is
+    let vals: [int] = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+    let syms: [string] = ["m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i"]
+    let mut n: int = n0
+    let mut out: string = ""
+    if n <= 0 || n >= 4000 is return to_string(n0) end
+    let mut i: int = 0
+    while i < array_len(vals) is
+        while n >= vals[i] is
+            out = out + syms[i]
+            n -= vals[i]
+        end
+        i += 1
+    end
+    return if upper then string_upper(out) else out
+end
+
+fn alpha_of(n0: int, upper: bool) -> string is
+    if n0 <= 0 is return to_string(n0) end
+    let letters: string = "abcdefghijklmnopqrstuvwxyz"
+    let mut n: int = n0
+    let mut out: string = ""
+    while n > 0 is
+        n -= 1
+        out = string_slice(letters, n % 26, n % 26 + 1) + out
+        n = n / 26
+    end
+    return if upper then string_upper(out) else out
+end
+
+fn greek_of(n0: int) -> string is
+    let letters: [string] = ["α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "ι", "κ", "λ", "μ", "ν", "ξ", "ο", "π", "ρ", "σ", "τ", "υ", "φ", "χ", "ψ", "ω"]
+    if n0 <= 0 || n0 > 24 is return to_string(n0) end
+    return letters[n0 - 1]
+end
+
+;; Numer elementu listy (od 1), z obsługą ol[start] i ol[reversed].
+fn li_index(cx: LayoutCtx, id: int) -> int is
     let n: dom::DomNode = cx.dom.nodes[id]
-    if n.parent < 0 is return "•" end
+    if n.parent < 0 is return 1 end
     let parent: dom::DomNode = cx.dom.nodes[n.parent]
-    if parent.tag != "ol" is return "•" end
     let mut idx: int = 0
+    let mut count: int = 0
+    let mut mine: int = 0
     let mut i: int = 0
     while i < array_len(parent.children) is
         let c: dom::DomNode = cx.dom.nodes[parent.children[i]]
-        if c.tag == "li" && !c.removed is idx += 1 end
-        if parent.children[i] == id is return to_string(idx) + "." end
+        if c.tag == "li" && !c.removed is
+            count += 1
+            if parent.children[i] == id is mine = count end
+        end
         i += 1
     end
-    return "•"
+    let start_attr: string = dom::get_attr(parent, "start")
+    let reversed: bool = dom::has_attr(parent, "reversed")
+    let first: int = if start_attr != "" then str_to_int(start_attr) elsif reversed then count else 1
+    idx = if reversed then first - (mine - 1) else first + (mine - 1)
+    let own: string = dom::get_attr(n, "value")
+    if own != "" is idx = str_to_int(own) end
+    return idx
+end
+
+fn li_marker(cx: LayoutCtx, id: int) -> string is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    let st: style::ComputedStyle = cx.styles[id]
+    let mut kind: string = st.list_style
+    if kind == "" is
+        kind = "disc"
+        if n.parent >= 0 && cx.dom.nodes[n.parent].tag == "ol" is kind = "decimal" end
+    end
+    if kind == "none" is return "" end
+    if kind == "disc" is return "•" end
+    if kind == "circle" is return "◦" end
+    if kind == "square" is return "▪" end
+    let idx: int = li_index(cx, id)
+    if kind == "decimal-leading-zero" is return (if idx >= 0 && idx < 10 then "0" else "") + to_string(idx) + "." end
+    if kind == "lower-alpha" || kind == "lower-latin" is return alpha_of(idx, false) + "." end
+    if kind == "upper-alpha" || kind == "upper-latin" is return alpha_of(idx, true) + "." end
+    if kind == "lower-roman" is return roman_of(idx, false) + "." end
+    if kind == "upper-roman" is return roman_of(idx, true) + "." end
+    if kind == "lower-greek" is return greek_of(idx) + "." end
+    return to_string(idx) + "."
 end
 
 fn scroll_offset(cx: LayoutCtx, id: int) -> int is
@@ -781,10 +1186,14 @@ end
 fn layout_flow(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, boxes: [LayoutBox]) -> InlineRes is
     let n: dom::DomNode = cx.dom.nodes[id]
     let st: style::ComputedStyle = cx.styles[id]
+    let bfc: bool = id == 0 || is_bfc_root(st)
+    let mut fls: [int] = if bfc then [] else cx.floats
+    let mut cxf: LayoutCtx = if bfc && array_len(cx.floats) > 0 then with_floats(cx, []) else cx
     let mut acc: [LayoutBox] = boxes
     let mut cursor: int = y
     let mut pending_mb: int = 0
     let mut first_block: bool = true
+    let mut first_run: bool = true
     let mut run: [int] = []
     let mut max_used: int = 0
     let mut i: int = 0
@@ -802,15 +1211,73 @@ fn layout_flow(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
         if array_len(run) > 0 is
             cursor = cursor + pending_mb
             pending_mb = 0
-            let r: InlineRes = flow_inline(cx, run, id, x, cursor, w, st.text_align, acc)
+            let indent: int = if first_run then st.text_indent + marker_indent(cx, id) else 0
+            let r: InlineRes = flow_inline_f(cxf, run, id, x, cursor, w, align_spec(st), acc, fls, indent)
             acc = r.boxes
             cursor = cursor + r.height
             if r.used_w > max_used is max_used = r.used_w end
             run = []
             first_block = false
+            first_run = false
         end
         if at_end is break end
-        let res: BlockRes = layout_block(cx, cid, x, cursor, w, inner_h, -1, false)
+        let cst: style::ComputedStyle = cx.styles[cid]
+        ;; ----- float -----
+        if cx.dom.nodes[cid].tag != "text" && is_float(cst) is
+            let fy: int = cursor + pending_mb
+            let res: BlockRes = layout_block(cxf, cid, x, fy, w, inner_h, -1, true)
+            let tw: int = res.w + res.ml + res.mr
+            let th: int = res.h + res.mt + res.mb
+            let mut py: int = fy
+            let cc: int = clear_side_code(cst)
+            if cc >= 0 is
+                let fb: int = float_bottom(fls, cc)
+                if fb > py is py = fb end
+            end
+            let to_right: bool = cst.float_side == "right"
+            let mut fx: int = x
+            let mut tries: int = 0
+            let mut placed_ok: bool = false
+            while tries < 40 && !placed_ok is
+                let band: [int] = float_bounds(fls, py, py + th, x, x + w)
+                if band[1] - band[0] >= tw || band[2] == 0 is
+                    fx = if to_right then band[1] - tw else band[0]
+                    placed_ok = true
+                else is
+                    let nb: int = float_next_bottom(fls, py)
+                    if nb < 0 is
+                        fx = if to_right then band[1] - tw else band[0]
+                        placed_ok = true
+                    else is
+                        py = nb
+                    end
+                end
+                tries += 1
+            end
+            acc = concat_boxes(acc, shift_boxes(res.boxes, fx - x, py - fy))
+            fls = array_push(array_push(array_push(array_push(array_push(fls, if to_right then 1 else 0), py), py + th), fx), fx + tw)
+            cxf = with_floats(cx, fls)
+            if tw > max_used is max_used = tw end
+            continue
+        end
+        ;; ----- clear -----
+        let cc2: int = clear_side_code(cst)
+        if cc2 >= 0 && array_len(fls) > 0 is
+            let fb2: int = float_bottom(fls, cc2)
+            if fb2 > cursor + pending_mb is
+                cursor = fb2
+                pending_mb = 0
+            end
+        end
+        ;; ----- blok w przepływie (BFC omija floaty) -----
+        let mut bx: int = x
+        let mut bw: int = w
+        if array_len(fls) > 0 && is_bfc_root(cst) is
+            let band: [int] = float_bounds(fls, cursor + pending_mb, cursor + pending_mb + 1, x, x + w)
+            bx = band[0]
+            bw = band[1] - band[0]
+        end
+        let res: BlockRes = layout_block(cxf, cid, bx, cursor, bw, inner_h, -1, false)
         let want: int = collapse_margin(pending_mb, res.mt)
         let delta: int = want - res.mt
         let placed: [LayoutBox] = shift_boxes(res.boxes, 0, delta)
@@ -819,9 +1286,23 @@ fn layout_flow(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
         pending_mb = res.mb
         if res.w + res.ml + res.mr > max_used is max_used = res.w + res.ml + res.mr end
         first_block = false
+        first_run = false
     end
     cursor = cursor + pending_mb
+    if bfc && array_len(fls) > 0 is
+        let fb3: int = float_bottom(fls, 2)
+        if fb3 > cursor is cursor = fb3 end
+    end
     return InlineRes { boxes: acc, height: cursor - y, used_w: max_used }
+end
+
+;; Dodatkowe wcięcie pierwszego wiersza dla `list-style-position: inside`.
+fn marker_indent(cx: LayoutCtx, id: int) -> int is
+    let st: style::ComputedStyle = cx.styles[id]
+    if st.display != "list-item" || st.list_pos != "inside" is return 0 end
+    let marker: string = li_marker(cx, id)
+    if marker == "" is return 0 end
+    return text_w(cx, marker, st) + 6
 end
 
 struct FItem is
@@ -927,7 +1408,7 @@ end
 ;; Układa element tekstowy będący bezpośrednim dzieckiem kontenera flex/grid.
 fn layout_text_item(cx: LayoutCtx, tid: int, owner: int, w: int) -> BlockRes is
     let ost: style::ComputedStyle = cx.styles[owner]
-    let r: InlineRes = flow_inline(cx, [tid], owner, 0, 0, w, ost.text_align, [])
+    let r: InlineRes = flow_inline(cx, [tid], owner, 0, 0, w, align_spec(ost), [])
     return BlockRes { boxes: r.boxes, w: r.used_w, h: r.height, mt: 0, mb: 0, ml: 0, mr: 0 }
 end
 
@@ -968,8 +1449,10 @@ fn layout_flex(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
         end
         let nlines: int = array_len(line_start)
         let mut cursor_y: int = y
+        let mut line_acc: [int] = []
         let mut li: int = 0
         while li < nlines is
+            line_acc = array_push(line_acc, array_len(acc))
             let from: int = line_start[li]
             let to: int = if li + 1 < nlines then line_start[li + 1] else count
             ;; rozmiary główne w linii
@@ -1069,6 +1552,42 @@ fn layout_flex(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
             end
             cursor_y = cursor_y + line_cross + (if li + 1 < nlines then cross_gap else 0)
             li += 1
+        end
+        ;; align-content: rozdział wolnego miejsca w osi poprzecznej (tylko przy wysokości kontenera)
+        let ac: string = st.align_content
+        if st.flex_wrap && inner_h > 0 && inner_h > cursor_y - y && ac != "normal" && ac != "stretch" && ac != "flex-start" && ac != "start" is
+            let spare: int = inner_h - (cursor_y - y)
+            let mut shifted: [LayoutBox] = []
+            let mut gi: int = 0
+            while gi < array_len(acc) is
+                let mut line_no: int = 0
+                let mut q: int = 0
+                while q < nlines is
+                    if gi >= line_acc[q] is line_no = q end
+                    q += 1
+                end
+                let mut off: int = 0
+                if ac == "center" is
+                    off = spare / 2
+                elsif ac == "flex-end" || ac == "end" is
+                    off = spare
+                elsif ac == "space-between" && nlines > 1 is
+                    off = spare * line_no / (nlines - 1)
+                elsif ac == "space-around" is
+                    off = spare / nlines / 2 + spare * line_no / nlines
+                elsif ac == "space-evenly" is
+                    off = spare * (line_no + 1) / (nlines + 1)
+                end
+                let mut moved: LayoutBox = acc[gi]
+                if gi >= line_acc[0] is
+                    moved.y = moved.y + off
+                    if moved.has_clip is moved.cy = moved.cy + off end
+                end
+                shifted = array_push(shifted, moved)
+                gi += 1
+            end
+            acc = shifted
+            cursor_y = y + inner_h
         end
         return InlineRes { boxes: acc, height: cursor_y - y, used_w: w }
     end
@@ -1216,23 +1735,300 @@ fn conv_milli(s: string) -> int is
     return whole + str_to_int(string_slice(frac_raw, 0, 3))
 end
 
+;; =====================================================================
+;; 0.3: grid — obszary, linie, auto-placement, spany w obu osiach
+;; =====================================================================
+;; Prostokąt nazwanego obszaru: [wiersz0, kol0, wiersz1(wył.), kol1(wył.)]; [] gdy brak.
+fn area_rect(areas: string, name: string) -> [int] is
+    if areas == "" || name == "" is return [] end
+    let rows: [string] = string_split(areas, "\u0001")
+    let mut r0: int = 100000
+    let mut c0: int = 100000
+    let mut r1: int = -1
+    let mut c1: int = -1
+    let mut r: int = 0
+    while r < array_len(rows) is
+        let names: [string] = cssval::split_top(rows[r])
+        let mut c: int = 0
+        while c < array_len(names) is
+            if names[c] == name is
+                if r < r0 is r0 = r end
+                if c < c0 is c0 = c end
+                if r > r1 is r1 = r end
+                if c > c1 is c1 = c end
+            end
+            c += 1
+        end
+        r += 1
+    end
+    if r1 < 0 is return [] end
+    return [r0, c0, r1 + 1, c1 + 1]
+end
+
+fn area_cols(areas: string) -> int is
+    if areas == "" is return 0 end
+    let rows: [string] = string_split(areas, "\u0001")
+    let mut best: int = 0
+    let mut r: int = 0
+    while r < array_len(rows) is
+        let n: int = array_len(cssval::split_top(rows[r]))
+        if n > best is best = n end
+        r += 1
+    end
+    return best
+end
+
+fn count_area_rows(areas: string) -> int is
+    let parts: [string] = string_split(areas, "\u0001")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if string_trim(parts[i]) != "" is n += 1 end
+        i += 1
+    end
+    return if n < 1 then 1 else n
+end
+
+fn grid_free(occ: [bool], ncols: int, r: int, c: int, rs: int, cs: int) -> bool is
+    let mut dr: int = 0
+    while dr < rs is
+        let mut dc: int = 0
+        while dc < cs is
+            if occ[(r + dr) * ncols + c + dc] is return false end
+            dc += 1
+        end
+        dr += 1
+    end
+    return true
+end
+
+fn grid_mark(occ: [bool], ncols: int, r: int, c: int, rs: int, cs: int) -> [bool] is
+    let mut out: [bool] = occ
+    let mut dr: int = 0
+    while dr < rs is
+        let mut dc: int = 0
+        while dc < cs is
+            out[(r + dr) * ncols + c + dc] = true
+            dc += 1
+        end
+        dr += 1
+    end
+    return out
+end
+
+fn justify_kw(st: style::ComputedStyle, container: style::ComputedStyle) -> string is
+    if st.justify_self != "" is return st.justify_self end
+    return container.justify_items
+end
+
 fn layout_grid(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox]) -> InlineRes is
     let st: style::ComputedStyle = cx.styles[id]
     let items: [FItem] = flex_items(cx, id, true, "stretch", w)
     let count: int = array_len(items)
     if count == 0 is return InlineRes { boxes: boxes, height: 0, used_w: 0 } end
     let mut tracks: [Track] = parse_tracks(st.grid_cols, w, st.gap)
-    if array_len(tracks) == 0 is tracks = array_push(tracks, Track { kind: "fr", val: 1000 }) end
-    let ncols: int = array_len(tracks)
-    ;; szerokości kolumn
+    if array_len(tracks) == 0 && string_find(st.grid_auto_flow, "column") < 0 is
+        let ac: int = area_cols(st.grid_areas)
+        let mut k: int = 0
+        while k < (if ac > 0 then ac else 1) is
+            tracks = array_push(tracks, Track { kind: "fr", val: 1000 })
+            k += 1
+        end
+    end
+    let colflow: bool = string_find(st.grid_auto_flow, "column") >= 0
+    let explicit_cols: int = array_len(tracks)
+    let row_tpl: [Track] = parse_tracks(st.grid_rows, 100000, st.row_gap)
+    let nr_exp: int = if array_len(row_tpl) > 0 then array_len(row_tpl) elsif area_cols(st.grid_areas) > 0 then count_area_rows(st.grid_areas) else 1
+    let mut ncols: int = array_len(tracks)
+    if colflow && count > ncols is ncols = count end
+    ;; ----- umieszczanie elementów -----
+    let max_rows: int = count * 4 + 64
+    let mut occ: [bool] = []
+    let mut oi: int = 0
+    while oi < max_rows * ncols is
+        occ = array_push(occ, false)
+        oi += 1
+    end
+    let mut pr: [int] = []
+    let mut pc: [int] = []
+    let mut prs: [int] = []
+    let mut pcs: [int] = []
+    let mut placed: [bool] = []
+    let mut i: int = 0
+    while i < count is
+        pr = array_push(pr, 0)
+        pc = array_push(pc, 0)
+        prs = array_push(prs, 1)
+        pcs = array_push(pcs, 1)
+        placed = array_push(placed, false)
+        i += 1
+    end
+    ;; przebieg 1: obszary nazwane i jawne współrzędne
+    i = 0
+    while i < count is
+        let it: FItem = items[i]
+        if !it.is_text is
+            let ist: style::ComputedStyle = cx.styles[it.id]
+            let ar: [int] = if ist.grid_area != "" then area_rect(st.grid_areas, ist.grid_area) else []
+            if array_len(ar) == 4 && ar[1] < ncols is
+                pr[i] = ar[0]
+                pc[i] = ar[1]
+                prs[i] = ar[2] - ar[0]
+                pcs[i] = if ar[3] - ar[1] > ncols - ar[1] then ncols - ar[1] else ar[3] - ar[1]
+                placed[i] = true
+            elsif ist.grid_row_start > 0 && ist.grid_col_start > 0 && ist.grid_col_start <= ncols is
+                pr[i] = ist.grid_row_start - 1
+                pc[i] = ist.grid_col_start - 1
+                prs[i] = ist.grid_row_span
+                pcs[i] = if ist.grid_col_span > ncols - pc[i] then ncols - pc[i] else ist.grid_col_span
+                placed[i] = true
+            end
+            if placed[i] is
+                if pr[i] + prs[i] > max_rows - 1 is prs[i] = max_rows - 1 - pr[i] end
+                occ = grid_mark(occ, ncols, pr[i], pc[i], prs[i], pcs[i])
+            end
+        end
+        i += 1
+    end
+    ;; przebieg 2: auto-placement
+    let dense: bool = string_find(st.grid_auto_flow, "dense") >= 0
+    if colflow is
+        let mut cur_c2: int = 0
+        let mut cur_r2: int = 0
+        let mut ci: int = 0
+        while ci < count is
+            if placed[ci] is
+                ci += 1
+                continue
+            end
+            let cit: FItem = items[ci]
+            let cst: style::ComputedStyle = cx.styles[cit.id]
+            let mut ccs: int = if cit.is_text then 1 else cst.grid_col_span
+            let mut crs: int = if cit.is_text then 1 else cst.grid_row_span
+            if ccs < 1 is ccs = 1 end
+            if crs < 1 is crs = 1 end
+            if crs > nr_exp is crs = nr_exp end
+            let mut c2: int = if dense then 0 else cur_c2
+            let mut found2: bool = false
+            while c2 + ccs <= ncols && !found2 is
+                let mut r2: int = if c2 == cur_c2 && !dense then cur_r2 else 0
+                while r2 + crs <= nr_exp && !found2 is
+                    if grid_free(occ, ncols, r2, c2, crs, ccs) is
+                        pr[ci] = r2
+                        pc[ci] = c2
+                        prs[ci] = crs
+                        pcs[ci] = ccs
+                        found2 = true
+                    else is
+                        r2 += 1
+                    end
+                end
+                if !found2 is c2 += 1 end
+            end
+            if !found2 is
+                pr[ci] = 0
+                pc[ci] = ncols - ccs
+                prs[ci] = crs
+                pcs[ci] = ccs
+            end
+            occ = grid_mark(occ, ncols, pr[ci], pc[ci], prs[ci], pcs[ci])
+            if !dense is
+                cur_c2 = pc[ci]
+                cur_r2 = pr[ci] + prs[ci]
+                if cur_r2 >= nr_exp is
+                    cur_r2 = 0
+                    cur_c2 += 1
+                end
+            end
+            ci += 1
+        end
+        ;; kolumny niejawne wg grid-auto-columns
+        let mut used: int = explicit_cols
+        let mut ui: int = 0
+        while ui < count is
+            if pc[ui] + pcs[ui] > used is used = pc[ui] + pcs[ui] end
+            ui += 1
+        end
+        let auto_t: [Track] = if st.grid_auto_cols != "" then parse_tracks(st.grid_auto_cols, w, st.gap) else []
+        let tpl: Track = if array_len(auto_t) > 0 then auto_t[0] else Track { kind: "auto", val: 0 }
+        while array_len(tracks) < used is
+            tracks = array_push(tracks, tpl)
+        end
+        ncols = used
+    else is
+    let mut cur_r: int = 0
+    let mut cur_c: int = 0
+    i = 0
+    while i < count is
+        if placed[i] is
+            i += 1
+            continue
+        end
+        let it: FItem = items[i]
+        let ist: style::ComputedStyle = cx.styles[it.id]
+        let mut cs: int = if it.is_text then 1 else ist.grid_col_span
+        let mut rs: int = if it.is_text then 1 else ist.grid_row_span
+        if cs > ncols is cs = ncols end
+        if cs < 1 is cs = 1 end
+        if rs < 1 is rs = 1 end
+        let fixed_col: int = if it.is_text then 0 else ist.grid_col_start
+        let fixed_row: int = if it.is_text then 0 else ist.grid_row_start
+        let mut r: int = if dense then 0 else cur_r
+        let mut found: bool = false
+        while r < max_rows - rs - 1 && !found is
+            let mut c: int = 0
+            if fixed_col > 0 is
+                c = fixed_col - 1
+            elsif r == cur_r && !dense is
+                c = cur_c
+            end
+            if fixed_row > 0 && r != fixed_row - 1 is
+                r = fixed_row - 1
+                c = 0
+                if fixed_col > 0 is c = fixed_col - 1 end
+            end
+            let c_end: int = if fixed_col > 0 then fixed_col else ncols - cs + 1
+            while c < c_end && c + cs <= ncols && !found is
+                if grid_free(occ, ncols, r, c, rs, cs) is
+                    pr[i] = r
+                    pc[i] = c
+                    prs[i] = rs
+                    pcs[i] = cs
+                    found = true
+                else is
+                    c += 1
+                end
+            end
+            if !found is
+                if fixed_row > 0 is break end
+                r += 1
+            end
+        end
+        if !found is
+            pr[i] = max_rows - rs - 2
+            pc[i] = 0
+            prs[i] = rs
+            pcs[i] = cs
+        end
+        occ = grid_mark(occ, ncols, pr[i], pc[i], prs[i], pcs[i])
+        if !dense is
+            cur_r = pr[i]
+            cur_c = pc[i] + pcs[i]
+            if cur_c >= ncols is
+                cur_c = 0
+                cur_r += 1
+            end
+        end
+        i += 1
+    end
+    end
+    ;; ----- szerokości kolumn -----
     let mut fixed: int = st.gap * (ncols - 1)
     let mut fr_sum: int = 0
-    let mut auto_cols: int = 0
-    let mut i: int = 0
+    i = 0
     while i < ncols is
         if tracks[i].kind == "px" is fixed = fixed + tracks[i].val end
         if tracks[i].kind == "fr" is fr_sum = fr_sum + tracks[i].val end
-        if tracks[i].kind == "auto" is auto_cols += 1 end
         i += 1
     end
     let mut col_w: [int] = []
@@ -1242,13 +2038,14 @@ fn layout_grid(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox
         if tracks[i].kind == "px" is
             cw = tracks[i].val
         elsif tracks[i].kind == "auto" is
-            ;; max-content elementów w tej kolumnie (placement po kolei)
-            let mut j: int = i
+            let mut j: int = 0
             while j < count is
-                let it: FItem = items[j]
-                let mc: int = if it.is_text then it.basis else max_content(cx, it.id, 0) + it.ml + it.mr
-                if mc > cw is cw = mc end
-                j += ncols
+                if pc[j] == i && pcs[j] == 1 is
+                    let it: FItem = items[j]
+                    let mc: int = if it.is_text then it.basis else max_content(cx, it.id, 0) + it.ml + it.mr
+                    if mc > cw is cw = mc end
+                end
+                j += 1
             end
             fixed = fixed + cw
         end
@@ -1263,70 +2060,760 @@ fn layout_grid(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox
         end
         i += 1
     end
-    let row_tracks: [Track] = parse_tracks(st.grid_rows, 100000, st.row_gap)
-    let mut acc: [LayoutBox] = boxes
-    let mut cursor_y: int = y
-    let mut idx: int = 0
-    let mut row_i: int = 0
-    while idx < count is
-        ;; jedna linia siatki: dobierz elementy do wypełnienia kolumn (z uwzględnieniem span)
-        let mut col: int = 0
-        let mut cells: [BlockRes] = []
-        let mut cell_x: [int] = []
-        let mut cell_item: [int] = []
-        let mut cell_w: [int] = []
-        let mut row_h: int = 0
-        while idx < count && col < ncols is
-            let it: FItem = items[idx]
-            let span_raw: int = if it.is_text then 1 else cx.styles[it.id].grid_col_span
-            let span: int = if span_raw > ncols - col then ncols - col else span_raw
-            let mut cw: int = 0
-            let mut cx_off: int = 0
-            let mut c: int = 0
-            while c < col is
-                cx_off = cx_off + col_w[c] + st.gap
-                c += 1
-            end
-            c = col
-            while c < col + span is
-                cw = cw + col_w[c] + (if c > col then st.gap else 0)
-                c += 1
-            end
-            let r: BlockRes = layout_item(cx, it, id, cw - it.ml - it.mr, w, -1, false)
-            cells = array_push(cells, r)
-            cell_x = array_push(cell_x, cx_off)
-            cell_item = array_push(cell_item, idx)
-            cell_w = array_push(cell_w, cw)
-            let oh: int = r.h + it.mt + it.mb
-            if oh > row_h is row_h = oh end
-            col = col + span
-            idx += 1
-        end
-        if row_i < array_len(row_tracks) && row_tracks[row_i].kind == "px" is row_h = row_tracks[row_i].val end
-        let mut k: int = 0
-        while k < array_len(cells) is
-            let it: FItem = items[cell_item[k]]
-            let r: BlockRes = cells[k]
-            let mut bx: [LayoutBox] = r.boxes
-            let mut dy: int = 0
-            let oh: int = r.h + it.mt + it.mb
-            if it.align == "center" is
-                dy = (row_h - oh) / 2
-            elsif it.align == "flex-end" is
-                dy = row_h - oh
-            elsif it.align == "stretch" && !it.is_text && cx.styles[it.id].height_mode == "auto" && array_len(bx) > 0 is
-                bx[0].h = row_h - it.mt - it.mb
-            end
-            acc = concat_boxes(acc, shift_boxes(bx, x + cell_x[k] + it.ml, cursor_y + dy))
-            k += 1
-        end
-        cursor_y = cursor_y + row_h + (if idx < count then st.row_gap else 0)
-        row_i += 1
+    let mut col_x: [int] = []
+    let mut run_x: int = 0
+    i = 0
+    while i < ncols is
+        col_x = array_push(col_x, run_x)
+        run_x = run_x + col_w[i] + st.gap
+        i += 1
     end
-    return InlineRes { boxes: acc, height: cursor_y - y, used_w: w }
+    ;; ----- wysokości wierszy -----
+    let mut nrows: int = 0
+    i = 0
+    while i < count is
+        if pr[i] + prs[i] > nrows is nrows = pr[i] + prs[i] end
+        i += 1
+    end
+    let row_tracks: [Track] = parse_tracks(st.grid_rows, 100000, st.row_gap)
+    let auto_rows: [Track] = if st.grid_auto_rows != "" then parse_tracks(st.grid_auto_rows, 100000, st.row_gap) else []
+    let mut row_h: [int] = []
+    let mut row_fixed: [bool] = []
+    i = 0
+    while i < nrows is
+        let mut tr: Track = Track { kind: "auto", val: 0 }
+        if i < array_len(row_tracks) is
+            tr = row_tracks[i]
+        elsif array_len(auto_rows) > 0 is
+            tr = auto_rows[0]
+        end
+        row_h = array_push(row_h, if tr.kind == "px" then tr.val else 0)
+        row_fixed = array_push(row_fixed, tr.kind == "px")
+        i += 1
+    end
+    let mut results: [BlockRes] = []
+    let mut widths: [int] = []
+    i = 0
+    while i < count is
+        let it: FItem = items[i]
+        let mut cw: int = st.gap * (pcs[i] - 1)
+        let mut d: int = 0
+        while d < pcs[i] is
+            cw += col_w[pc[i] + d]
+            d += 1
+        end
+        widths = array_push(widths, cw)
+        let jk: string = if it.is_text then "" else justify_kw(cx.styles[it.id], st)
+        let stretch: bool = jk == "" || jk == "stretch"
+        let mut r: BlockRes = layout_item(cx, it, id, cw - it.ml - it.mr, w, -1, false)
+        if !stretch is r = layout_item(cx, it, id, -1, cw - it.ml - it.mr, -1, true) end
+        results = array_push(results, r)
+        let oh: int = r.h + it.mt + it.mb
+        if prs[i] == 1 && !row_fixed[pr[i]] && oh > row_h[pr[i]] is row_h[pr[i]] = oh end
+        i += 1
+    end
+    i = 0
+    while i < count is
+        if prs[i] > 1 is
+            let it: FItem = items[i]
+            let r: BlockRes = results[i]
+            let mut have: int = st.row_gap * (prs[i] - 1)
+            let mut d: int = 0
+            while d < prs[i] is
+                have += row_h[pr[i] + d]
+                d += 1
+            end
+            let need: int = r.h + it.mt + it.mb
+            let last: int = pr[i] + prs[i] - 1
+            if need > have && !row_fixed[last] is row_h[last] = row_h[last] + (need - have) end
+        end
+        i += 1
+    end
+    let mut row_y: [int] = []
+    let mut run_y: int = 0
+    i = 0
+    while i < nrows is
+        row_y = array_push(row_y, run_y)
+        run_y = run_y + row_h[i] + st.row_gap
+        i += 1
+    end
+    let total_h: int = if nrows > 0 then run_y - st.row_gap else 0
+    ;; ----- ustawienie elementów -----
+    let mut acc: [LayoutBox] = boxes
+    i = 0
+    while i < count is
+        let it: FItem = items[i]
+        let r: BlockRes = results[i]
+        let mut cell_h: int = st.row_gap * (prs[i] - 1)
+        let mut d: int = 0
+        while d < prs[i] is
+            cell_h += row_h[pr[i] + d]
+            d += 1
+        end
+        let mut bx: [LayoutBox] = r.boxes
+        let oh: int = r.h + it.mt + it.mb
+        let mut dy: int = 0
+        let mut dx: int = 0
+        if it.align == "center" is
+            dy = (cell_h - oh) / 2
+        elsif it.align == "flex-end" is
+            dy = cell_h - oh
+        elsif it.align == "stretch" && !it.is_text && cx.styles[it.id].height_mode == "auto" && array_len(bx) > 0 is
+            bx[0].h = cell_h - it.mt - it.mb
+        end
+        if !it.is_text is
+            let jk: string = justify_kw(cx.styles[it.id], st)
+            let free: int = widths[i] - it.ml - it.mr - r.w
+            if free > 0 is
+                if jk == "center" is dx = free / 2 end
+                if jk == "flex-end" is dx = free end
+            end
+        end
+        acc = concat_boxes(acc, shift_boxes(bx, x + col_x[pc[i]] + it.ml + dx, y + row_y[pr[i]] + dy))
+        i += 1
+    end
+    return InlineRes { boxes: acc, height: total_h, used_w: w }
 end
 
 ;; ---------- główny układ bloku ----------
+
+;; =====================================================================
+;; 0.3: układ tabel (display: table / table-row / table-cell)
+;; =====================================================================
+struct TCell is
+    pub id:  int
+    pub row: int
+    pub col: int
+    pub cs:  int
+    pub rs:  int
+end
+
+struct TGrid is
+    pub cells: [TCell]
+    pub rows:  [int]     ;; id węzłów wierszy (nagłówek, ciało, stopka)
+    pub ncols: int
+    pub caption: int
+end
+
+fn attr_span(cx: LayoutCtx, id: int, name: string) -> int is
+    let v: string = dom::get_attr(cx.dom.nodes[id], name)
+    if v == "" is return 1 end
+    let n: int = str_to_int(v)
+    if n < 1 is return 1 end
+    if n > 64 is return 64 end
+    return n
+end
+
+fn push_rows_of(cx: LayoutCtx, parent: int, rows: [int]) -> [int] is
+    let mut out: [int] = rows
+    let kids: [int] = cx.dom.nodes[parent].children
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let k: int = kids[i]
+        i += 1
+        if !is_rendered(cx, k) || cx.dom.nodes[k].tag == "text" is continue end
+        if cx.styles[k].display == "table-row" is out = array_push(out, k) end
+    end
+    return out
+end
+
+fn table_grid(cx: LayoutCtx, id: int) -> TGrid is
+    let kids: [int] = cx.dom.nodes[id].children
+    let mut head: [int] = []
+    let mut body: [int] = []
+    let mut foot: [int] = []
+    let mut caption: int = -1
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let k: int = kids[i]
+        i += 1
+        if !is_rendered(cx, k) || cx.dom.nodes[k].tag == "text" is continue end
+        let d: string = cx.styles[k].display
+        if d == "table-row" is
+            body = array_push(body, k)
+        elsif d == "table-header-group" is
+            head = push_rows_of(cx, k, head)
+        elsif d == "table-row-group" is
+            body = push_rows_of(cx, k, body)
+        elsif d == "table-footer-group" is
+            foot = push_rows_of(cx, k, foot)
+        elsif cx.dom.nodes[k].tag == "caption" && caption < 0 is
+            caption = k
+        end
+    end
+    let mut rows: [int] = head
+    i = 0
+    while i < array_len(body) is
+        rows = array_push(rows, body[i])
+        i += 1
+    end
+    i = 0
+    while i < array_len(foot) is
+        rows = array_push(rows, foot[i])
+        i += 1
+    end
+    let nrows: int = array_len(rows)
+    let maxc: int = 64
+    let mut occ: [bool] = []
+    i = 0
+    while i < (nrows + 70) * maxc is
+        occ = array_push(occ, false)
+        i += 1
+    end
+    let mut cells: [TCell] = []
+    let mut ncols: int = 0
+    let mut r: int = 0
+    while r < nrows is
+        let rk: [int] = cx.dom.nodes[rows[r]].children
+        let mut c: int = 0
+        let mut j: int = 0
+        while j < array_len(rk) is
+            let cid: int = rk[j]
+            j += 1
+            if !is_rendered(cx, cid) || cx.dom.nodes[cid].tag == "text" is continue end
+            if cx.styles[cid].display != "table-cell" is continue end
+            while c < maxc - 1 && occ[r * maxc + c] is c += 1 end
+            let cs: int = attr_span(cx, cid, "colspan")
+            let mut rs: int = attr_span(cx, cid, "rowspan")
+            if r + rs > nrows is rs = nrows - r end
+            if c + cs > maxc is cs = maxc - c end
+            let mut dr: int = 0
+            while dr < rs is
+                let mut dc: int = 0
+                while dc < cs is
+                    occ[(r + dr) * maxc + c + dc] = true
+                    dc += 1
+                end
+                dr += 1
+            end
+            cells = array_push(cells, TCell { id: cid, row: r, col: c, cs: cs, rs: rs })
+            if c + cs > ncols is ncols = c + cs end
+            c += cs
+        end
+        r += 1
+    end
+    return TGrid { cells: cells, rows: rows, ncols: ncols, caption: caption }
+end
+
+;; Najdłuższe słowo w poddrzewie (min-content).
+fn min_content(cx: LayoutCtx, id: int, depth: int) -> int is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    if n.removed || depth > 40 is return 0 end
+    if n.tag == "text" is
+        let st: style::ComputedStyle = cx.styles[id]
+        let words: [string] = string_split(apply_transform(n.text, st.text_transform), " ")
+        let mut best: int = 0
+        let mut i: int = 0
+        while i < array_len(words) is
+            if words[i] != "" is
+                let w: int = text_w(cx, words[i], st)
+                if w > best is best = w end
+            end
+            i += 1
+        end
+        return best
+    end
+    let st: style::ComputedStyle = cx.styles[id]
+    if st.display == "none" || is_out_of_flow(st) is return 0 end
+    let own: int = pad_border_h(st)
+    if st.width_mode == "px" is
+        return if st.border_box then st.width else st.width + own
+    end
+    if is_replaced(n.tag) is return max_content(cx, id, depth + 1) end
+    let mut best: int = 0
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let c: int = n.children[i]
+        i += 1
+        if !is_rendered(cx, c) is continue end
+        let w: int = min_content(cx, c, depth + 1)
+        if w > best is best = w end
+    end
+    return best + own
+end
+
+;; Metryki kolumn: [max_0..max_{n-1}, min_0..min_{n-1}].
+fn table_col_metrics(cx: LayoutCtx, g: TGrid, avail: int) -> [int] is
+    let nc: int = g.ncols
+    let mut mx: [int] = []
+    let mut mn: [int] = []
+    let mut i: int = 0
+    while i < nc is
+        mx = array_push(mx, 0)
+        mn = array_push(mn, 0)
+        i += 1
+    end
+    ;; najpierw komórki bez colspan
+    let mut pass: int = 0
+    while pass < 2 is
+        let mut k: int = 0
+        while k < array_len(g.cells) is
+            let c: TCell = g.cells[k]
+            k += 1
+            if (pass == 0 && c.cs != 1) || (pass == 1 && c.cs == 1) is continue end
+            let cst: style::ComputedStyle = cx.styles[c.id]
+            let mut cmax: int = max_content(cx, c.id, 0)
+            if cst.width_mode == "pct" is
+                let want: int = avail * cst.width_pct / 10000 + (if cst.border_box then 0 else pad_border_h(cst))
+                if want > cmax is cmax = want end
+            end
+            let cmin: int = min_content(cx, c.id, 0)
+            if c.cs == 1 is
+                if cmax > mx[c.col] is mx[c.col] = cmax end
+                if cmin > mn[c.col] is mn[c.col] = cmin end
+            else is
+                let mut sum_mx: int = 0
+                let mut sum_mn: int = 0
+                let mut d: int = 0
+                while d < c.cs is
+                    sum_mx += mx[c.col + d]
+                    sum_mn += mn[c.col + d]
+                    d += 1
+                end
+                if cmax > sum_mx is
+                    let extra: int = (cmax - sum_mx) / c.cs
+                    d = 0
+                    while d < c.cs is
+                        mx[c.col + d] = mx[c.col + d] + extra
+                        d += 1
+                    end
+                end
+                if cmin > sum_mn is
+                    let extra2: int = (cmin - sum_mn) / c.cs
+                    d = 0
+                    while d < c.cs is
+                        mn[c.col + d] = mn[c.col + d] + extra2
+                        d += 1
+                    end
+                end
+            end
+        end
+        pass += 1
+    end
+    let mut out: [int] = mx
+    i = 0
+    while i < nc is
+        out = array_push(out, mn[i])
+        i += 1
+    end
+    return out
+end
+
+fn table_spacing(st: style::ComputedStyle) -> int is
+    if st.border_collapse is return 0 end
+    return st.border_spacing
+end
+
+fn table_max_content(cx: LayoutCtx, id: int) -> int is
+    let st: style::ComputedStyle = cx.styles[id]
+    let g: TGrid = table_grid(cx, id)
+    if g.ncols == 0 is return pad_border_h(st) end
+    let m: [int] = table_col_metrics(cx, g, 0)
+    let mut sum: int = 0
+    let mut i: int = 0
+    while i < g.ncols is
+        sum += m[i]
+        i += 1
+    end
+    let sp: int = table_spacing(st)
+    return sum + sp * (g.ncols + 1) + pad_border_h(st)
+end
+
+fn layout_table(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox]) -> InlineRes is
+    let st: style::ComputedStyle = cx.styles[id]
+    let g: TGrid = table_grid(cx, id)
+    let mut acc: [LayoutBox] = boxes
+    let mut cursor: int = y
+    if g.caption >= 0 is
+        let cr: BlockRes = layout_block(cx, g.caption, x, cursor, w, -1, -1, false)
+        acc = concat_boxes(acc, cr.boxes)
+        cursor = cursor + cr.mt + cr.h + cr.mb
+    end
+    if g.ncols == 0 is return InlineRes { boxes: acc, height: cursor - y, used_w: 0 } end
+    let sp: int = table_spacing(st)
+    let nc: int = g.ncols
+    let nr: int = array_len(g.rows)
+    ;; nakładanie ramek w trybie collapse
+    let mut ov: int = 0
+    if st.border_collapse && array_len(g.cells) > 0 is ov = cx.styles[g.cells[0].id].bl end
+    let avail: int = w - sp * (nc + 1) + (nc - 1) * ov
+    let m: [int] = table_col_metrics(cx, g, avail)
+    let mut colw: [int] = []
+    let mut total_max: int = 0
+    let mut total_min: int = 0
+    let mut i: int = 0
+    while i < nc is
+        total_max += m[i]
+        total_min += m[nc + i]
+        i += 1
+    end
+    i = 0
+    while i < nc is
+        let cmax: int = m[i]
+        let cmin: int = m[nc + i]
+        let mut cw: int = 0
+        if st.table_fixed is
+            cw = avail / nc
+        elsif total_max <= avail is
+            cw = if total_max > 0 then cmax + (avail - total_max) * cmax / total_max else avail / nc
+        elsif total_min >= avail is
+            cw = cmin
+        else is
+            cw = cmin + (cmax - cmin) * (avail - total_min) / (total_max - total_min)
+        end
+        colw = array_push(colw, cw)
+        i += 1
+    end
+    ;; reszta z zaokrągleń trafia do ostatniej kolumny (gdy tabela nie przepełnia)
+    if total_min < avail || st.table_fixed is
+        let mut sum_cols: int = 0
+        i = 0
+        while i < nc is
+            sum_cols += colw[i]
+            i += 1
+        end
+        if sum_cols < avail && (total_max >= avail || total_max > 0 || st.table_fixed) is
+            colw[nc - 1] = colw[nc - 1] + (avail - sum_cols)
+        end
+    end
+    ;; przebieg A: układ komórek w (0,0) i wysokości wierszy
+    let mut rowh: [int] = []
+    i = 0
+    while i < nr is
+        rowh = array_push(rowh, 0)
+        i += 1
+    end
+    let mut results: [BlockRes] = []
+    let mut k: int = 0
+    while k < array_len(g.cells) is
+        let c: TCell = g.cells[k]
+        k += 1
+        let mut cwid: int = sp * (c.cs - 1)
+        let mut d: int = 0
+        while d < c.cs is
+            cwid += colw[c.col + d]
+            d += 1
+        end
+        let res: BlockRes = layout_block(cx, c.id, 0, 0, cwid, -1, cwid, false)
+        results = array_push(results, res)
+        if c.rs == 1 is
+            let hh: int = res.h + res.mt + res.mb
+            if hh > rowh[c.row] is rowh[c.row] = hh end
+        end
+    end
+    k = 0
+    while k < array_len(g.cells) is
+        let c: TCell = g.cells[k]
+        let res: BlockRes = results[k]
+        k += 1
+        if c.rs > 1 is
+            let mut have: int = sp * (c.rs - 1)
+            let mut d: int = 0
+            while d < c.rs is
+                have += rowh[c.row + d]
+                d += 1
+            end
+            let need: int = res.h + res.mt + res.mb
+            if need > have is rowh[c.row + c.rs - 1] = rowh[c.row + c.rs - 1] + (need - have) end
+        end
+    end
+    ;; pozycje kolumn i wierszy
+    let mut colx: [int] = []
+    let mut cxp: int = x + sp
+    i = 0
+    while i < nc is
+        colx = array_push(colx, cxp)
+        cxp = cxp + colw[i] + sp - ov
+        i += 1
+    end
+    let mut rowy: [int] = []
+    let mut ryp: int = cursor + sp
+    i = 0
+    while i < nr is
+        rowy = array_push(rowy, ryp)
+        ryp = ryp + rowh[i] + sp - ov
+        i += 1
+    end
+    let table_end: int = ryp + ov
+    ;; tła wierszy i grup wierszy (przed komórkami)
+    let row_w: int = cxp - x - sp + ov + 2 * sp
+    i = 0
+    while i < nr is
+        let rid: int = g.rows[i]
+        let gp: int = cx.dom.nodes[rid].parent
+        if gp >= 0 && gp != id && is_decorated(cx.styles[gp]) is
+            let mut seen: bool = false
+            let mut q: int = 0
+            while q < array_len(acc) is
+                if acc[q].node_id == gp && acc[q].kind == "box" is seen = true end
+                q += 1
+            end
+            if !seen is acc = array_push(acc, no_clip_box(gp, x, rowy[i], row_w, rowh[i], cx.styles[gp], "box")) end
+        end
+        if is_decorated(cx.styles[rid]) is
+            acc = array_push(acc, no_clip_box(rid, x, rowy[i], row_w, rowh[i], cx.styles[rid], "box"))
+        end
+        i += 1
+    end
+    ;; przebieg B: ustawienie komórek
+    k = 0
+    while k < array_len(g.cells) is
+        let c: TCell = g.cells[k]
+        let res: BlockRes = results[k]
+        k += 1
+        let mut cell_h: int = sp * (c.rs - 1)
+        let mut d: int = 0
+        while d < c.rs is
+            cell_h += rowh[c.row + d]
+            d += 1
+        end
+        let used: int = res.h + res.mt + res.mb
+        let mut placed: [LayoutBox] = res.boxes
+        let cst: style::ComputedStyle = cx.styles[c.id]
+        ;; rozciągnięcie tła komórki do wysokości wiersza
+        if array_len(placed) > 0 is placed[0].h = cell_h - res.mt - res.mb end
+        let spare: int = cell_h - used
+        if spare > 0 && array_len(placed) > 1 is
+            let shift: int = if cst.valign == "middle" then spare / 2 elsif cst.valign == "bottom" then spare else 0
+            if shift > 0 is
+                let mut inner: [LayoutBox] = []
+                let mut p: int = 1
+                while p < array_len(placed) is
+                    inner = array_push(inner, placed[p])
+                    p += 1
+                end
+                inner = shift_boxes(inner, 0, shift)
+                let mut rebuilt: [LayoutBox] = [placed[0]]
+                rebuilt = concat_boxes(rebuilt, inner)
+                placed = rebuilt
+            end
+        end
+        acc = concat_boxes(acc, shift_boxes(placed, colx[c.col] - res.ml, rowy[c.row]))
+    end
+    return InlineRes { boxes: acc, height: table_end - y, used_w: cxp - x }
+end
+
+
+;; ---------- układ wielokolumnowy (column-count / column-width / column-gap / column-rule / column-fill) ----------
+fn xlen_px(cx: LayoutCtx, st: style::ComputedStyle, val: string, dflt: int) -> int is
+    if val == "" is return dflt end
+    let low: string = string_lower(val)
+    if low == "thin" is return 1 end
+    if low == "medium" is return 3 end
+    if low == "thick" is return 5 end
+    let l: cssval::Len = cssval::parse_len(val, cssval::LenEnv { em: st.font_size, rem: 16, vw: cx.vw, vh: cx.vh })
+    if !l.ok || l.auto is return dflt end
+    return cssval::px_of(l, 0)
+end
+
+;; [liczba kolumn, szerokość kolumny, odstęp]; liczba kolumn 1 = brak wielokolumnowości.
+fn column_plan(cx: LayoutCtx, st: style::ComputedStyle, cw: int) -> [int] is
+    let cnt_s: string = props::xget(st.xp, "column-count")
+    let cnt: int = if props::is_int(cnt_s) then str_to_int(cnt_s) else 0
+    let wpx: int = xlen_px(cx, st, props::xget(st.xp, "column-width"), 0)
+    if (cnt <= 0 && wpx <= 0) || cw <= 0 is return [1, cw, 0] end
+    let gap: int = if props::xhas(st.xp, "column-gap") then st.gap else st.font_size
+    let mut n: int = cnt
+    if wpx > 0 is
+        let fit: int = (cw + gap) / (wpx + gap)
+        let f2: int = if fit < 1 then 1 else fit
+        n = if cnt > 0 && cnt < f2 then cnt else f2
+    end
+    if n < 1 is n = 1 end
+    let colw: int = (cw - (n - 1) * gap) / n
+    return [n, if colw < 1 then 1 else colw, gap]
+end
+
+fn break_avoid(st: style::ComputedStyle) -> bool is
+    let a: string = props::xget(st.xp, "break-inside")
+    let b: string = props::xget(st.xp, "page-break-inside")
+    return a == "avoid" || a == "avoid-column" || b == "avoid"
+end
+
+fn wants_col_break(st: style::ComputedStyle, which: string) -> bool is
+    let v: string = props::xget(st.xp, "break-" + which)
+    if v == "column" || v == "always" || v == "all" is return true end
+    let l: string = props::xget(st.xp, "page-break-" + which)
+    return l == "always"
+end
+
+fn rule_box(cx: LayoutCtx, id: int, st: style::ComputedStyle, x: int, y: int, w: int, h: int, c: style::Color) -> LayoutBox is
+    let mut s: style::ComputedStyle = st
+    s.has_bg = true
+    s.background = c
+    s.has_grad = false
+    s.bg_image = ""
+    s.bt = 0
+    s.br = 0
+    s.bb = 0
+    s.bl = 0
+    s.pad_top = 0
+    s.pad_right = 0
+    s.pad_bottom = 0
+    s.pad_left = 0
+    s.rad_tl = 0
+    s.rad_tr = 0
+    s.rad_br = 0
+    s.rad_bl = 0
+    s.has_shadow = false
+    s.outline_w = 0
+    s.xp = ""
+    return no_clip_box(id, x, y, w, h, s, "box")
+end
+
+;; Rozkłada gotowy przepływ (szerokość jednej kolumny) na `n` kolumn. Wiersze tekstu trafiają do kolumny wg y,
+;; pudełka przecinające granicę są dzielone (box-decoration-break: slice lub clone).
+fn split_columns(cx: LayoutCtx, id: int, st: style::ComputedStyle, flow: InlineRes, x0: int, y0: int, plan: [int], fixed_h: int) -> InlineRes is
+    let n: int = plan[0]
+    let colw: int = plan[1]
+    let gap: int = plan[2]
+    let total: int = flow.height
+    let lh: int = if line_h_of(st) > 0 then line_h_of(st) else 1
+    let fill_auto: bool = props::xget(st.xp, "column-fill") == "auto" && fixed_h > 0
+    let mut th: int = if fill_auto then fixed_h else (total + n - 1) / n
+    if th < 1 is th = 1 end
+    if !fill_auto is
+        ;; zaokrąglij do wielokrotności wysokości wiersza tylko, gdy bez tego jakiś wiersz tekstu przecinałby granicę kolumny
+        let mut straddle: bool = false
+        let mut q: int = 0
+        while q < array_len(flow.boxes) is
+            let tb: LayoutBox = flow.boxes[q]
+            q += 1
+            if tb.kind == "text" && tb.h > 0 is
+                let r0: int = tb.y - y0
+                if r0 / th != (r0 + tb.h - 1) / th is straddle = true end
+            end
+        end
+        if straddle is th = ((th + lh - 1) / lh) * lh end
+    end
+    let clone: bool = props::xget(st.xp, "box-decoration-break") == "clone"
+    let mut out: [LayoutBox] = []
+    let mut push: int = 0
+    let mut after_mark: int = -1
+    let mut i: int = 0
+    while i < array_len(flow.boxes) is
+        let b: LayoutBox = flow.boxes[i]
+        i += 1
+        let mut rel: int = b.y - y0 + push
+        let mut col: int = if rel <= 0 then 0 else rel / th
+        if col > n - 1 is col = n - 1 end
+        ;; wymuszony podział (break-before: column) i break-inside: avoid przesuwają treść do następnej kolumny
+        if b.kind == "box" && b.node_id > 0 && b.node_id != id && col < n - 1 is
+            let into: int = rel - col * th
+            let forced: bool = wants_col_break(b.st, "before") && into > 0
+            let straddle: bool = break_avoid(b.st) && b.h <= th && into + b.h > th
+            if forced || straddle is
+                let delta: int = (col + 1) * th - rel
+                push += delta
+                rel += delta
+                col += 1
+            end
+        end
+        if after_mark >= 0 && b.y >= after_mark && col < n - 1 && rel - col * th > 0 is
+            let delta2: int = (col + 1) * th - rel
+            push += delta2
+            rel += delta2
+            col += 1
+            after_mark = -1
+        end
+        if b.kind == "box" && b.node_id > 0 && b.node_id != id && wants_col_break(b.st, "after") is after_mark = b.y + b.h end
+        if b.kind == "box" && b.h > th / 2 is
+            ;; pudełko, które może przekraczać granicę kolumny → podział
+            let mut cur: int = rel
+            let mut remaining: int = b.h
+            let mut first: bool = true
+            while remaining > 0 && col < n is
+                let room: int = if col == n - 1 then remaining else (col + 1) * th - cur
+                let ph: int = if remaining < room then remaining else room
+                let mut pb: LayoutBox = b
+                pb.x = b.x + col * (colw + gap)
+                pb.y = y0 + cur - col * th
+                pb.h = ph
+                if has_clip_dummy(b) is
+                    pb.cx = b.cx + col * (colw + gap)
+                    pb.cy = b.cy + push - col * th
+                end
+                remaining = remaining - ph
+                if !clone is
+                    if !first is
+                        pb.st.bt = 0
+                        pb.st.rad_tl = 0
+                        pb.st.rad_tr = 0
+                    end
+                    if remaining > 0 is
+                        pb.st.bb = 0
+                        pb.st.rad_bl = 0
+                        pb.st.rad_br = 0
+                    end
+                end
+                out = array_push(out, pb)
+                first = false
+                cur = cur + ph
+                col += 1
+            end
+        else is
+            let mut pb: LayoutBox = b
+            pb.x = b.x + col * (colw + gap)
+            pb.y = y0 + rel - col * th
+            if b.has_clip is
+                pb.cx = b.cx + col * (colw + gap)
+                pb.cy = b.cy + push - col * th
+            end
+            out = array_push(out, pb)
+        end
+    end
+    ;; linie między kolumnami
+    let rs: string = props::xget(st.xp, "column-rule-style")
+    let rw: int = xlen_px(cx, st, props::xval(st.xp, "column-rule-width"), 3)
+    if rs != "" && rs != "none" && rs != "hidden" && rw > 0 && n > 1 is
+        let rc_s: string = props::xget(st.xp, "column-rule-color")
+        let rc: style::Color = if rc_s == "" || string_lower(rc_s) == "currentcolor" then st.color else style::parse_color(rc_s)
+        let mut k: int = 1
+        while k < n is
+            let rx: int = x0 + k * (colw + gap) - gap / 2 - rw / 2
+            out = array_push(out, rule_box(cx, id, st, rx, y0, rw, if total < th then total else th, rc))
+            k += 1
+        end
+    end
+    return InlineRes { boxes: out, height: if total < th then total else th, used_w: n * colw + (n - 1) * gap }
+end
+
+fn has_clip_dummy(b: LayoutBox) -> bool is
+    return b.has_clip
+end
+
+fn intrinsic_h(cx: LayoutCtx, st: style::ComputedStyle) -> int is
+    let mut v: string = props::xget(st.xp, "contain-intrinsic-height")
+    if v == "" is v = props::xget(st.xp, "contain-intrinsic-block-size") end
+    if v == "" is
+        let sz: [string] = cssval::split_top(props::xget(st.xp, "contain-intrinsic-size"))
+        if array_len(sz) >= 2 is v = sz[1] elsif array_len(sz) == 1 is v = sz[0] end
+    end
+    if string_starts_with(string_lower(v), "auto ") is v = string_trim(string_slice(v, 5, string_len(v))) end
+    return xlen_px(cx, st, v, 0)
+end
+
+;; Odcina boxy poniżej `limit` i dokleja „…” do ostatniego widocznego wiersza.
+fn clamp_lines(kids: [LayoutBox], limit: int, lh: int) -> [LayoutBox] is
+    let mut out: [LayoutBox] = []
+    let mut last_text: int = -1
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let b: LayoutBox = kids[i]
+        i += 1
+        if b.y >= limit is continue end
+        let mut nb: LayoutBox = b
+        if b.kind == "box" && b.y + b.h > limit is nb.h = limit - b.y end
+        out = array_push(out, nb)
+        if nb.kind == "text" && nb.y >= limit - lh is last_text = array_len(out) - 1 end
+    end
+    if last_text >= 0 is
+        out[last_text].text = out[last_text].text + "…"
+        out[last_text].w = out[last_text].w + 8
+    end
+    return out
+end
+
 pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_h: int, force_w: int, fit: bool) -> BlockRes is
     let n: dom::DomNode = cx.dom.nodes[id]
     let st: style::ComputedStyle = cx.styles[id]
@@ -1334,11 +2821,17 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
     let own_v: int = pad_border_v(st)
     let mlz: int = m_or_zero(st.mar_left)
     let mrz: int = m_or_zero(st.mar_right)
-    let mt: int = m_or_zero(st.mar_top)
-    let mb: int = m_or_zero(st.mar_bottom)
+    let mt0: int = m_or_zero(st.mar_top)
+    let mb0: int = m_or_zero(st.mar_bottom)
     let replaced: bool = is_replaced(n.tag)
     let w_spec: int = style::size_of(st.width, st.width_pct, st.width_mode, avail_w)
-    let h_spec: int = style::size_of(st.height, st.height_pct, st.height_mode, avail_h)
+    let mut h_spec: int = style::size_of(st.height, st.height_pct, st.height_mode, avail_h)
+
+    ;; zwijanie marginesów rodzic <-> pierwsze/ostatnie dziecko
+    let ctm: int = if st.pad_top == 0 && st.bt == 0 && array_len(n.children) > 0 then collapsed_child_margin(cx, id, false, 0) else 0
+    let cmb: int = if st.pad_bottom == 0 && st.bb == 0 && array_len(n.children) > 0 && h_spec < 0 then collapsed_child_margin(cx, id, true, 0) else 0
+    let mt: int = if ctm != 0 then collapse_margin(mt0, ctm) else mt0
+    let mb: int = if cmb != 0 then collapse_margin(mb0, cmb) else mb0
 
     let mut border_w: int = 0
     let mut nat: style::BoxSides = style::BoxSides { top: 0, right: 0, bottom: 0, left: 0 }
@@ -1353,7 +2846,7 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
             cw = (if st.border_box then h_spec - own_v else h_spec) * nat.right / nat.bottom
         end
         border_w = cw + own_h
-    elsif fit is
+    elsif fit || st.display == "table" is
         let mc: int = max_content(cx, id, 0)
         let room: int = avail_w - mlz - mrz
         border_w = if mc < room then mc else room
@@ -1388,6 +2881,10 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
     let cw: int = border_w - own_h
     let cx0: int = x + ml + st.bl + st.pad_left
     let cy0: int = y + mt + st.bt + st.pad_top
+    ;; aspect-ratio: wysokość z szerokości, gdy wysokość jest auto
+    if st.aspect_ratio > 0 && h_spec < 0 && !replaced is
+        h_spec = if st.border_box then (border_w * 1000 + st.aspect_ratio / 2) / st.aspect_ratio else (cw * 1000 + st.aspect_ratio / 2) / st.aspect_ratio
+    end
     let mut inner_h_spec: int = -1
     if h_spec >= 0 is
         inner_h_spec = h_spec
@@ -1397,7 +2894,10 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
 
     let mut kids: [LayoutBox] = []
     let mut content_h: int = 0
-    if replaced is
+    let cv_hidden: bool = props::xget(st.xp, "content-visibility") == "hidden"
+    if cv_hidden is
+        content_h = intrinsic_h(cx, st)
+    elsif replaced is
         content_h = nat.bottom
         if n.tag == "img" && nat.right > 0 && w_spec >= 0 && h_spec < 0 is
             content_h = cw * nat.bottom / nat.right
@@ -1410,10 +2910,33 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
         let r: InlineRes = layout_grid(cx, id, cx0, cy0, cw, [])
         kids = r.boxes
         content_h = r.height
-    else is
-        let r: InlineRes = layout_flow(cx, id, cx0, cy0, cw, inner_h_spec, [])
+    elsif st.display == "table" is
+        let r: InlineRes = layout_table(cx, id, cx0, cy0, cw, [])
         kids = r.boxes
         content_h = r.height
+    else is
+        let plan: [int] = column_plan(cx, st, cw)
+        if plan[0] > 1 is
+            let r0: InlineRes = layout_flow(cx, id, cx0, cy0 - ctm, plan[1], inner_h_spec, [])
+            let r: InlineRes = split_columns(cx, id, st, r0, cx0, cy0 - ctm, plan, inner_h_spec)
+            kids = r.boxes
+            content_h = r.height - ctm - cmb
+        else is
+            let r: InlineRes = layout_flow(cx, id, cx0, cy0 - ctm, cw, inner_h_spec, [])
+            kids = r.boxes
+            content_h = r.height - ctm - cmb
+        end
+    end
+
+    ;; line-clamp: tylko N pierwszych wierszy, ostatni z wielokropkiem
+    let clamp_s: string = props::xget(st.xp, "line-clamp")
+    if props::is_int(clamp_s) && !replaced && !cv_hidden is
+        let cn: int = str_to_int(clamp_s)
+        let lhc: int = line_h_of(st)
+        if cn > 0 && content_h > cn * lhc is
+            kids = clamp_lines(kids, cy0 + cn * lhc, lhc)
+            content_h = cn * lhc
+        end
     end
 
     let mut border_h: int = 0
@@ -1449,10 +2972,13 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
     ;; znacznik listy
     if st.display == "list-item" is
         let marker: string = li_marker(cx, id)
-        let mw: int = text_w(cx, marker, st)
-        let mut mbx: LayoutBox = no_clip_box(id, cx0 - mw - 8, cy0, mw, line_h_of(st), st, "marker")
-        mbx.text = marker
-        out = array_push(out, mbx)
+        if marker != "" is
+            let mw: int = text_w(cx, marker, st)
+            let mx: int = if st.list_pos == "inside" then cx0 else cx0 - mw - 8
+            let mut mbx: LayoutBox = no_clip_box(id, mx, cy0, mw, line_h_of(st), st, "marker")
+            mbx.text = marker
+            out = array_push(out, mbx)
+        end
     end
     if n.tag == "img" is
         out[0].img_src = n.attr_src
@@ -1547,17 +3073,953 @@ fn place_abs(cx: LayoutCtx, id: int, boxes: [LayoutBox], doc_h: int) -> [LayoutB
     return concat_boxes(boxes, placed)
 end
 
+
+;; =====================================================================
+;; 0.3: przebiegi końcowe — z-index, opacity grupowe, filter, clip-path, transform, sticky
+;; =====================================================================
+fn is_in_subtree(cx: LayoutCtx, id: int, root: int) -> bool is
+    let mut cur: int = id
+    let mut guard: int = 0
+    while cur >= 0 && guard < 200 is
+        if cur == root is return true end
+        cur = cx.dom.nodes[cur].parent
+        guard += 1
+    end
+    return false
+end
+
+fn clamp255(v: int) -> int is
+    if v < 0 is return 0 end
+    if v > 255 is return 255 end
+    return v
+end
+
+;; filter: brightness → contrast → grayscale → sepia → invert (alfa bez zmian).
+fn filter_rgb(c: style::Color, f: style::ComputedStyle) -> style::Color is
+    let mut r: int = c.r
+    let mut g: int = c.g
+    let mut b: int = c.b
+    if f.f_bright != 100 is
+        r = clamp255(r * f.f_bright / 100)
+        g = clamp255(g * f.f_bright / 100)
+        b = clamp255(b * f.f_bright / 100)
+    end
+    if f.f_contrast != 100 is
+        r = clamp255((r - 128) * f.f_contrast / 100 + 128)
+        g = clamp255((g - 128) * f.f_contrast / 100 + 128)
+        b = clamp255((b - 128) * f.f_contrast / 100 + 128)
+    end
+    if f.f_gray > 0 is
+        let lum: int = (r * 299 + g * 587 + b * 114) / 1000
+        r = r + (lum - r) * f.f_gray / 100
+        g = g + (lum - g) * f.f_gray / 100
+        b = b + (lum - b) * f.f_gray / 100
+    end
+    if f.f_sepia > 0 is
+        let sr: int = clamp255((r * 393 + g * 769 + b * 189) / 1000)
+        let sg: int = clamp255((r * 349 + g * 686 + b * 168) / 1000)
+        let sb: int = clamp255((r * 272 + g * 534 + b * 131) / 1000)
+        r = r + (sr - r) * f.f_sepia / 100
+        g = g + (sg - g) * f.f_sepia / 100
+        b = b + (sb - b) * f.f_sepia / 100
+    end
+    if f.f_invert > 0 is
+        r = r + (255 - 2 * r) * f.f_invert / 100
+        g = g + (255 - 2 * g) * f.f_invert / 100
+        b = b + (255 - 2 * b) * f.f_invert / 100
+    end
+    return style::Color { r: r, g: g, b: b, a: c.a }
+end
+
+fn filter_style(s0: style::ComputedStyle, f: style::ComputedStyle) -> style::ComputedStyle is
+    let mut s: style::ComputedStyle = s0
+    s.color = filter_rgb(s.color, f)
+    s.background = filter_rgb(s.background, f)
+    s.grad_from = filter_rgb(s.grad_from, f)
+    s.grad_to = filter_rgb(s.grad_to, f)
+    s.bct = filter_rgb(s.bct, f)
+    s.bcr = filter_rgb(s.bcr, f)
+    s.bcb = filter_rgb(s.bcb, f)
+    s.bcl = filter_rgb(s.bcl, f)
+    s.border_color = filter_rgb(s.border_color, f)
+    s.sh_color = filter_rgb(s.sh_color, f)
+    s.ts_color = filter_rgb(s.ts_color, f)
+    s.outline_color = filter_rgb(s.outline_color, f)
+    s.deco_color = filter_rgb(s.deco_color, f)
+    if f.f_opacity < 100 is s.opacity = s.opacity * f.f_opacity / 100 end
+    return s
+end
+
+fn clip_len(t: string, reference: int) -> int is
+    let v: string = string_lower(string_trim(t))
+    if string_ends_with(v, "%") is
+        return conv::float_to_int(conv::str_to_float(string_slice(v, 0, string_len(v) - 1)) * conv::int_to_float(reference) / 100.0)
+    end
+    if string_ends_with(v, "px") is return conv::float_to_int(conv::str_to_float(string_slice(v, 0, string_len(v) - 2))) end
+    return conv::float_to_int(conv::str_to_float(v))
+end
+
+;; clip-path → prostokąt [x, y, w, h] (przybliżenie bounding-box dla circle/ellipse/polygon); [] gdy brak.
+fn clip_rect_of(cp: string, bx: int, by: int, bw: int, bh: int) -> [int] is
+    if cp == "" is return [] end
+    if string_starts_with(cp, "inset(") is
+        let inner: string = string_slice(cp, 6, string_len(cp) - 1)
+        let rd: int = string_find(inner, "round")
+        let body: string = if rd >= 0 then string_slice(inner, 0, rd) else inner
+        let t: [string] = cssval::split_top(body)
+        if array_len(t) == 0 is return [] end
+        let top: int = clip_len(t[0], bh)
+        let right: int = if array_len(t) >= 2 then clip_len(t[1], bw) else clip_len(t[0], bw)
+        let bottom: int = if array_len(t) >= 3 then clip_len(t[2], bh) else top
+        let left: int = if array_len(t) >= 4 then clip_len(t[3], bw) else right
+        let w: int = bw - left - right
+        let h: int = bh - top - bottom
+        return [bx + left, by + top, if w > 0 then w else 0, if h > 0 then h else 0]
+    end
+    if string_starts_with(cp, "circle(") || string_starts_with(cp, "ellipse(") is
+        let is_circle: bool = string_starts_with(cp, "circle(")
+        let inner: string = string_slice(cp, if is_circle then 7 else 8, string_len(cp) - 1)
+        let at: int = string_find(inner, " at ")
+        let shape: string = if at >= 0 then string_slice(inner, 0, at) else inner
+        let pos: string = if at >= 0 then string_slice(inner, at + 4, string_len(inner)) else "50% 50%"
+        let pt: [string] = cssval::split_top(pos)
+        let mut ccx: int = bx + bw / 2
+        let mut ccy: int = by + bh / 2
+        if array_len(pt) >= 1 is ccx = bx + clip_len(pt[0], bw) end
+        if array_len(pt) >= 2 is ccy = by + clip_len(pt[1], bh) end
+        let st: [string] = cssval::split_top(string_trim(shape))
+        let half_min: int = (if bw < bh then bw else bh) / 2
+        let mut rx: int = half_min
+        let mut ry: int = half_min
+        if array_len(st) >= 1 && st[0] != "closest-side" && st[0] != "farthest-side" is
+            rx = clip_len(st[0], if is_circle then half_min * 2 else bw)
+            ry = if is_circle then rx else (if array_len(st) >= 2 then clip_len(st[1], bh) else rx)
+        end
+        return [ccx - rx, ccy - ry, rx * 2, ry * 2]
+    end
+    if string_starts_with(cp, "polygon(") is
+        let inner: string = string_slice(cp, 8, string_len(cp) - 1)
+        let pts: [string] = cssval::split_commas(inner)
+        let mut x0: int = 1000000
+        let mut y0: int = 1000000
+        let mut x1: int = -1000000
+        let mut y1: int = -1000000
+        let mut i: int = 0
+        while i < array_len(pts) is
+            let xy: [string] = cssval::split_top(pts[i])
+            i += 1
+            if array_len(xy) >= 2 is
+                if string_lower(xy[0]) == "nonzero" || string_lower(xy[0]) == "evenodd" is continue end
+                let px: int = bx + clip_len(xy[0], bw)
+                let py: int = by + clip_len(xy[1], bh)
+                if px < x0 is x0 = px end
+                if px > x1 is x1 = px end
+                if py < y0 is y0 = py end
+                if py > y1 is y1 = py end
+            end
+        end
+        if x1 < x0 is return [] end
+        return [x0, y0, x1 - x0, y1 - y0]
+    end
+    return []
+end
+
+fn clip_one(b0: LayoutBox, rx: int, ry: int, rw: int, rh: int) -> LayoutBox is
+    let mut b: LayoutBox = b0
+    if b.has_clip is
+        let x0: int = if b.cx > rx then b.cx else rx
+        let y0: int = if b.cy > ry then b.cy else ry
+        let x1: int = if b.cx + b.cw < rx + rw then b.cx + b.cw else rx + rw
+        let y1: int = if b.cy + b.ch < ry + rh then b.cy + b.ch else ry + rh
+        b.cx = x0
+        b.cy = y0
+        b.cw = if x1 > x0 then x1 - x0 else 0
+        b.ch = if y1 > y0 then y1 - y0 else 0
+    else is
+        b.has_clip = true
+        b.cx = rx
+        b.cy = ry
+        b.cw = rw
+        b.ch = rh
+    end
+    return b
+end
+
+fn scale_len(v: int, k: int) -> int is
+    return v * k / 1000
+end
+
+;; Stosuje transform (translate + scale) do boxa względem początku (ox, oy).
+fn transform_box(b0: LayoutBox, ox: int, oy: int, sx: int, sy: int, tx: int, ty: int) -> LayoutBox is
+    let mut b: LayoutBox = b0
+    b.x = ox + scale_len(b.x - ox, sx) + tx
+    b.y = oy + scale_len(b.y - oy, sy) + ty
+    b.w = scale_len(b.w, sx)
+    b.h = scale_len(b.h, sy)
+    if b.has_clip is
+        b.cx = ox + scale_len(b.cx - ox, sx) + tx
+        b.cy = oy + scale_len(b.cy - oy, sy) + ty
+        b.cw = scale_len(b.cw, sx)
+        b.ch = scale_len(b.ch, sy)
+    end
+    if sx != 1000 || sy != 1000 is
+        let k: int = (sx + sy) / 2
+        b.st.font_size = if scale_len(b.st.font_size, k) > 1 then scale_len(b.st.font_size, k) else 1
+        if b.st.line_height > 0 is b.st.line_height = scale_len(b.st.line_height, k) end
+        b.st.bt = scale_len(b.st.bt, sy)
+        b.st.bb = scale_len(b.st.bb, sy)
+        b.st.bl = scale_len(b.st.bl, sx)
+        b.st.br = scale_len(b.st.br, sx)
+        b.st.rad_tl = scale_len(b.st.rad_tl, k)
+        b.st.rad_tr = scale_len(b.st.rad_tr, k)
+        b.st.rad_br = scale_len(b.st.rad_br, k)
+        b.st.rad_bl = scale_len(b.st.rad_bl, k)
+        b.st.letter_spacing = scale_len(b.st.letter_spacing, k)
+    end
+    return b
+end
+
+fn has_effects(st: style::ComputedStyle) -> bool is
+    return st.opacity < 100 || st.has_filter || st.clip_path != "" || st.has_transform
+end
+
+pub fn apply_effects(cx: LayoutCtx, boxes0: [LayoutBox]) -> [LayoutBox] is
+    let mut out: [LayoutBox] = boxes0
+    let total: int = array_len(out)
+    let mut any_fx: bool = false
+    let mut q: int = 0
+    while q < total is
+        if out[q].kind == "box" && out[q].node_id > 0 && has_effects(cx.styles[out[q].node_id]) is any_fx = true end
+        q += 1
+    end
+    if !any_fx is return out end
+    let mut i: int = 0
+    while i < total is
+        let b: LayoutBox = out[i]
+        i += 1
+        if b.kind != "box" || b.node_id <= 0 is continue end
+        let st: style::ComputedStyle = cx.styles[b.node_id]
+        if !has_effects(st) is continue end
+        let id: int = b.node_id
+        ;; indeksy poddrzewa (poza samym elementem)
+        let mut sub: [int] = []
+        let mut j: int = i
+        while j < total is
+            if is_in_subtree(cx, out[j].node_id, id) is sub = array_push(sub, j) end
+            j += 1
+        end
+        ;; opacity grupowe: mnożymy przez potomków
+        if st.opacity < 100 is
+            let mut k: int = 0
+            while k < array_len(sub) is
+                out[sub[k]].st.opacity = out[sub[k]].st.opacity * st.opacity / 100
+                k += 1
+            end
+        end
+        if st.has_filter is
+            out[i - 1].st = filter_style(out[i - 1].st, st)
+            let mut k: int = 0
+            while k < array_len(sub) is
+                out[sub[k]].st = filter_style(out[sub[k]].st, st)
+                k += 1
+            end
+        end
+        if st.clip_path != "" is
+            let r: [int] = clip_rect_of(st.clip_path, b.x, b.y, b.w, b.h)
+            if array_len(r) == 4 is
+                out[i - 1] = clip_one(out[i - 1], r[0], r[1], r[2], r[3])
+                let mut k: int = 0
+                while k < array_len(sub) is
+                    out[sub[k]] = clip_one(out[sub[k]], r[0], r[1], r[2], r[3])
+                    k += 1
+                end
+            end
+        end
+        if st.has_transform && array_len(st.tr_m) == 6 is
+            ;; obrót / pochylenie: poddrzewo rysowane jako warstwa przekształcana przez natywną warstwę
+            let px: int = b.x + b.w * st.origin_x / 10000
+            let py: int = b.y + b.h * st.origin_y / 10000
+            let mut x0: int = b.x
+            let mut y0: int = b.y
+            let mut x1: int = b.x + b.w
+            let mut y1: int = b.y + b.h
+            let mut k: int = 0
+            while k < array_len(sub) is
+                let sb: LayoutBox = out[sub[k]]
+                let mut rx0: int = sb.x
+                let mut ry0: int = sb.y
+                let mut rx1: int = sb.x + sb.w
+                let mut ry1: int = sb.y + sb.h
+                if sb.has_clip is
+                    if sb.cx > rx0 is rx0 = sb.cx end
+                    if sb.cy > ry0 is ry0 = sb.cy end
+                    if sb.cx + sb.cw < rx1 is rx1 = sb.cx + sb.cw end
+                    if sb.cy + sb.ch < ry1 is ry1 = sb.cy + sb.ch end
+                end
+                if rx1 > rx0 && ry1 > ry0 is
+                    if rx0 < x0 is x0 = rx0 end
+                    if ry0 < y0 is y0 = ry0 end
+                    if rx1 > x1 is x1 = rx1 end
+                    if ry1 > y1 is y1 = ry1 end
+                end
+                k += 1
+            end
+            let grp: [int] = [st.tr_m[0], st.tr_m[1], st.tr_m[2], st.tr_m[3], st.tr_m[4], st.tr_m[5], px, py, x0 - 2, y0 - 2, x1 - x0 + 4, y1 - y0 + 4]
+            out[i - 1].xf_id = id
+            out[i - 1].xf = grp
+            k = 0
+            while k < array_len(sub) is
+                out[sub[k]].xf_id = id
+                out[sub[k]].xf = grp
+                k += 1
+            end
+        elsif st.has_transform is
+            let ox: int = b.x + b.w * st.origin_x / 10000
+            let oy: int = b.y + b.h * st.origin_y / 10000
+            let tx: int = st.tr_tx + b.w * st.tr_tx_pct / 10000
+            let ty: int = st.tr_ty + b.h * st.tr_ty_pct / 10000
+            out[i - 1] = transform_box(out[i - 1], ox, oy, st.tr_sx, st.tr_sy, tx, ty)
+            let mut k: int = 0
+            while k < array_len(sub) is
+                out[sub[k]] = transform_box(out[sub[k]], ox, oy, st.tr_sx, st.tr_sy, tx, ty)
+                k += 1
+            end
+        end
+    end
+    return out
+end
+
+;; position: sticky — oznacza boxy poddrzewa danymi do przesunięcia przy rysowaniu.
+pub fn mark_sticky(cx: LayoutCtx, boxes0: [LayoutBox]) -> [LayoutBox] is
+    let mut out: [LayoutBox] = boxes0
+    let total: int = array_len(out)
+    let mut i: int = 0
+    while i < total is
+        let b: LayoutBox = out[i]
+        i += 1
+        if b.kind != "box" || b.node_id <= 0 || cx.styles[b.node_id].position != "sticky" is continue end
+        if cx.styles[b.node_id].top == auto_v() is continue end
+        let par: int = cx.dom.nodes[b.node_id].parent
+        let pr: style::BoxSides = box_rect_of(out, par)
+        let pst: style::ComputedStyle = cx.styles[par]
+        let parent_bottom: int = pr.top + pr.bottom - pst.pad_bottom - pst.bb
+        let mut maxdy: int = parent_bottom - (b.y + b.h)
+        if maxdy < 0 is maxdy = 0 end
+        let mut j: int = i - 1
+        while j < total is
+            if is_in_subtree(cx, out[j].node_id, b.node_id) is
+                out[j].sticky = true
+                out[j].stk_top = cx.styles[b.node_id].top
+                out[j].stk_y = b.y
+                out[j].stk_max = maxdy
+            end
+            j += 1
+        end
+    end
+    return out
+end
+
+;; Klucz kolejności rysowania wg z-index (do 3 poziomów zagnieżdżonych kontekstów).
+fn makes_stacking_context(st: style::ComputedStyle) -> bool is
+    if props::xget(st.xp, "isolation") == "isolate" is return true end
+    let mb: string = props::xget(st.xp, "mix-blend-mode")
+    if mb != "" && mb != "normal" is return true end
+    let wc: string = props::xget(st.xp, "will-change")
+    if string_find(wc, "transform") >= 0 || string_find(wc, "opacity") >= 0 || string_find(wc, "z-index") >= 0 is return true end
+    if contains_any(st, " layout paint strict content ") is return true end
+    return false
+end
+
+fn z_key(cx: LayoutCtx, id: int) -> int is
+    let mut chain: [int] = []
+    let mut cur: int = id
+    let mut guard: int = 0
+    while cur > 0 && guard < 200 is
+        let st: style::ComputedStyle = cx.styles[cur]
+        if st.position != "static" && st.z_index != 0 is
+            chain = array_push(chain, st.z_index)
+        elsif makes_stacking_context(st) is
+            chain = array_push(chain, 0)
+        end
+        cur = cx.dom.nodes[cur].parent
+        guard += 1
+    end
+    let n: int = array_len(chain)
+    if n == 0 is return 0 end
+    let weights: [int] = [1000000, 1000, 1]
+    let mut key: int = 0
+    let mut lvl: int = 0
+    while lvl < 3 && lvl < n is
+        let mut z: int = chain[n - 1 - lvl]
+        if z > 999 is z = 999 end
+        if z < -999 is z = -999 end
+        key = key + z * weights[lvl]
+        lvl += 1
+    end
+    return key
+end
+
+pub fn z_sort(cx: LayoutCtx, boxes: [LayoutBox]) -> [LayoutBox] is
+    let total: int = array_len(boxes)
+    let mut keys: [int] = []
+    let mut any_z: bool = false
+    let mut i: int = 0
+    while i < total is
+        let k: int = if boxes[i].node_id > 0 then z_key(cx, boxes[i].node_id) else 0
+        if k != 0 is any_z = true end
+        keys = array_push(keys, k)
+        i += 1
+    end
+    if !any_z is return boxes end
+    let mut distinct: [int] = []
+    i = 0
+    while i < total is
+        let k: int = keys[i]
+        i += 1
+        let mut have: bool = false
+        let mut j: int = 0
+        while j < array_len(distinct) is
+            if distinct[j] == k is have = true end
+            j += 1
+        end
+        if !have is
+            let mut pos: int = array_len(distinct)
+            j = 0
+            while j < array_len(distinct) is
+                if distinct[j] > k && pos == array_len(distinct) is pos = j end
+                j += 1
+            end
+            let mut nd: [int] = []
+            j = 0
+            while j < array_len(distinct) is
+                if j == pos is nd = array_push(nd, k) end
+                nd = array_push(nd, distinct[j])
+                j += 1
+            end
+            if pos == array_len(distinct) is nd = array_push(nd, k) end
+            distinct = nd
+        end
+    end
+    let mut out: [LayoutBox] = []
+    let mut d: int = 0
+    while d < array_len(distinct) is
+        i = 0
+        while i < total is
+            if keys[i] == distinct[d] is out = array_push(out, boxes[i]) end
+            i += 1
+        end
+        d += 1
+    end
+    return out
+end
+
+;; Przesunięcie pionowe boxa `sticky` przy przewinięciu dokumentu o `scroll`.
+pub fn sticky_dy(b: LayoutBox, scroll: int) -> int is
+    if !b.sticky || b.fixed is return 0 end
+    let want: int = scroll + b.stk_top - b.stk_y
+    if want < 0 is return 0 end
+    if want > b.stk_max is return b.stk_max end
+    return want
+end
+
+
+;; =====================================================================
+;; 0.3: generowanie treści ::before / ::after, attr(), counter(), cudzysłowy
+;; =====================================================================
+struct GenState is
+    pub d:          dom::Dom
+    pub cn:         [string]   ;; nazwy liczników (stos instancji)
+    pub cv:         [int]
+    pub co:         [int]      ;; właściciel zakresu: id węzła, po którego poddrzewie instancja znika
+    pub has_before: bool
+    pub has_after:  bool
+end
+
+fn unquote(v: string) -> string is
+    let t: string = string_trim(v)
+    if string_len(t) >= 2 && (string_starts_with(t, "\"") || string_starts_with(t, "'")) is
+        return string_slice(t, 1, string_len(t) - 1)
+    end
+    return t
+end
+
+fn css_unescape(s: string) -> string is
+    let n: int = string_len(s)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        if c == "\\" && i + 1 < n is
+            let mut j: int = i + 1
+            let mut hex: string = ""
+            while j < n && j < i + 7 && dom::hex_val(string_at(s, j)) >= 0 is
+                hex = hex + string_at(s, j)
+                j += 1
+            end
+            if hex != "" is
+                let cp: int = dom::hex_val(hex)
+                if cp == 10 is out = out + "\n" else is out = out + dom::codepoint_to_str(cp) end
+                if j < n && string_at(s, j) == " " is j += 1 end
+                i = j
+            else is
+                out = out + string_at(s, i + 1)
+                i += 2
+            end
+        else is
+            out = out + c
+            i += 1
+        end
+    end
+    return out
+end
+
+fn counter_top(gs: GenState, name: string) -> int is
+    let mut idx: int = -1
+    let mut i: int = 0
+    while i < array_len(gs.cn) is
+        if gs.cn[i] == name is idx = i end
+        i += 1
+    end
+    return idx
+end
+
+fn counter_format(n: int, kind: string) -> string is
+    if kind == "none" is return "" end
+    if kind == "disc" is return "•" end
+    if kind == "circle" is return "◦" end
+    if kind == "square" is return "▪" end
+    if kind == "decimal-leading-zero" is return (if n >= 0 && n < 10 then "0" else "") + to_string(n) end
+    if kind == "lower-alpha" || kind == "lower-latin" is return alpha_of(n, false) end
+    if kind == "upper-alpha" || kind == "upper-latin" is return alpha_of(n, true) end
+    if kind == "lower-roman" is return roman_of(n, false) end
+    if kind == "upper-roman" is return roman_of(n, true) end
+    if kind == "lower-greek" is return greek_of(n) end
+    return to_string(n)
+end
+
+;; "name 2 other" -> pary (nazwa, liczba); domyślna liczba = dflt
+fn counter_pairs(val: string, dflt: int) -> [string] is
+    let toks: [string] = cssval::split_top(val)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if t == "none" is continue end
+        let mut num: int = dflt
+        if i < array_len(toks) is
+            let nx: string = toks[i]
+            let c0: string = string_slice(nx, 0, 1)
+            if (c0 >= "0" && c0 <= "9") || c0 == "-" is
+                num = str_to_int(nx)
+                i += 1
+            end
+        end
+        out = array_push(out, t)
+        out = array_push(out, to_string(num))
+    end
+    return out
+end
+
+fn apply_counter_decls(gs0: GenState, decls: [css::CssDecl], scope: int) -> GenState is
+    let mut gs: GenState = gs0
+    let mut di: int = 0
+    while di < array_len(decls) is
+        let dc: css::CssDecl = decls[di]
+        di += 1
+        if dc.prop == "counter-reset" || dc.prop == "counter-set" || dc.prop == "counter-increment" is
+            let pairs: [string] = counter_pairs(dc.val, if dc.prop == "counter-increment" then 1 else 0)
+            let mut pi: int = 0
+            while pi + 1 < array_len(pairs) is
+                let name: string = pairs[pi]
+                let num: int = str_to_int(pairs[pi + 1])
+                pi += 2
+                let top: int = counter_top(gs, name)
+                if dc.prop == "counter-reset" is
+                    if top >= 0 && gs.co[top] == scope is
+                        gs.cv[top] = num
+                    else is
+                        gs.cn = array_push(gs.cn, name)
+                        gs.cv = array_push(gs.cv, num)
+                        gs.co = array_push(gs.co, scope)
+                    end
+                elsif dc.prop == "counter-set" is
+                    if top >= 0 is
+                        gs.cv[top] = num
+                    else is
+                        gs.cn = array_push(gs.cn, name)
+                        gs.cv = array_push(gs.cv, num)
+                        gs.co = array_push(gs.co, scope)
+                    end
+                else is
+                    if top >= 0 is
+                        gs.cv[top] = gs.cv[top] + num
+                    else is
+                        gs.cn = array_push(gs.cn, name)
+                        gs.cv = array_push(gs.cv, num)
+                        gs.co = array_push(gs.co, scope)
+                    end
+                end
+            end
+        end
+    end
+    return gs
+end
+
+fn gen_pop(gs0: GenState, owner: int) -> GenState is
+    let mut gs: GenState = gs0
+    let mut cn: [string] = []
+    let mut cv: [int] = []
+    let mut co: [int] = []
+    let mut i: int = 0
+    while i < array_len(gs.cn) is
+        if gs.co[i] != owner is
+            cn = array_push(cn, gs.cn[i])
+            cv = array_push(cv, gs.cv[i])
+            co = array_push(co, gs.co[i])
+        end
+        i += 1
+    end
+    gs.cn = cn
+    gs.cv = cv
+    gs.co = co
+    return gs
+end
+
+;; Wartość `content` → tekst. host = element, do którego należy pseudo-element.
+fn eval_content(gs: GenState, host: int, expr: string) -> string is
+    let n: int = string_len(expr)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(expr, i)
+        if c == " " || c == "," || c == "\t" || c == "\n" is
+            i += 1
+        elsif c == "\"" || c == "'" is
+            let mut j: int = i + 1
+            while j < n && string_at(expr, j) != c is
+                if string_at(expr, j) == "\\" is j += 1 end
+                j += 1
+            end
+            out = out + css_unescape(string_slice(expr, i + 1, if j > n then n else j))
+            i = j + 1
+        else is
+            let rest: string = string_lower(string_slice(expr, i, n))
+            let close: int = string_find(rest, ")")
+            if string_starts_with(rest, "attr(") && close > 0 is
+                let name: string = string_trim(string_slice(expr, i + 5, i + close))
+                out = out + dom::get_attr(gs.d.nodes[host], name)
+                i = i + close + 1
+            elsif string_starts_with(rest, "counters(") && close > 0 is
+                let args: [string] = cssval::split_commas(string_slice(expr, i + 9, i + close))
+                let name: string = string_trim(args[0])
+                let mut sep: string = ""
+                if array_len(args) >= 2 is sep = css_unescape(unquote(string_trim(args[1]))) end
+                let kind: string = if array_len(args) >= 3 then string_lower(string_trim(args[2])) else "decimal"
+                let mut first: bool = true
+                let mut k: int = 0
+                while k < array_len(gs.cn) is
+                    if gs.cn[k] == name is
+                        out = out + (if first then "" else sep) + counter_format(gs.cv[k], kind)
+                        first = false
+                    end
+                    k += 1
+                end
+                if first is out = out + "0" end
+                i = i + close + 1
+            elsif string_starts_with(rest, "counter(") && close > 0 is
+                let args: [string] = cssval::split_commas(string_slice(expr, i + 8, i + close))
+                let name: string = string_trim(args[0])
+                let kind: string = if array_len(args) >= 2 then string_lower(string_trim(args[1])) else "decimal"
+                let top: int = counter_top(gs, name)
+                out = out + counter_format(if top >= 0 then gs.cv[top] else 0, kind)
+                i = i + close + 1
+            elsif string_starts_with(rest, "open-quote") is
+                out = out + "“"
+                i += 10
+            elsif string_starts_with(rest, "close-quote") is
+                out = out + "”"
+                i += 11
+            elsif string_starts_with(rest, "no-open-quote") is
+                i += 13
+            elsif string_starts_with(rest, "no-close-quote") is
+                i += 14
+            elsif string_starts_with(rest, "url(") && close > 0 is
+                i = i + close + 1
+            else is
+                let mut j: int = i
+                while j < n && string_at(expr, j) != " " is j += 1 end
+                i = j
+            end
+        end
+    end
+    return out
+end
+
+fn content_decl_of(decls: [css::CssDecl]) -> string is
+    let mut found: string = ""
+    let mut i: int = 0
+    while i < array_len(decls) is
+        if decls[i].prop == "content" is found = string_trim(decls[i].val) end
+        i += 1
+    end
+    return found
+end
+
+fn make_pseudo(gs0: GenState, sheet: css::Stylesheet, ix: css::InteractionState, host: int, pe: string) -> GenState is
+    let mut gs: GenState = gs0
+    let mut d2: dom::Dom = dom::new_node(gs.d, host, "span")
+    let pid: int = array_len(d2.nodes) - 1
+    d2.nodes[pid].pseudo = pe
+    let decls: [css::CssDecl] = css::matching_decls_ctx(sheet, d2, pid, ix)
+    let expr: string = content_decl_of(decls)
+    let low: string = string_lower(expr)
+    if expr == "" || low == "none" || low == "normal" is
+        ;; brak treści: usuń tymczasowy węzeł
+        d2.nodes[pid].removed = true
+        let mut kids: [int] = []
+        let mut k: int = 0
+        while k < array_len(d2.nodes[host].children) is
+            if d2.nodes[host].children[k] != pid is kids = array_push(kids, d2.nodes[host].children[k]) end
+            k += 1
+        end
+        d2.nodes[host].children = kids
+        gs.d = d2
+        return gs
+    end
+    gs.d = d2
+    gs = apply_counter_decls(gs, decls, host)
+    let txt: string = eval_content(gs, host, expr)
+    if txt != "" is
+        let mut d3: dom::Dom = dom::new_node(gs.d, pid, "text")
+        let tid: int = array_len(d3.nodes) - 1
+        d3.nodes[tid].text = txt
+        gs.d = d3
+    end
+    if pe == "before" is
+        let mut kids: [int] = [pid]
+        let mut k: int = 0
+        while k < array_len(gs.d.nodes[host].children) is
+            if gs.d.nodes[host].children[k] != pid is kids = array_push(kids, gs.d.nodes[host].children[k]) end
+            k += 1
+        end
+        gs.d.nodes[host].children = kids
+    end
+    return gs
+end
+
+fn gen_walk(gs0: GenState, sheet: css::Stylesheet, ix: css::InteractionState, id: int, depth: int) -> GenState is
+    let mut gs: GenState = gs0
+    if depth > 80 is return gs end
+    let node: dom::DomNode = gs.d.nodes[id]
+    if node.tag == "text" || node.removed || node.pseudo != "" is return gs end
+    let decls: [css::CssDecl] = css::matching_decls_ctx(sheet, gs.d, id, ix)
+    gs = apply_counter_decls(gs, decls, node.parent)
+    let orig: [int] = node.children
+    if gs.has_before is gs = make_pseudo(gs, sheet, ix, id, "before") end
+    let mut i: int = 0
+    while i < array_len(orig) is
+        gs = gen_walk(gs, sheet, ix, orig[i], depth + 1)
+        i += 1
+    end
+    if gs.has_after is gs = make_pseudo(gs, sheet, ix, id, "after") end
+    return gen_pop(gs, id)
+end
+
+fn sheet_pelem_flags(sheet: css::Stylesheet) -> [bool] is
+    let mut b: bool = false
+    let mut a: bool = false
+    let mut counters: bool = false
+    let mut i: int = 0
+    while i < array_len(sheet.rules) is
+        let r: css::CssRule = sheet.rules[i]
+        if r.pelem == "before" is b = true end
+        if r.pelem == "after" is a = true end
+        let mut j: int = 0
+        while j < array_len(r.decls) is
+            let p: string = r.decls[j].prop
+            if p == "counter-reset" || p == "counter-increment" || p == "counter-set" is counters = true end
+            j += 1
+        end
+        i += 1
+    end
+    return [b, a, counters]
+end
+
+;; Dodaje do DOM węzły ::before/::after (jako <span> z polem pseudo) według arkusza.
+pub fn gen_pseudo(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionState) -> dom::Dom is
+    let fl: [bool] = sheet_pelem_flags(sheet)
+    if !fl[0] && !fl[1] && !fl[2] is return d end
+    let gs: GenState = GenState { d: d, cn: [], cv: [], co: [], has_before: fl[0], has_after: fl[1] }
+    let out: GenState = gen_walk(gs, sheet, ix, 0, 0)
+    return out.d
+end
+
+;; Boxy pseudo-elementów należą do elementu-gospodarza (reszta aplikacji nie zna węzłów pseudo).
+pub fn remap_pseudo_ids(d: dom::Dom, boxes0: [LayoutBox]) -> [LayoutBox] is
+    let mut out: [LayoutBox] = boxes0
+    let mut i: int = 0
+    while i < array_len(out) is
+        let id: int = out[i].node_id
+        if id > 0 && id < array_len(d.nodes) && d.nodes[id].pseudo != "" is out[i].node_id = d.nodes[id].parent end
+        if id > 0 && id < array_len(d.nodes) && d.nodes[id].tag == "text" && d.nodes[id].parent >= 0 && d.nodes[d.nodes[id].parent].pseudo != "" is
+            out[i].node_id = d.nodes[d.nodes[id].parent].parent
+        end
+        i += 1
+    end
+    return out
+end
+
 ;; ---------- punkty wejścia ----------
 ;; Diagnostyka (SILVER_DEBUG=3): obliczone style wszystkich węzłów — to samo, co widzi layout_full.
+
+;; ---------- display: contents ----------
+;; Element z `display: contents` nie tworzy pudełka — jego dzieci trafiają do rodzica. Style (a więc i
+;; dziedziczenie) zostały już policzone na pełnym drzewie, więc wystarczy spłaszczyć listy `children`.
+fn is_contents_el(d: dom::Dom, styles: [style::ComputedStyle], id: int) -> bool is
+    if id <= 0 || id >= array_len(d.nodes) is return false end
+    let n: dom::DomNode = d.nodes[id]
+    if n.removed || n.tag == "text" is return false end
+    return styles[id].display == "contents"
+end
+
+;; Elementy zastępowane i `br` z `display: contents` zachowują się jak `display: none` (CSS Display 3).
+pub fn contents_fix_styles(d: dom::Dom, styles0: [style::ComputedStyle]) -> [style::ComputedStyle] is
+    let mut styles: [style::ComputedStyle] = styles0
+    let mut i: int = 1
+    while i < array_len(d.nodes) is
+        if is_contents_el(d, styles, i) && (is_replaced(d.nodes[i].tag) || d.nodes[i].tag == "br") is
+            styles[i].display = "none"
+        end
+        i += 1
+    end
+    return styles
+end
+
+fn flatten_contents(d: dom::Dom, styles: [style::ComputedStyle], kids: [int], depth: int) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let c: int = kids[i]
+        i += 1
+        if depth < 64 && is_contents_el(d, styles, c) is
+            let inner: [int] = flatten_contents(d, styles, d.nodes[c].children, depth + 1)
+            let mut k: int = 0
+            while k < array_len(inner) is
+                out = array_push(out, inner[k])
+                k += 1
+            end
+        else is
+            out = array_push(out, c)
+        end
+    end
+    return out
+end
+
+pub fn has_contents(d: dom::Dom, styles: [style::ComputedStyle]) -> bool is
+    let mut i: int = 1
+    while i < array_len(d.nodes) is
+        if is_contents_el(d, styles, i) is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn hoist_contents(d0: dom::Dom, styles: [style::ComputedStyle]) -> dom::Dom is
+    if !has_contents(d0, styles) is return d0 end
+    let mut d: dom::Dom = d0
+    let mut i: int = 0
+    while i < array_len(d.nodes) is
+        let n: dom::DomNode = d.nodes[i]
+        if !n.removed && !is_contents_el(d0, styles, i) is
+            let kids: [int] = flatten_contents(d0, styles, n.children, 0)
+            if array_len(kids) != array_len(n.children) || has_contents_child(d0, styles, n.children) is
+                d.nodes[i].children = kids
+                let mut k: int = 0
+                while k < array_len(kids) is
+                    d.nodes[kids[k]].parent = i
+                    k += 1
+                end
+            end
+        end
+        i += 1
+    end
+    ;; same elementy `contents` znikają z drzewa pudełek
+    i = 1
+    while i < array_len(d.nodes) is
+        if is_contents_el(d0, styles, i) is d.nodes[i].children = [] end
+        i += 1
+    end
+    return d
+end
+
+fn has_contents_child(d: dom::Dom, styles: [style::ComputedStyle], kids: [int]) -> bool is
+    let mut i: int = 0
+    while i < array_len(kids) is
+        if is_contents_el(d, styles, kids[i]) is return true end
+        i += 1
+    end
+    return false
+end
+
 pub fn debug_styles(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionState) -> [style::ComputedStyle] is
     return compute_styles(d, sheet, ix)
 end
 
-pub fn layout_full(d: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport_h: int, win_handle: int,
+pub fn layout_full(d0: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport_h: int, win_handle: int,
                    ix: css::InteractionState, scrolls: [int]) -> LayoutResult is
-    if array_len(d.nodes) == 0 is return LayoutResult { boxes: [], height: 0 } end
-    let styles: [style::ComputedStyle] = compute_styles(d, sheet, ix)
-    let cx: LayoutCtx = LayoutCtx { dom: d, styles: styles, win: win_handle, vw: viewport_w, vh: viewport_h, scrolls: scrolls }
+    return layout_full_a(d0, sheet, viewport_w, viewport_h, win_handle, ix, scrolls, anim::no_anim())
+end
+
+;; Jak layout_full, z animacjami @keyframes i przejściami geometrii nałożonymi na style.
+pub fn layout_full_a(d0: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport_h: int, win_handle: int,
+                     ix: css::InteractionState, scrolls: [int], act: anim::AnimCtx) -> LayoutResult is
+    if array_len(d0.nodes) == 0 || !css::sheet_has_cq(sheet) is
+        return layout_core(d0, sheet, viewport_w, viewport_h, win_handle, ix, scrolls, act)
+    end
+    ;; @container: przebieg 1 mierzy kontenery, przebieg 2 ewaluuje zapytania względem ich rozmiarów
+    let r1: LayoutResult = layout_core(d0, sheet, viewport_w, viewport_h, win_handle, ix, scrolls, act)
+    let n: int = array_len(d0.nodes)
+    let mut cw: [int] = []
+    let mut ch: [int] = []
+    let mut cn: [string] = []
+    let mut i: int = 0
+    while i < n is
+        cw = array_push(cw, -1)
+        ch = array_push(ch, -1)
+        cn = array_push(cn, "")
+        i += 1
+    end
+    let mut found_c: bool = false
+    i = 0
+    while i < array_len(r1.boxes) is
+        let b: LayoutBox = r1.boxes[i]
+        i += 1
+        if b.kind != "box" || b.node_id <= 0 || b.node_id >= n is continue end
+        let ty: string = props::xget(b.st.xp, "container-type")
+        if ty == "" || ty == "normal" is continue end
+        cw[b.node_id] = b.w - b.st.pad_left - b.st.pad_right - b.st.bl - b.st.br
+        ch[b.node_id] = if ty == "size" then b.h - b.st.pad_top - b.st.pad_bottom - b.st.bt - b.st.bb else -1
+        let nm: string = props::xget(b.st.xp, "container-name")
+        cn[b.node_id] = if nm == "none" then "" else nm
+        found_c = true
+    end
+    if !found_c is return r1 end
+    let mut ix2: css::InteractionState = ix
+    ix2.cq_w = cw
+    ix2.cq_h = ch
+    ix2.cq_names = cn
+    return layout_core(d0, sheet, viewport_w, viewport_h, win_handle, ix2, scrolls, act)
+end
+
+fn layout_core(d0: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport_h: int, win_handle: int,
+               ix: css::InteractionState, scrolls: [int], act: anim::AnimCtx) -> LayoutResult is
+    if array_len(d0.nodes) == 0 is return LayoutResult { boxes: [], height: 0 } end
+    let d1: dom::Dom = gen_pseudo(d0, sheet, ix)
+    let styles1: [style::ComputedStyle] = contents_fix_styles(d1, compute_styles_a(d1, sheet, ix, act))
+    let d: dom::Dom = hoist_contents(d1, styles1)
+    let styles: [style::ComputedStyle] = styles1
+    let cx: LayoutCtx = LayoutCtx { dom: d, styles: styles, win: win_handle, vw: viewport_w, vh: viewport_h, scrolls: scrolls, floats: [] }
     let res: BlockRes = layout_block(cx, 0, 0, 0, viewport_w, viewport_h, viewport_w, false)
     let mut boxes: [LayoutBox] = res.boxes
     let mut doc_h: int = res.h
@@ -1580,6 +4042,10 @@ pub fn layout_full(d: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewpor
         if hidden is continue end
         boxes = place_abs(cx, id, boxes, doc_h)
     end
+    boxes = apply_effects(cx, boxes)
+    boxes = mark_sticky(cx, boxes)
+    boxes = z_sort(cx, boxes)
+    boxes = remap_pseudo_ids(d1, boxes)
     i = 0
     while i < array_len(boxes) is
         if !boxes[i].fixed && boxes[i].y + boxes[i].h > doc_h && boxes[i].kind == "box" is doc_h = boxes[i].y + boxes[i].h end
@@ -1595,4 +4061,37 @@ end
 
 pub fn layout(d: dom::Dom, sheet: css::Stylesheet, viewport_w: int, win_handle: int) -> [LayoutBox] is
     return layout_i(d, sheet, viewport_w, win_handle, css::no_interaction())
+end
+
+
+;; ---------- scrollIntoView / skok do kotwicy: scroll-margin-top elementu + scroll-padding-top korzenia ----------
+pub fn len_px_of(val: string, st: style::ComputedStyle) -> int is
+    if val == "" || val == "auto" is return 0 end
+    let l: cssval::Len = cssval::parse_len(val, cssval::LenEnv { em: st.font_size, rem: 16, vw: 0, vh: 0 })
+    if !l.ok || l.auto is return 0 end
+    return cssval::px_of(l, 0)
+end
+
+;; Docelowe przewinięcie strony (px od góry) tak, by element `id` zaczynał się pod marginesem/paddingiem; -1 gdy brak boxa.
+pub fn scroll_into_y(boxes: [LayoutBox], id: int) -> int is
+    let mut target: int = 0
+    let mut found_t: bool = false
+    let mut root_pad: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        let b: LayoutBox = boxes[i]
+        i += 1
+        if b.kind != "box" is continue end
+        if b.node_id == 0 && root_pad == 0 is root_pad = len_px_of(props::xget(b.st.xp, "scroll-padding-top"), b.st) end
+        if b.node_id == id && !found_t is
+            target = b.y - len_px_of(props::xget(b.st.xp, "scroll-margin-top"), b.st)
+            found_t = true
+        end
+    end
+    if !found_t is
+        if id == 0 is return 0 end
+        return -1
+    end
+    let y: int = target - root_pad
+    return if y < 0 then 0 else y
 end
