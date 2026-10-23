@@ -2,6 +2,7 @@ mod ffi_shim
 mod dom
 mod layout
 mod style
+mod cssval
 
 ;; Stan potrzebny tylko do rysowania (budowany przez app.h# co klatkę).
 pub struct RenderState is
@@ -29,7 +30,7 @@ fn flags_of(st: style::ComputedStyle) -> int is
     if st.italic is f += 2 end
     if st.underline is f += 4 end
     if st.strike is f += 8 end
-    return f
+    return f + st.font_key * 256
 end
 
 fn fill(win: int, x: int, y: int, w: int, h: int, c: style::Color, opacity: int) -> int is
@@ -77,13 +78,220 @@ fn draw_shadow(win: int, x: int, y: int, w: int, h: int, st: style::ComputedStyl
     return 0
 end
 
+
+;; ---------- 0.3: linie (ramki dashed/dotted/double, podkreślenia), tekst z odstępami ----------
+;; Rysuje odcinek poziomy/pionowy o grubości `t` w stylu: solid | dashed | dotted | double | wavy.
+fn draw_line_styled(win: int, x: int, y: int, len: int, t: int, vertical: bool, kind: string, c: style::Color, opacity: int) -> int is
+    if len <= 0 || t <= 0 || c.a <= 0 is return 0 end
+    if kind == "dashed" || kind == "dotted" is
+        let on: int = if kind == "dotted" then t else t * 3
+        let off: int = if kind == "dotted" then t else t * 2
+        let mut pos: int = 0
+        while pos < len is
+            let seg: int = if pos + on > len then len - pos else on
+            if vertical is
+                fill(win, x, y + pos, t, seg, c, opacity)
+            else is
+                fill(win, x + pos, y, seg, t, c, opacity)
+            end
+            pos = pos + on + off
+        end
+        return 0
+    end
+    if kind == "double" && t >= 3 is
+        let line: int = t / 3
+        if vertical is
+            fill(win, x, y, line, len, c, opacity)
+            fill(win, x + t - line, y, line, len, c, opacity)
+        else is
+            fill(win, x, y, len, line, c, opacity)
+            fill(win, x, y + t - line, len, line, c, opacity)
+        end
+        return 0
+    end
+    if kind == "wavy" && !vertical is
+        let step: int = if t * 2 < 2 then 2 else t * 2
+        let mut pos: int = 0
+        let mut up: bool = true
+        while pos < len is
+            let seg: int = if pos + step > len then len - pos else step
+            fill(win, x + pos, if up then y else y + t, seg, t, c, opacity)
+            up = !up
+            pos += step
+        end
+        return 0
+    end
+    if vertical is
+        fill(win, x, y, t, len, c, opacity)
+    else is
+        fill(win, x, y, len, t, c, opacity)
+    end
+    return 0
+end
+
+fn side_is_plain(kind: string) -> bool is
+    return kind == "solid" || kind == "" || kind == "groove" || kind == "ridge" || kind == "inset" || kind == "outset"
+end
+
+;; Tekst znak po znaku: letter-spacing / word-spacing.
+fn draw_text_spaced(win: int, x: int, y: int, text: string, st: style::ComputedStyle, c: style::Color, flags: int) -> int is
+    let n: int = string_len(text)
+    let mut pos: int = 0
+    let mut cx: int = x
+    while pos < n is
+        let nx: int = ffi_shim::silver_utf8_next(text, pos)
+        let step: int = if nx <= pos then pos + 1 else nx
+        let ch: string = string_slice(text, pos, if step > n then n else step)
+        pos = step
+        if ch != " " is
+            ffi_shim::silver_draw_text_ex(win, cx, y, ch, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity), st.font_size, flags)
+        end
+        cx = cx + ffi_shim::silver_measure_text_ex(win, ch, st.font_size, flags) + st.letter_spacing
+        if ch == " " is cx = cx + st.word_spacing end
+    end
+    return 0
+end
+
+fn draw_text_plain(win: int, x: int, y: int, text: string, st: style::ComputedStyle, c: style::Color, flags: int) -> int is
+    if st.letter_spacing != 0 || st.word_spacing != 0 is
+        return draw_text_spaced(win, x, y, text, st, c, flags)
+    end
+    return ffi_shim::silver_draw_text_ex(win, x, y, text, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity), st.font_size, flags)
+end
+
+;; Kolor z magazynu xp (caret-color, accent-color…) albo `dflt` dla auto/currentcolor/niepoprawnego.
+fn xcolor(st: style::ComputedStyle, key: string, dflt: style::Color) -> style::Color is
+    let toks: [string] = cssval::split_top(string_lower(props::xget(st.xp, key)))
+    let v: string = if array_len(toks) >= 1 then toks[0] else ""
+    if v == "" || v == "auto" || v == "currentcolor" is return dflt end
+    if !cssval::is_color(v) is return dflt end
+    return style::parse_color(v)
+end
+
+;; Długość z xp (px; em względem rozmiaru czcionki) albo `dflt`.
+fn xpx(st: style::ComputedStyle, key: string, dflt: int) -> int is
+    let v: string = props::xget(st.xp, key)
+    if v == "" || v == "auto" || v == "from-font" is return dflt end
+    let l: cssval::Len = cssval::parse_len(v, cssval::LenEnv { em: st.font_size, rem: 16, vw: 0, vh: 0 })
+    if !l.ok || l.auto is return dflt end
+    return cssval::px_of(l, st.font_size)
+end
+
+;; Promień rozmycia z `backdrop-filter: blur(Npx)` (0 = brak).
+pub fn backdrop_blur_px(st: style::ComputedStyle) -> int is
+    let v: string = string_lower(props::xget(st.xp, "backdrop-filter"))
+    let at: int = string_find(v, "blur(")
+    if at < 0 is return 0 end
+    let close: int = string_find(string_slice(v, at, string_len(v)), ")")
+    if close < 0 is return 0 end
+    let arg: string = string_trim(string_slice(v, at + 5, at + close))
+    let l: cssval::Len = cssval::parse_len(arg, cssval::LenEnv { em: st.font_size, rem: 16, vw: 0, vh: 0 })
+    if !l.ok || l.auto is return 0 end
+    return cssval::px_of(l, 0)
+end
+
+fn draw_text_full(win: int, b: layout::LayoutBox, by: int) -> int is
+    let st: style::ComputedStyle = b.st
+    let c: style::Color = st.color
+    let ul_custom: bool = st.underline && (props::xhas(st.xp, "text-underline-offset") || props::xget(st.xp, "text-underline-position") == "under")
+    let custom_deco: bool = (st.underline || st.strike) && (st.has_deco_color || st.deco_style != "solid" || st.deco_thick > 0 || ul_custom)
+    let mut flags: int = flags_of(st)
+    if custom_deco is flags = flags - (if st.underline then 4 else 0) - (if st.strike then 8 else 0) end
+    if st.has_tshadow is
+        let sc: style::Color = st.ts_color
+        if st.ts_blur > 0 is
+            let faint: style::Color = style::Color { r: sc.r, g: sc.g, b: sc.b, a: sc.a / 4 }
+            draw_text_plain(win, b.x + st.ts_x - 1, by + st.ts_y, b.text, st, faint, flags)
+            draw_text_plain(win, b.x + st.ts_x + 1, by + st.ts_y, b.text, st, faint, flags)
+            draw_text_plain(win, b.x + st.ts_x, by + st.ts_y - 1, b.text, st, faint, flags)
+            draw_text_plain(win, b.x + st.ts_x, by + st.ts_y + 1, b.text, st, faint, flags)
+        end
+        draw_text_plain(win, b.x + st.ts_x, by + st.ts_y, b.text, st, sc, flags)
+    end
+    draw_text_plain(win, b.x, by, b.text, st, c, flags)
+    if custom_deco is
+        let dc: style::Color = if st.has_deco_color then st.deco_color else c
+        let t: int = if st.deco_thick > 0 then st.deco_thick else (if st.font_size / 14 < 1 then 1 else st.font_size / 14)
+        if st.underline is
+            let under: bool = props::xget(st.xp, "text-underline-position") == "under"
+            let base_y: int = if under then by + b.h - t - 1 else by + (b.h + st.font_size) / 2 + 1
+            draw_line_styled(win, b.x, base_y + xpx(st, "text-underline-offset", 0), b.w, t, false, st.deco_style, dc, st.opacity)
+        end
+        if st.strike is
+            draw_line_styled(win, b.x, by + b.h / 2, b.w, t, false, st.deco_style, dc, st.opacity)
+        end
+    end
+    return 0
+end
+
+;; Obraz tła w naturalnym rozmiarze z background-position / background-repeat.
+fn pos_token(t: string, free: int) -> int is
+    if t == "left" || t == "top" is return 0 end
+    if t == "right" || t == "bottom" is return free end
+    if t == "center" is return free / 2 end
+    if string_ends_with(t, "%") is
+        let pct: int = str_to_int(string_slice(t, 0, string_len(t) - 1))
+        return free * pct / 100
+    end
+    if string_ends_with(t, "px") is return str_to_int(string_slice(t, 0, string_len(t) - 2)) end
+    return 0
+end
+
+fn draw_bg_natural(win: int, path: string, x: int, y: int, w: int, h: int, pos: string, repeat: string, alpha: int) -> int is
+    let iw: int = ffi_shim::silver_image_width(win, path)
+    let ih: int = ffi_shim::silver_image_height(win, path)
+    if iw <= 0 || ih <= 0 is return 0 end
+    let toks: [string] = cssval::split_top(pos)
+    let mut px_t: string = "0%"
+    let mut py_t: string = "0%"
+    if array_len(toks) >= 1 is px_t = toks[0] end
+    if array_len(toks) >= 2 is py_t = toks[1] end
+    if array_len(toks) == 1 && (toks[0] == "top" || toks[0] == "bottom") is
+        py_t = toks[0]
+        px_t = "center"
+    end
+    if (px_t == "top" || px_t == "bottom") && array_len(toks) >= 2 is
+        let swap: string = px_t
+        px_t = py_t
+        py_t = swap
+    end
+    let ox: int = x + pos_token(px_t, w - iw)
+    let oy: int = y + pos_token(py_t, h - ih)
+    ffi_shim::silver_clip_set(win, x, y, w, h)
+    let rep_x: bool = repeat == "repeat" || repeat == "repeat-x" || repeat == "space" || repeat == "round"
+    let rep_y: bool = repeat == "repeat" || repeat == "repeat-y" || repeat == "space" || repeat == "round"
+    let mut sx: int = ox
+    if rep_x is
+        while sx > x is sx -= iw end
+    end
+    let mut sy: int = oy
+    if rep_y is
+        while sy > y is sy -= ih end
+    end
+    let mut count: int = 0
+    let mut ty: int = sy
+    while ty < y + h && count < 600 is
+        let mut tx: int = sx
+        while tx < x + w && count < 600 is
+            ffi_shim::silver_draw_image(win, path, tx, ty, iw, ih, alpha)
+            count += 1
+            if !rep_x is break end
+            tx += iw
+        end
+        if !rep_y is break end
+        ty += ih
+    end
+    return 0
+end
+
 ;; ---------- obramowanie ----------
 fn draw_border(win: int, x: int, y: int, w: int, h: int, st: style::ComputedStyle) -> int is
     if st.bt <= 0 && st.br <= 0 && st.bb <= 0 && st.bl <= 0 is return 0 end
     let rad: int = max_radius(st)
+    let plain: bool = side_is_plain(st.border_style) && side_is_plain(st.bs_r) && side_is_plain(st.bs_b) && side_is_plain(st.bs_l)
     let uniform: bool = st.bt == st.br && st.br == st.bb && st.bb == st.bl &&
                         same_color(st.bct, st.bcr) && same_color(st.bcr, st.bcb) && same_color(st.bcb, st.bcl)
-    if uniform is
+    if uniform && (plain || rad > 0) is
         let c: style::Color = st.bct
         if c.a > 0 is
             if rad > 0 is
@@ -97,15 +305,48 @@ fn draw_border(win: int, x: int, y: int, w: int, h: int, st: style::ComputedStyl
         end
         return 0
     end
-    fill(win, x, y, w, st.bt, st.bct, st.opacity)
-    fill(win, x, y + h - st.bb, w, st.bb, st.bcb, st.opacity)
-    fill(win, x, y + st.bt, st.bl, h - st.bt - st.bb, st.bcl, st.opacity)
-    fill(win, x + w - st.br, y + st.bt, st.br, h - st.bt - st.bb, st.bcr, st.opacity)
+    draw_line_styled(win, x, y, w, st.bt, false, st.border_style, st.bct, st.opacity)
+    draw_line_styled(win, x, y + h - st.bb, w, st.bb, false, st.bs_b, st.bcb, st.opacity)
+    draw_line_styled(win, x, y + st.bt, h - st.bt - st.bb, st.bl, true, st.bs_l, st.bcl, st.opacity)
+    draw_line_styled(win, x + w - st.br, y + st.bt, h - st.bt - st.bb, st.br, true, st.bs_r, st.bcr, st.opacity)
+    return 0
+end
+
+;; Obrys (outline) z outline-offset i stylem.
+fn draw_outline(win: int, x: int, y: int, w: int, h: int, st: style::ComputedStyle) -> int is
+    let t: int = st.outline_w
+    if t <= 0 || st.outline_style == "none" is return 0 end
+    let o: style::Color = st.outline_color
+    let ox: int = x - t - st.outline_offset
+    let oy: int = y - t - st.outline_offset
+    let ow: int = w + (t + st.outline_offset) * 2
+    let oh: int = h + (t + st.outline_offset) * 2
+    if side_is_plain(st.outline_style) is
+        ffi_shim::silver_stroke_round_rect(win, ox, oy, ow, oh, max_radius(st) + t, t, o.r, o.g, o.b, scaled_alpha(o.a, st.opacity))
+        return 0
+    end
+    draw_line_styled(win, ox, oy, ow, t, false, st.outline_style, o, st.opacity)
+    draw_line_styled(win, ox, oy + oh - t, ow, t, false, st.outline_style, o, st.opacity)
+    draw_line_styled(win, ox, oy + t, oh - 2 * t, t, true, st.outline_style, o, st.opacity)
+    draw_line_styled(win, ox + ow - t, oy + t, oh - 2 * t, t, true, st.outline_style, o, st.opacity)
     return 0
 end
 
 ;; ---------- obrazy (object-fit / background-size) ----------
 fn draw_fitted(win: int, path: string, x: int, y: int, w: int, h: int, mode: string, alpha: int, rx: int, ry: int, rw: int, rh: int) -> int is
+    return draw_fitted_pos(win, path, x, y, w, h, mode, alpha, rx, ry, rw, rh, "50% 50%")
+end
+
+fn obj_pos_token(t: string, free: int) -> int is
+    if t == "left" || t == "top" is return 0 end
+    if t == "right" || t == "bottom" is return free end
+    if t == "center" is return free / 2 end
+    if string_ends_with(t, "%") is return free * str_to_int(string_slice(t, 0, string_len(t) - 1)) / 100 end
+    if string_ends_with(t, "px") is return str_to_int(string_slice(t, 0, string_len(t) - 2)) end
+    return free / 2
+end
+
+fn draw_fitted_pos(win: int, path: string, x: int, y: int, w: int, h: int, mode: string, alpha: int, rx: int, ry: int, rw: int, rh: int, pos: string) -> int is
     let iw: int = ffi_shim::silver_image_width(win, path)
     let ih: int = ffi_shim::silver_image_height(win, path)
     if iw <= 0 || ih <= 0 is return 0 end
@@ -135,8 +376,20 @@ fn draw_fitted(win: int, path: string, x: int, y: int, w: int, h: int, mode: str
         dw = iw
         dh = ih
     end
-    let dx: int = x + (w - dw) / 2
-    let dy: int = y + (h - dh) / 2
+    let pt: [string] = cssval::split_top(string_lower(pos))
+    let mut ptx: string = if array_len(pt) >= 1 then pt[0] else "50%"
+    let mut pty: string = if array_len(pt) >= 2 then pt[1] else "50%"
+    if array_len(pt) == 1 && (pt[0] == "top" || pt[0] == "bottom") is
+        pty = pt[0]
+        ptx = "50%"
+    end
+    if (ptx == "top" || ptx == "bottom") && array_len(pt) >= 2 is
+        let sw: string = ptx
+        ptx = pty
+        pty = sw
+    end
+    let dx: int = x + obj_pos_token(ptx, w - dw)
+    let dy: int = y + obj_pos_token(pty, h - dh)
     ffi_shim::silver_clip_set(win, rx, ry, rw, rh)
     ffi_shim::silver_draw_image(win, path, dx, dy, dw, dh, alpha)
     return 0
@@ -316,7 +569,7 @@ fn draw_input(win: int, d: dom::Dom, b: layout::LayoutBox, by: int, rs: RenderSt
     end
     if focused && rs.caret_on is
         let ime_w: int = if rs.ime != "" then text_width(win, rs.ime, st) else 0
-        fill(win, ix - scroll + caret_x + ime_w, ty, 1, lh, tc, 100)
+        fill(win, ix - scroll + caret_x + ime_w, ty, 1, lh, xcolor(st, "caret-color", tc), 100)
     end
     return 0
 end
@@ -324,10 +577,11 @@ end
 fn draw_check(win: int, b: layout::LayoutBox, by: int, d: dom::Dom, rs: RenderState, radio: bool) -> int is
     let n: dom::DomNode = d.nodes[b.node_id]
     let st: style::ComputedStyle = b.st
+    if props::xget(st.xp, "appearance") == "none" is return 0 end   ;; wygląd natywny wyłączony — autor stylizuje sam
     let size: int = 16
     let x: int = b.x + (b.w - size) / 2
     let y: int = by + (b.h - size) / 2
-    let accent: style::Color = style::Color { r: 11, g: 107, b: 203, a: 255 }
+    let accent: style::Color = (if st.has_accent then st.accent else style::Color { r: 11, g: 107, b: 203, a: 255 })
     let edge: style::Color = if n.checked then accent else style::Color { r: 118, g: 118, b: 118, a: 255 }
     let rad: int = if radio then 8 else 3
     round_fill(win, x, y, size, size, rad, if n.checked && !radio then accent else style::Color { r: 255, g: 255, b: 255, a: 255 }, st.opacity)
@@ -410,22 +664,44 @@ fn draw_scrollbar(win: int, b: layout::LayoutBox, by: int) -> int is
     if st.overflow_y != "scroll" && st.overflow_y != "auto" is return 0 end
     let inner_h: int = b.h - st.bt - st.bb
     if b.content_h <= inner_h || inner_h <= 0 is return 0 end
+    let sbw: string = props::xget(st.xp, "scrollbar-width")
+    if sbw == "none" is return 0 end
     ffi_shim::silver_clip_clear(win)
-    let track_x: int = b.x + b.w - st.br - 7
+    let tw: int = if sbw == "thin" then 3 else 5
+    let track_x: int = b.x + b.w - st.br - tw - 2
     let mut thumb: int = inner_h * inner_h / b.content_h
     if thumb < 24 is thumb = 24 end
     let range: int = b.content_h - inner_h
     let travel: int = inner_h - thumb
     let ty: int = by + st.bt + (if range > 0 then b.scroll_y * travel / range else 0)
-    ffi_shim::silver_fill_round_rect(win, track_x, ty, 5, thumb, 2, 90, 90, 90, 140)
+    let sbc: style::Color = xcolor(st, "scrollbar-color", style::Color { r: 90, g: 90, b: 90, a: 140 })
+    ffi_shim::silver_fill_round_rect(win, track_x, ty, tw, thumb, 2, sbc.r, sbc.g, sbc.b, if props::xhas(st.xp, "scrollbar-color") then 220 else 140)
     return 0
 end
 
 ;; ---------- główne rysowanie ----------
-fn background_of(win: int, b: layout::LayoutBox, x: int, y: int, w: int, h: int) -> int is
+;; Prostokąt [x,y,w,h] wg wartości background-clip/-origin: border-box | padding-box | content-box.
+pub fn bg_box_rect(st: style::ComputedStyle, key: string, x: int, y: int, w: int, h: int) -> [int] is
+    let v: string = props::xget(st.xp, key)
+    if v == "padding-box" || v == "padding" is
+        return [x + st.bl, y + st.bt, w - st.bl - st.br, h - st.bt - st.bb]
+    end
+    if v == "content-box" || v == "content" is
+        return [x + st.bl + st.pad_left, y + st.bt + st.pad_top, w - st.bl - st.br - st.pad_left - st.pad_right, h - st.bt - st.bb - st.pad_top - st.pad_bottom]
+    end
+    return [x, y, w, h]
+end
+
+fn background_of(win: int, b: layout::LayoutBox, x0: int, y0: int, w0: int, h0: int) -> int is
     let st: style::ComputedStyle = b.st
     let rad: int = max_radius(st)
-    if st.has_shadow is draw_shadow(win, x, y, w, h, st) end
+    if st.has_shadow is draw_shadow(win, x0, y0, w0, h0, st) end
+    let cr: [int] = bg_box_rect(st, "background-clip", x0, y0, w0, h0)
+    let x: int = cr[0]
+    let y: int = cr[1]
+    let w: int = cr[2]
+    let h: int = cr[3]
+    if w <= 0 || h <= 0 is return 0 end
     if st.has_bg is
         round_fill(win, x, y, w, h, rad, st.background, st.opacity)
     end
@@ -437,7 +713,12 @@ fn background_of(win: int, b: layout::LayoutBox, x: int, y: int, w: int, h: int)
     end
     if st.bg_image != "" is
         let mode: string = if st.bg_size == "auto" then "none" else st.bg_size
-        draw_fitted(win, st.bg_image, x, y, w, h, mode, scaled_alpha(255, st.opacity), x, y, w, h)
+        let orr: [int] = if props::xhas(st.xp, "background-origin") then bg_box_rect(st, "background-origin", x0, y0, w0, h0) else [x, y, w, h]
+        if mode == "none" is
+            draw_bg_natural(win, st.bg_image, orr[0], orr[1], orr[2], orr[3], st.bg_pos, st.bg_repeat, scaled_alpha(255, st.opacity))
+        else is
+            draw_fitted(win, st.bg_image, orr[0], orr[1], orr[2], orr[3], mode, scaled_alpha(255, st.opacity), x, y, w, h)
+        end
     end
     return 0
 end
@@ -452,29 +733,29 @@ fn set_box_clip(win: int, b: layout::LayoutBox, dy: int) -> int is
     return 0
 end
 
-pub fn render(win: int, boxes: [layout::LayoutBox], d: dom::Dom, rs: RenderState, bg: style::Color) -> int is
-    ffi_shim::silver_clear(win, bg.r, bg.g, bg.b)
-    let count: int = array_len(boxes)
-    let mut i: int = 0
-    while i < count is
-        let b: layout::LayoutBox = boxes[i]
-        i += 1
-        let dy: int = if b.fixed then 0 else 0 - rs.scroll_y
+fn draw_one(win: int, b: layout::LayoutBox, d: dom::Dom, rs: RenderState) -> int is
+        let dy: int = if b.fixed then 0 else 0 - rs.scroll_y + layout::sticky_dy(b, rs.scroll_y)
         let by: int = b.y + dy
-        if by > rs.viewport_h || by + b.h < 0 && b.kind != "text" is continue end
-        if by > rs.viewport_h is continue end
+        if by > rs.viewport_h || by + b.h < 0 && b.kind != "text" is return 0 end
+        if by > rs.viewport_h is return 0 end
         set_box_clip(win, b, dy)
         let st: style::ComputedStyle = b.st
-        if !st.visible is continue end
+        if !st.visible is return 0 end
         if b.kind == "box" || b.kind == "inlinebg" is
             let n: dom::DomNode = d.nodes[b.node_id]
+            if b.img_src != "" || st.bg_image != "" is
+                let ir: string = props::xval(st.xp, "image-rendering")
+                ffi_shim::silver_image_filter(win, if ir == "pixelated" || ir == "crisp-edges" || ir == "optimizespeed" then 1 elsif ir == "smooth" || ir == "high-quality" || ir == "optimizequality" then 2 else 0)
+            end
+            let bb: int = backdrop_blur_px(st)
+            if bb > 0 && b.kind == "box" is ffi_shim::silver_backdrop_blur(win, b.x, by, b.w, b.h, bb) end
             background_of(win, b, b.x, by, b.w, b.h)
             if b.img_src != "" is
                 let pad_x: int = b.x + st.bl + st.pad_left
                 let pad_y: int = by + st.bt + st.pad_top
                 let iw: int = b.w - st.bl - st.br - st.pad_left - st.pad_right
                 let ih: int = b.h - st.bt - st.bb - st.pad_top - st.pad_bottom
-                draw_fitted(win, b.img_src, pad_x, pad_y, iw, ih, st.object_fit, scaled_alpha(255, st.opacity), pad_x, pad_y, iw, ih)
+                draw_fitted_pos(win, b.img_src, pad_x, pad_y, iw, ih, st.object_fit, scaled_alpha(255, st.opacity), pad_x, pad_y, iw, ih, props::xval(st.xp, "object-position"))
                 set_box_clip(win, b, dy)
             end
             draw_border(win, b.x, by, b.w, b.h, st)
@@ -493,11 +774,9 @@ pub fn render(win: int, boxes: [layout::LayoutBox], d: dom::Dom, rs: RenderState
                 elsif n.tag == "select" is
                     draw_select(win, d, b, by, rs)
                 end
-                if rs.focused == b.node_id && st.outline_w > 0 is
-                    let o: style::Color = st.outline_color
+                if st.outline_w > 0 is
                     ffi_shim::silver_clip_clear(win)
-                    ffi_shim::silver_stroke_round_rect(win, b.x - st.outline_w, by - st.outline_w, b.w + st.outline_w * 2, b.h + st.outline_w * 2,
-                                                       max_radius(st) + st.outline_w, st.outline_w, o.r, o.g, o.b, scaled_alpha(o.a, st.opacity))
+                    draw_outline(win, b.x, by, b.w, b.h, st)
                     set_box_clip(win, b, dy)
                 end
                 if style::is_scroll_container(st) is
@@ -506,9 +785,53 @@ pub fn render(win: int, boxes: [layout::LayoutBox], d: dom::Dom, rs: RenderState
             end
         elsif b.kind == "text" || b.kind == "marker" is
             if b.text != "" is
-                let c: style::Color = st.color
-                ffi_shim::silver_draw_text_ex(win, b.x, by, b.text, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity), st.font_size, flags_of(st))
+                draw_text_full(win, b, by)
             end
+        end
+    return 0
+end
+
+fn group_seen(seen: [int], id: int) -> bool is
+    let mut k: int = 0
+    while k < array_len(seen) is
+        if seen[k] == id is return true end
+        k += 1
+    end
+    return false
+end
+
+;; Poddrzewo z obrotem/pochyleniem: rysowane do warstwy i składane z macierzą (natywnie).
+fn draw_group(win: int, boxes: [layout::LayoutBox], d: dom::Dom, rs: RenderState, id: int, first: layout::LayoutBox) -> int is
+    let dy: int = if first.fixed then 0 else 0 - rs.scroll_y
+    let xf: [int] = first.xf
+    let ok: bool = ffi_shim::silver_layer_begin(win, xf[8], xf[9] + dy, xf[10], xf[11])
+    let mut k: int = 0
+    while k < array_len(boxes) is
+        if boxes[k].xf_id == id is draw_one(win, boxes[k], d, rs) end
+        k += 1
+    end
+    ffi_shim::silver_clip_clear(win)
+    if ok is
+        ffi_shim::silver_layer_end(win, xf[0], xf[1], xf[2], xf[3], xf[4] / 1000, xf[5] / 1000, xf[6], xf[7] + dy, 255)
+    end
+    return 0
+end
+
+pub fn render(win: int, boxes: [layout::LayoutBox], d: dom::Dom, rs: RenderState, bg: style::Color) -> int is
+    ffi_shim::silver_clear(win, bg.r, bg.g, bg.b)
+    let count: int = array_len(boxes)
+    let mut seen: [int] = []
+    let mut i: int = 0
+    while i < count is
+        let b: layout::LayoutBox = boxes[i]
+        i += 1
+        if b.xf_id > 0 is
+            if !group_seen(seen, b.xf_id) is
+                seen = array_push(seen, b.xf_id)
+                draw_group(win, boxes, d, rs, b.xf_id, b)
+            end
+        else is
+            draw_one(win, b, d, rs)
         end
     end
     ffi_shim::silver_clip_clear(win)
@@ -523,15 +846,38 @@ fn inside_clip(b: layout::LayoutBox, px: int, py_doc: int, py_view: int) -> bool
     return px >= b.cx && px < b.cx + b.cw && py >= b.cy && py < b.cy + b.ch
 end
 
+;; Odwrotność macierzy xf (obrót/pochylenie wokół punktu obrotu) zastosowana do punktu okna.
+pub fn inv_xf_point(xf: [int], x: int, y: int) -> [int] is
+    let a: int = xf[0]
+    let b: int = xf[1]
+    let c: int = xf[2]
+    let dd: int = xf[3]
+    let det: int = (a * dd - b * c) / 1000
+    if det == 0 is return [x, y] end
+    let u: int = x - xf[6] - xf[4] / 1000
+    let v: int = y - xf[7] - xf[5] / 1000
+    let lx: int = (dd * u - c * v) / det
+    let ly: int = (a * v - b * u) / det
+    return [xf[6] + lx, xf[7] + ly]
+end
+
 ;; id węzła na wierzchu w punkcie (dowolny element), -1 gdy nic.
 pub fn hit_test_at(boxes: [layout::LayoutBox], px: int, py: int, scroll_y: int) -> int is
     let mut i: int = array_len(boxes) - 1
     while i >= 0 is
         let b: layout::LayoutBox = boxes[i]
         i -= 1
-        let y_doc: int = py + scroll_y
+        let sd: int = layout::sticky_dy(b, scroll_y)
+        let y_doc: int = py + scroll_y - sd
         let y: int = if b.fixed then py else y_doc
-        if px >= b.x && px < b.x + b.w && y >= b.y && y < b.y + b.h && inside_clip(b, px, y_doc, py) && b.st.visible is
+        let mut qx: int = px
+        let mut qy: int = y
+        if b.xf_id > 0 is
+            let q: [int] = inv_xf_point(b.xf, px, y)
+            qx = q[0]
+            qy = q[1]
+        end
+        if qx >= b.x && qx < b.x + b.w && qy >= b.y && qy < b.y + b.h && inside_clip(b, qx, qy, qy) && b.st.visible && b.st.pointer_events is
             return b.node_id
         end
     end
