@@ -92,7 +92,7 @@ write_pc() { # nazwa opis libs
         echo "libdir=$ABS_OUT"
         echo "Name: $1"
         echo "Description: $2"
-        echo "Version: 0.2.0"
+        echo "Version: 0.3.0"
         echo "Libs: -L\${libdir} -l$1 $3"
     } > "$PC/$1.pc"
 }
@@ -113,7 +113,7 @@ if [ -f "$OUT/static-libs.txt" ]; then
             echo "libdir=$ABS_OUT"
             echo "Name: $1"
             echo "Description: $3 (static)"
-            echo "Version: 0.2.0"
+            echo "Version: 0.3.0"
             echo "Libs: -L\${libdir} -L$ABS_OUT/deps/lib -l$2 $4"
         } > "$PCS/$1.pc"
     }
