@@ -1,35 +1,44 @@
 # Roadmap
 
-Czego jeszcze nie ma w 0.2 — uczciwa lista, od najważniejszych.
+Czego jeszcze nie ma w 0.3 — uczciwa lista, od najważniejszych. Zamknięte w 0.3: `float`, tabele, `z-index`, `sticky`, `transform`
+(translate/scale), `filter`, `clip-path`, `@keyframes`/`animation`, przejścia geometrii, `@font-face` i kilka krojów, `letter-spacing`,
+`text-shadow`, zwijanie marginesów rodzic↔dziecko, `align-content`, `grid-template-areas`/`grid-row`, generowanie treści `::before/::after`,
+`:nth-child(… of S)`, `:has()`, `@import`; w JS: układ dla `getBoundingClientRect`/`getComputedStyle`, obserwatory, synchroniczne `preventDefault`,
+moduły ES, `Intl`, trwały `localStorage`, `Worker`, `WebSocket`, nagłówki `fetch`, Shadow DOM, Custom Elements, source mapy, React/Vue/Solid.
 
 ## Do zrobienia najpierw
-- [ ] **Pierwszy pełny `bit build` + uruchomienie okna** na prawdziwym H# (reszta była sprawdzana częściami — patrz README).
-- [ ] Testy interpretera H# nie obejmują: dopasowania enumów w polach struktur oraz wywołań `fn` z pól struktur
-      (2 testy `ipc` i 3 testy `jsonval` — łącznie 5 ze 138 — wymagają skompilowanego H#; w interpreterze przechodzi 133).
-- [ ] Testy integracyjne okna (zrzuty ekranu pod Xvfb porównywane z wzorcami).
+- [ ] **Pierwszy pełny `bit build` + uruchomienie okna** na prawdziwym H# (silnik, układ i most JS są sprawdzone częściami — patrz README).
+      Dotyczy zwłaszcza nowego kodu rysowania (`paint.h#`: ramki `dashed/dotted`, `text-shadow`, `letter-spacing`, tło z powtarzaniem, `sticky`)
+      i integracji animacji w `app.h#`, które przeszły parser i type-checker, ale nigdy nie były wyrenderowane.
+- [ ] Testy interpretera H# nie obejmują dopasowania enumów w polach struktur oraz UTF-8 przez FFI (4 testy z 287: 2 `ipc`, 2 edycja UTF-8).
+- [ ] Testy integracyjne okna (zrzuty ekranu pod Xvfb porównywane z wzorcami) — także dla nowych funkcji CSS.
+- [ ] CI uruchamiające `native/tests/run-all.sh` (dziś `ci.yml` wykonuje tylko budowę shimów i testy natywne).
 
-## JavaScript / frameworki
-- [ ] `getBoundingClientRect`, `offsetWidth/Height`, `getComputedStyle` z prawdziwymi wartościami z układu
-      (dziś zwracają zera / styl inline). Wymaga synchronicznego udostępnienia układu JS-owi (cache z ostatniej klatki).
-- [ ] `MutationObserver`/`ResizeObserver`/`IntersectionObserver` działające (dziś atrapy).
-- [ ] `preventDefault()` działające — zdarzenia są asynchroniczne; potrzebny tryb synchronicznej wymiany dla wybranych typów.
-- [ ] ES modules (`import` w plikach ładowanych przez `load_js`) — dziś tylko bundle IIFE.
-- [ ] `Intl`, `localStorage` trwałe (dziś w pamięci), `Worker`, `WebSocket`, nagłówki w `fetch`.
-- [ ] Vue, Solid, React — niesprawdzone (Preact i Svelte 4/5 sprawdzone).
-- [ ] Source mapy dla błędów TypeScript w konsoli.
+## JavaScript
+- [ ] `wss://` (TLS) dla `WebSocket`; `Worker` w osobnym wątku/kontekście QuickJS (dziś ten sam wątek, bez izolacji).
+- [ ] Pełne `Intl` (dane CLDR, strefy czasowe, `formatToParts`), `import()` po URL, `import.meta`.
+- [ ] Shadow DOM z enkapsulacją CSS (`:host`, `::slotted`), treścią zapasową slotu i `slotchange`; `formAssociated`/`extends` w Custom Elements.
+- [ ] `fetch`: strumieniowanie, `FormData`, ciasteczka, odpowiedź binarna bez pośrednictwa tekstu; wywołania nie blokujące pętli.
+- [ ] `getComputedStyle` dla elementów, o które JS nie pytał wcześniej, bez opóźnienia o jedną klatkę.
+- [ ] Source mapy dla skryptów wstrzykiwanych inaczej niż przez `load_js`/`<script src>`.
 
 ## CSS i układ
-- [ ] `float`, `display: table` (dziś `tr` = flex, `td` = elastyczna komórka), `position: sticky`, `z-index` (kolejność = kolejność dokumentu).
-- [ ] `@keyframes` / `animation`, `transition` dla wymiarów i transformacji, `transform`, `filter`, `clip-path`.
-- [ ] `@font-face`, wiele krojów (dziś jeden font systemowy + pogrubienie/kursywa syntetyczne), `letter-spacing`, `text-shadow`.
-- [ ] Zwijanie marginesów rodzic↔dziecko (jest tylko między rodzeństwem), `align-content`, `grid-template-areas`, `grid-row`.
-- [ ] Zaawansowane `::before/::after` (dziś reguły są parsowane, generowanie treści ograniczone), `:nth-child(… of S)`.
-- [ ] Bidi/RTL, łamanie wierszy wg UAX #14, shaping złożonych pism.
+- [ ] Transformacje 3D (`perspective`, `transform-style`), zagnieżdżone obrócone elementy (dziś działa tylko najbardziej wewnętrzna rotacja), `zoom`.
+- [ ] `position: sticky` w kontenerach przewijanych, `@property`, `@scope` z ewaluacją, jednostki kontenerowe `cqw/cqh`, `@container style()`.
+- [ ] Nazwane linie siatki, `align-content` dla grid, wiersze `fr` z wysokością kontenera, `masonry`.
+- [ ] Wiele kolumn: `column-span: all`, równoważenie z dzieleniem pojedynczych wierszy tekstu wewnątrz bloków.
+- [ ] Nadal tylko parsowane (P): SVG (`fill`, `stroke*`, …), `mask*`, `mix-blend-mode`, `border-image*`, `scroll-snap-*`, `overscroll-behavior`, `user-select`, `resize`,
+      `font-variant-*`, `font-stretch`, `quotes`, `list-style-image`, `writing-mode` pionowy, `anchor-*`/`position-*`, animacje sterowane przewijaniem.
+- [ ] Float: dokładne pozycjonowanie względem marginesów rodzeństwa; floaty wewnątrz komórek tabel i flexa.
+- [ ] Animacje: `animation-play-state` (pauza), przejścia pojedynczych właściwości o różnych czasach (dziś jeden czas i funkcja na regułę), animacje `rotate`.
+- [ ] Czcionki: WOFF2 (wymaga Brotli; WOFF 1.0 jest), lista zapasowych krojów (dziś pierwsza nazwa z `font-family`), `font-variant`, czcionki zmienne, `font` skrótowo z rodziną.
+- [ ] Rozmycie `text-shadow`/`box-shadow` (dziś przybliżenie), `filter: blur()` (jest `backdrop-filter: blur()`).
+- [ ] Pełne Bidi (mieszane kierunki w jednym wierszu; RTL w podstawowym wariancie jest), łamanie wierszy wg UAX #14, shaping złożonych pism.
 
 ## System i platformy
 - [ ] Tray, natywne menu, natywne dialogi bez zewnętrznych narzędzi (dziś zenity/kdialog/osascript/PowerShell).
 - [ ] Dostępność (accessibility tree, czytniki ekranu).
-- [ ] Wayland: testy (SDL2 powinien działać), IME na każdej platformie.
+- [ ] Wayland: testy (SDL2 powinien działać), IME na każdej platformie; WebSocket i `curl` na Windows.
 - [ ] Android/iOS.
 
 ## Narzędzia
