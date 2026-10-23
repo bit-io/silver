@@ -48,6 +48,13 @@ extern static [c, "silvershim"] is
     fn silver_image_forget(h: int, path: string) -> bool
     fn silver_draw_image(h: int, path: string, x: int, y: int, w: int, rh: int, a: int) -> bool
 
+    fn silver_image_filter(h: int, mode: int) -> bool
+    fn silver_backdrop_blur(h: int, x: int, y: int, w: int, rh: int, radius: int) -> bool
+
+    ;; 0.3: warstwy z transformacją afiniczną (obrót / pochylenie): begin → rysowanie → end
+    fn silver_layer_begin(h: int, x: int, y: int, w: int, rh: int) -> bool
+    fn silver_layer_end(h: int, a: int, b: int, c: int, d: int, e: int, f: int, ox: int, oy: int, alpha: int) -> bool
+
     ;; schowek, kursor, powiadomienia, motyw
     fn silver_clipboard_get() -> string
     fn silver_clipboard_set(text: string) -> bool
@@ -74,6 +81,7 @@ extern static [c, "silvershim"] is
     fn silver_measure_text(h: int, text: string) -> int
     fn silver_measure_text_ex(h: int, text: string, size: int, style: int) -> int
     fn silver_font_height(h: int, size: int) -> int
+    fn silver_font_register(h: int, key: int, path: string, bold: int, italic: int) -> int
     fn silver_text_fit(h: int, text: string, size: int, style: int, max_w: int) -> int
     fn silver_present(h: int) -> bool
     fn silver_delay(ms: int) -> bool
