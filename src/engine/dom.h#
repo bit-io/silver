@@ -98,7 +98,7 @@ fn named_entity(name: string) -> string is
     return ""
 end
 
-fn hex_val(s: string) -> int is
+pub fn hex_val(s: string) -> int is
     let digits: string = "0123456789abcdef"
     let lower: string = string_lower(s)
     let mut r: int = 0
@@ -112,7 +112,7 @@ fn hex_val(s: string) -> int is
     return r
 end
 
-fn codepoint_to_str(cp: int) -> string is
+pub fn codepoint_to_str(cp: int) -> string is
     if cp <= 0 || cp > 1114111 is return "" end
     if cp < 128 is return char_code_to_str(cp) end
     return char_code_to_str(cp)
