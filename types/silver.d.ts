@@ -49,6 +49,8 @@ interface SilverClipboardApi {
 
 interface SilverApi {
   readonly version: string;
+  /** Rejestruje source mapę skryptu (stosy błędów wskażą pliki .ts). Mapy z //# sourceMappingURL i <plik>.map ładują się same. */
+  registerSourceMap(scriptName: string, map: string | object): void;
   /**
    * Woła komendę zarejestrowaną w H# (`app::command`). Promise jest
    * odrzucany błędem, gdy komenda nie istnieje, jest zabroniona dla JS
