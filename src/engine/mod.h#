@@ -4,8 +4,13 @@ mod props_data
 mod props
 mod css
 mod style
+mod typo
+mod shape
+mod anchor
 mod anim
 mod layout
+mod gfx
+mod svg
 mod paint
 mod template
 mod jsonlite
