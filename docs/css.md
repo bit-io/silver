@@ -20,7 +20,7 @@ Długości: `px`, `%`, `em`, `rem`, `vw`, `vh`, `vmin`, `vmax`, `pt`, `pc`, `cm`
 ## Pokrycie
 **Wszystkie 474 właściwości CSS** z `tools/css_properties.txt` są **parsowane i walidowane** według gramatyki (`src/engine/props.h#`, tabela generowana
 przez `tools/gen_props.py`): poprawna wartość trafia do stylu obliczonego (`xp`) z dziedziczeniem, `initial/inherit/unset` i `@supports`; niepoprawna
-jest ignorowana jak w przeglądarce. **267 z 474 (56%)** ma realny wpływ na układ, rysowanie lub zachowanie — lista w `tools/css_rendered.txt`.
+jest ignorowana jak w przeglądarce. **452 z 474 (95,4%)** ma realny wpływ na układ, rysowanie lub zachowanie — lista w `tools/css_rendered.txt`; kolejne 10 jest zgodnie ze specyfikacją bezskuteczne na pulpicie (`tools/css_noop_by_spec.txt`), 12 nie ma jeszcze implementacji (patrz ROADMAP.md).
 Z ~118 najczęściej używanych właściwości **116 (98%)** jest renderowanych; tylko `user-select` i `resize` są parsowane bez efektu
 (Silver nie ma zaznaczania tekstu dokumentu ani uchwytu zmiany rozmiaru). Liczby: `python3 tools/css_coverage.py`.
 Uwaga: to pokrycie *właściwości*, nie zgodność ze specyfikacją — wiele z nich działa w wariancie uproszczonym (patrz niżej).
@@ -106,4 +106,13 @@ Specyficzność: pełna + kolejność źródłowa; `!important` i style inline.
 ## Znane uproszczenia
 `position: sticky` wewnątrz kontenerów przewijanych (działa względem przewijania dokumentu), `:host` w Shadow DOM, WOFF2,
 listy zapasowych krojów (`font-family` używa pierwszej nazwy), `zoom`, pełne Bidi (mieszane kierunki w wierszu) i shaping złożonych pism, pisma pionowe,
-zagnieżdżone obrócone elementy (działa tylko najbardziej wewnętrzna rotacja), `column-span`, tryby mieszania (`mix-blend-mode`). Pełna lista: [ROADMAP.md](../ROADMAP.md).
+zagnieżdżone obrócone elementy (działa tylko najbardziej wewnętrzna rotacja), tryby mieszania (`mix-blend-mode`). Pełna lista: [ROADMAP.md](../ROADMAP.md).
+
+### Dodane w 0.4 (uproszczenia)
+- `hyphens: auto` — heurystyka sylab bez słowników językowych; `font-variant: small-caps` — wersaliki bez zmniejszenia pisma;
+  `empty-cells: hide` — tylko przy `border-collapse: separate`; `quotes` — głębokość liczona w kolejności dokumentu po pseudo-elementach.
+
+### 0.4 — nowe możliwości i znane ograniczenia
+Pełna lista w `CHANGELOG.md` (sekcja 0.4). Grafika (gradienty, tła warstwowe, `border-image`, `mask-*`, `mix-blend-mode`, `filter`, SVG) działa przez
+`native/silver_fx.h` + `silver_shim.c` i jest testowana pikselami (`tools/run_paint_tests.sh`, `native/tests/fx_gfx.c`).
+Nadal tylko parsowane: cechy OpenType, pisma pionowe, transformacje 3D, pozycjonowanie kotwicowe, `shape-outside`, filtry SVG (patrz CHANGELOG).
