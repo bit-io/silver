@@ -1,0 +1,394 @@
+mod cssval
+mod props
+use "std -> conv" from "conv"
+
+;; 0.4: shape-outside — geometria kształtów (circle, ellipse, inset, polygon, pola odniesienia).
+;; Kształt jest zamieniany na pasy poziome o wysokości `STEP` px; każdy pas to zwykły prostokątny wpis w liście floatów
+;; [strona, góra, dół, lewo, prawo], więc cały istniejący mechanizm układu (line_bounds, clear, kolejne floaty) działa bez zmian.
+;; Opis kształtu (desc) to płaska lista liczb bezwzględnych: [1, l, t, r, b] prostokąt | [2, cx, cy, rx, ry] elipsa |
+;; [3, n, x0, y0, x1, y1, …] wielokąt. Bez tworzenia kształtu z obrazu (url(), gradient) — patrz ROADMAP.
+
+pub fn step() -> int is return 4 end
+
+pub fn isqrt(n: int) -> int is
+    if n <= 0 is return 0 end
+    let mut x: int = n
+    let mut y: int = (x + 1) / 2
+    let mut guard: int = 0
+    while y < x && guard < 64 is
+        x = y
+        y = (x + n / x) / 2
+        guard += 1
+    end
+    return x
+end
+
+fn fnum(tok: string) -> f64 is
+    return conv::str_to_float(tok)
+end
+
+;; Długość: px / em / % (względem `ref`) / liczba; słowa kluczowe pozycji → ułamek `ref`.
+pub fn len_px(tok0: string, ref: int, em: int) -> int is
+    let tok: string = string_lower(string_trim(tok0))
+    if tok == "left" || tok == "top" is return 0 end
+    if tok == "right" || tok == "bottom" is return ref end
+    if tok == "center" is return ref / 2 end
+    if string_ends_with(tok, "%") is
+        return conv::float_to_int(fnum(string_slice(tok, 0, string_len(tok) - 1)) * conv::int_to_float(ref) / 100.0)
+    end
+    if string_ends_with(tok, "px") is return conv::float_to_int(fnum(string_slice(tok, 0, string_len(tok) - 2))) end
+    if string_ends_with(tok, "em") is
+        return conv::float_to_int(fnum(string_slice(tok, 0, string_len(tok) - 2)) * conv::int_to_float(em))
+    end
+    if tok == "" || tok == "none" is return 0 end
+    return conv::float_to_int(fnum(tok))
+end
+
+fn func_name(t: string) -> string is
+    let p: int = string_find(t, "(")
+    if p < 0 is return "" end
+    return string_lower(string_trim(string_slice(t, 0, p)))
+end
+
+fn func_args(t: string) -> string is
+    let p: int = string_find(t, "(")
+    if p < 0 is return "" end
+    let mut e: int = string_len(t)
+    if string_ends_with(t, ")") is e = e - 1 end
+    return string_trim(string_slice(t, p + 1, e))
+end
+
+pub fn is_box_kw(t: string) -> bool is
+    return t == "margin-box" || t == "border-box" || t == "padding-box" || t == "content-box"
+end
+
+;; Słowo kluczowe pola odniesienia z wartości shape-outside ("" = domyślne margin-box).
+pub fn ref_box_kw(v: string) -> string is
+    let toks: [string] = cssval::split_top(string_lower(string_trim(v)))
+    let mut i: int = 0
+    while i < array_len(toks) is
+        if is_box_kw(toks[i]) is return toks[i] end
+        i += 1
+    end
+    return "margin-box"
+end
+
+;; Czy wartość to kształt, który umiemy wykonać (basic-shape albo samo pole).
+pub fn supported(v: string) -> bool is
+    let toks: [string] = cssval::split_top(string_lower(string_trim(v)))
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let n: string = func_name(toks[i])
+        if n == "circle" || n == "ellipse" || n == "inset" || n == "polygon" || is_box_kw(toks[i]) is return true end
+        i += 1
+    end
+    return false
+end
+
+fn pos_split(args: string) -> [string] is
+    ;; "<promień> at <x> <y>" → [promień, pozycja]
+    let low: string = string_lower(args)
+    let p: int = string_find(low, " at ")
+    if p >= 0 is return [string_trim(string_slice(args, 0, p)), string_trim(string_slice(args, p + 4, string_len(args)))] end
+    if string_starts_with(low, "at ") is return ["", string_trim(string_slice(args, 3, string_len(args)))] end
+    return [string_trim(args), ""]
+end
+
+fn center_of(pos: string, rw: int, rh: int, em: int) -> [int] is
+    if pos == "" is return [rw / 2, rh / 2] end
+    let t: [string] = cssval::split_top(pos)
+    if array_len(t) == 1 is
+        if t[0] == "top" || t[0] == "bottom" is return [rw / 2, len_px(t[0], rh, em)] end
+        return [len_px(t[0], rw, em), rh / 2]
+    end
+    ;; "top left" / "bottom right" — kolejność słów kluczowych dowolna
+    if t[0] == "top" || t[0] == "bottom" is return [len_px(t[1], rw, em), len_px(t[0], rh, em)] end
+    return [len_px(t[0], rw, em), len_px(t[1], rh, em)]
+end
+
+;; Buduje opis kształtu; (rx, ry, rw, rh) = pole odniesienia we współrzędnych bezwzględnych; `margin` = shape-margin.
+;; Zwraca [] gdy kształt nieobsługiwany lub pusty.
+pub fn build(v: string, rx: int, ry: int, rw: int, rh: int, margin: int, em: int) -> [int] is
+    let toks: [string] = cssval::split_top(string_trim(v))
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let name: string = func_name(toks[i])
+        let args: string = func_args(toks[i])
+        i += 1
+        if name == "circle" || name == "ellipse" is
+            let ps: [string] = pos_split(args)
+            let c: [int] = center_of(ps[1], rw, rh, em)
+            let dl: int = c[0]
+            let dr: int = rw - c[0]
+            let dt: int = c[1]
+            let db: int = rh - c[1]
+            let cl_x: int = if dl < dr then dl else dr
+            let cl_y: int = if dt < db then dt else db
+            let fa_x: int = if dl > dr then dl else dr
+            let fa_y: int = if dt > db then dt else db
+            let rt: [string] = if ps[0] == "" then [] else cssval::split_top(string_lower(ps[0]))
+            if name == "circle" is
+                let tok: string = if array_len(rt) >= 1 then rt[0] else "closest-side"
+                let cl: int = if cl_x < cl_y then cl_x else cl_y
+                let fa: int = if fa_x > fa_y then fa_x else fa_y
+                let mut r: int = cl
+                if tok == "farthest-side" is r = fa
+                else is
+                    if tok != "closest-side" is
+                        let refd: int = isqrt((rw * rw + rh * rh) / 2)
+                        r = len_px(tok, refd, em)
+                    end
+                end
+                return [2, rx + c[0], ry + c[1], r + margin, r + margin]
+            end
+            let tx: string = if array_len(rt) >= 1 then rt[0] else "closest-side"
+            let ty: string = if array_len(rt) >= 2 then rt[1] else tx
+            let mut ex: int = cl_x
+            let mut ey: int = cl_y
+            if tx == "farthest-side" is ex = fa_x
+            else is
+                if tx != "closest-side" is ex = len_px(tx, rw, em) end
+            end
+            if ty == "farthest-side" is ey = fa_y
+            else is
+                if ty != "closest-side" is ey = len_px(ty, rh, em) end
+            end
+            return [2, rx + c[0], ry + c[1], ex + margin, ey + margin]
+        end
+        if name == "inset" is
+            let low: string = string_lower(args)
+            let rp: int = string_find(low, " round ")
+            let body: string = if rp >= 0 then string_slice(args, 0, rp) else args
+            let t: [string] = cssval::split_top(string_trim(body))
+            let n: int = array_len(t)
+            if n == 0 is return [] end
+            let top: int = len_px(t[0], rh, em)
+            let right: int = if n >= 2 then len_px(t[1], rw, em) else top
+            let bottom: int = if n >= 3 then len_px(t[2], rh, em) else top
+            let left: int = if n >= 4 then len_px(t[3], rw, em) else right
+            return [1, rx + left - margin, ry + top - margin, rx + rw - right + margin, ry + rh - bottom + margin]
+        end
+        if name == "polygon" is
+            let parts: [string] = cssval::split_commas(args)
+            let mut out: [int] = [3, 0]
+            let mut n: int = 0
+            let mut k: int = 0
+            while k < array_len(parts) is
+                let p: string = string_trim(parts[k])
+                k += 1
+                let lp: string = string_lower(p)
+                if lp == "nonzero" || lp == "evenodd" is continue end
+                let xy: [string] = cssval::split_top(p)
+                if array_len(xy) < 2 is continue end
+                out = array_push(out, rx + len_px(xy[0], rw, em))
+                out = array_push(out, ry + len_px(xy[1], rh, em))
+                n += 1
+            end
+            if n < 3 is return [] end
+            out[1] = n
+            out = array_push(out, margin)
+            return out
+        end
+    end
+    ;; samo pole odniesienia (margin-box itd.) → prostokąt
+    if ref_box_kw(v) != "" && supported(v) is return [1, rx - margin, ry - margin, rx + rw + margin, ry + rh + margin] end
+    return []
+end
+
+;; Zakres pionowy kształtu [góra, dół).
+pub fn y_range(d: [int]) -> [int] is
+    if array_len(d) == 0 is return [0, 0] end
+    if d[0] == 1 is return [d[2], d[4]] end
+    if d[0] == 2 is return [d[2] - d[4], d[2] + d[4]] end
+    if d[0] == 4 is return [d[2] - d[5], d[2] + d[4] + d[5]] end
+    let n: int = d[1]
+    let m: int = d[2 + n * 2]
+    let mut top: int = 1000000
+    let mut bot: int = -1000000
+    let mut i: int = 0
+    while i < n is
+        let y: int = d[3 + i * 2]
+        if y < top is top = y end
+        if y > bot is bot = y end
+        i += 1
+    end
+    return [top - m, bot + m]
+end
+
+;; Poziomy zasięg kształtu na wysokości y: [lewo, prawo] albo [] gdy puste.
+pub fn extent(d: [int], y: int) -> [int] is
+    if array_len(d) == 0 is return [] end
+    if d[0] == 1 is
+        if y >= d[2] && y < d[4] && d[3] > d[1] is return [d[1], d[3]] end
+        return []
+    end
+    if d[0] == 4 is return image_extent(d, y) end
+    if d[0] == 2 is
+        let dy: int = y - d[2]
+        let ry: int = d[4]
+        let rx: int = d[3]
+        if ry <= 0 || rx <= 0 || dy > ry || dy < 0 - ry is return [] end
+        let half: int = rx * isqrt(ry * ry - dy * dy) / ry
+        return [d[1] - half, d[1] + half]
+    end
+    let n: int = d[1]
+    let m: int = d[2 + n * 2]
+    let mut lo: int = 1000000
+    let mut hi: int = -1000000
+    let mut i: int = 0
+    while i < n is
+        let j: int = (i + 1) % n
+        let xa: int = d[2 + i * 2]
+        let ya: int = d[3 + i * 2]
+        let xb: int = d[2 + j * 2]
+        let yb: int = d[3 + j * 2]
+        let ymin: int = if ya < yb then ya else yb
+        let ymax: int = if ya > yb then ya else yb
+        if ya == yb is
+            if y == ya is
+                if xa < lo is lo = xa end
+                if xb < lo is lo = xb end
+                if xa > hi is hi = xa end
+                if xb > hi is hi = xb end
+            end
+        else is
+            if y >= ymin && y <= ymax is
+                let x: int = xa + (y - ya) * (xb - xa) / (yb - ya)
+                if x < lo is lo = x end
+                if x > hi is hi = x end
+            end
+        end
+        i += 1
+    end
+    ;; shape-margin dla wielokąta: przybliżenie — poszerzenie zasięgu poziomo i rozciągnięcie pionowe
+    if lo > hi is
+        if m > 0 is
+            let a: [int] = extent_poly_near(d, y - m)
+            let b: [int] = extent_poly_near(d, y + m)
+            if array_len(a) == 2 && array_len(b) == 2 is
+                return [(if a[0] < b[0] then a[0] else b[0]) - m, (if a[1] > b[1] then a[1] else b[1]) + m]
+            end
+            if array_len(a) == 2 is return [a[0] - m, a[1] + m] end
+            if array_len(b) == 2 is return [b[0] - m, b[1] + m] end
+        end
+        return []
+    end
+    return [lo - m, hi + m]
+end
+
+fn extent_poly_near(d: [int], y: int) -> [int] is
+    let n: int = d[1]
+    let mut lo: int = 1000000
+    let mut hi: int = -1000000
+    let mut i: int = 0
+    while i < n is
+        let j: int = (i + 1) % n
+        let xa: int = d[2 + i * 2]
+        let ya: int = d[3 + i * 2]
+        let xb: int = d[2 + j * 2]
+        let yb: int = d[3 + j * 2]
+        let ymin: int = if ya < yb then ya else yb
+        let ymax: int = if ya > yb then ya else yb
+        if ya != yb && y >= ymin && y <= ymax is
+            let x: int = xa + (y - ya) * (xb - xa) / (yb - ya)
+            if x < lo is lo = x end
+            if x > hi is hi = x end
+        end
+        i += 1
+    end
+    if lo > hi is return [] end
+    return [lo, hi]
+end
+
+;; Wpisy listy floatów (po 5 liczb) dla kształtu `d` float'a po stronie `side` (0 lewa, 1 prawa) o polu marginesu
+;; [fx, py, tw, th]. Dolny wpis dopełnia float do dołu pola marginesu (dla `clear`).
+pub fn records(d: [int], side: int, fx: int, py: int, tw: int, th: int) -> [int] is
+    let mut out: [int] = []
+    let yr: [int] = y_range(d)
+    let st: int = step()
+    let mut y: int = yr[0]
+    if y < py - st * 64 is y = py - st * 64 end
+    let ylim: int = if yr[1] > py + th then yr[1] else py + th
+    let mut last_bot: int = py
+    let mut guard: int = 0
+    while y < yr[1] && guard < 2000 is
+        guard += 1
+        let y1: int = y + st
+        let a: [int] = extent(d, y)
+        let b: [int] = extent(d, y + st / 2)
+        let c: [int] = extent(d, y1 - 1)
+        let mut lo: int = 1000000
+        let mut hi: int = -1000000
+        let ex: [[int]] = [a, b, c]
+        let mut k: int = 0
+        while k < 3 is
+            if array_len(ex[k]) == 2 is
+                if ex[k][0] < lo is lo = ex[k][0] end
+                if ex[k][1] > hi is hi = ex[k][1] end
+            end
+            k += 1
+        end
+        if lo <= hi is
+            if side == 0 is
+                if hi > fx is
+                    out = array_push(array_push(array_push(array_push(array_push(out, 0), y), y1), fx), hi)
+                    if y1 > last_bot is last_bot = y1 end
+                end
+            else is
+                if lo < fx + tw is
+                    out = array_push(array_push(array_push(array_push(array_push(out, 1), y), y1), lo), fx + tw)
+                    if y1 > last_bot is last_bot = y1 end
+                end
+            end
+        end
+        y = y1
+    end
+    if py + th > last_bot is
+        let edge_l: int = if side == 0 then fx else fx + tw
+        out = array_push(array_push(array_push(array_push(array_push(out, side), last_bot), py + th), edge_l), edge_l)
+    end
+    return out
+end
+
+;; 0.4: kształt z obrazu — pasy alfa ("l r l r …" w promilach szerokości, "-1 -1" = pusty pas) rozciągnięte na pole odniesienia.
+;; Opis: [4, x, y, w, h, margines, n, l0, r0, …].
+pub fn build_image(bands: string, rx: int, ry: int, rw: int, rh: int, margin: int) -> [int] is
+    if bands == "" || rw <= 0 || rh <= 0 is return [] end
+    let toks: [string] = string_split(bands, " ")
+    let n: int = array_len(toks) / 2
+    if n < 1 is return [] end
+    let mut d: [int] = [4, rx, ry, rw, rh, margin, n]
+    let mut i: int = 0
+    while i < array_len(toks) is
+        d = array_push(d, str_to_int(toks[i]))
+        i += 1
+    end
+    return d
+end
+
+;; Zasięg poziomy kształtu z obrazu w wierszu y (z shape-margin: ±m w pionie i poziomie).
+fn image_extent(d: [int], y: int) -> [int] is
+    let n: int = d[6]
+    let m: int = d[5]
+    let mut lo: int = 1000000
+    let mut hi: int = -1000000
+    let mut yy: int = y - m
+    let step_y: int = if m > 0 then m else 1
+    while yy <= y + m is
+        let rel: int = yy - d[2]
+        if rel >= 0 && rel < d[4] is
+            let b: int = rel * n / d[4]
+            let l: int = d[7 + b * 2]
+            let r: int = d[8 + b * 2]
+            if l >= 0 && r > l is
+                let x0: int = d[1] + l * d[3] / 1000
+                let x1: int = d[1] + r * d[3] / 1000
+                if x0 < lo is lo = x0 end
+                if x1 > hi is hi = x1 end
+            end
+        end
+        yy += step_y
+    end
+    if lo > hi is return [] end
+    return [lo - m, hi + m]
+end
