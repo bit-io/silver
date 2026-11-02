@@ -35,3 +35,81 @@ text-underline-offset text-underline-position text-wrap text-wrap-mode text-wrap
 transition transition-delay transition-duration transition-property transition-timing-function translate vertical-align visibility
 white-space white-space-collapse width will-change word-break word-spacing word-wrap z-index
 backdrop-filter appearance scroll-behavior
+
+# 0.4 (kazda pozycja ma test t04_* w engine_tests.h#)
+hyphens column-span quotes caption-side empty-cells font-variant font-variant-caps
+grid-column-start grid-column-end grid-row-start grid-row-end place-content
+grid grid-template scroll-snap-type scroll-snap-align overscroll-behavior overscroll-behavior-y overscroll-behavior-block
+scrollbar-gutter margin-trim
+animation-play-state
+
+# 0.4 batch 3 (testy t04_*)
+orphans widows user-select resize zoom text-justify list-style-image
+overscroll-behavior-x overscroll-behavior-inline scroll-margin-left scroll-margin-right scroll-padding-left scroll-padding-right
+
+# 0.4 batch 4 (testy e2e/paint_tests.h# i t04_*)
+mix-blend-mode background-blend-mode background-attachment background-origin background-clip background-image background-position background-size background-repeat
+mask mask-image mask-mode mask-size mask-position mask-repeat mask-origin mask-clip mask-composite
+scroll-margin-bottom scroll-margin-block-end scroll-margin-inline scroll-margin-inline-end scroll-margin-inline-start scroll-padding-bottom scroll-padding-block-end scroll-padding-inline scroll-padding-inline-end scroll-padding-inline-start scroll-snap-stop
+border-image border-image-source border-image-slice border-image-width border-image-outset border-image-repeat
+mask-border mask-border-source mask-border-slice mask-border-width mask-border-outset mask-border-repeat mask-border-mode
+
+# 0.4 batch 5: SVG (NanoSVG + serializer), testy e2e
+fill fill-opacity fill-rule stroke stroke-width stroke-opacity stroke-linecap stroke-dasharray stroke-dashoffset stop-color stop-opacity
+cx cy r rx ry x y d paint-order vector-effect marker marker-start marker-mid marker-end text-anchor dominant-baseline alignment-baseline baseline-shift
+
+# 0.4 batch 6
+text-emphasis text-emphasis-style text-emphasis-color text-emphasis-position line-height-step hyphenate-character hyphenate-limit-chars font-kerning text-rendering
+clip color-scheme contain-intrinsic-width contain-intrinsic-inline-size contain-intrinsic-size overflow-clip-margin
+stroke-linejoin stroke-miterlimit
+shape-rendering font-synthesis font-synthesis-weight font-synthesis-style font-synthesis-small-caps
+animation-timeline animation-range animation-range-start animation-range-end scroll-timeline scroll-timeline-name scroll-timeline-axis view-timeline view-timeline-name view-timeline-axis view-timeline-inset timeline-scope
+offset offset-path offset-distance offset-rotate offset-anchor
+image-resolution
+font-size-adjust
+font-stretch
+font-variation-settings
+font-variant-position
+font-variant-ligatures
+font-feature-settings
+font-variant-numeric
+font-variant-east-asian
+font-variant-emoji
+unicode-bidi
+transform-box
+caret-shape
+caret
+text-decoration-skip-ink
+hanging-punctuation
+initial-letter
+shape-outside
+shape-margin
+masonry-auto-flow
+anchor-name
+position-anchor
+position-area
+position-try-fallbacks
+position-visibility
+anchor-scope
+perspective
+perspective-origin
+backface-visibility
+writing-mode
+animation-composition
+transition-behavior
+offset-position
+math-depth
+image-orientation
+object-view-box
+position-try-order
+ruby-position
+ruby-align
+overflow-anchor
+shape-image-threshold
+text-spacing-trim
+text-orientation
+text-combine-upright
+
+position-try
+transform-style
+math-style
