@@ -335,7 +335,7 @@ fn parse_compound(token: string) -> ParsedCompound is
                 has_arg = true
                 k = e + 1
             end
-            if double || name == "before" || name == "after" is
+            if double || name == "before" || name == "after" || name == "first-letter" is
                 pelem = name
             elsif name == "not" && has_arg is
                 c.nots = array_push(c.nots, arg)
