@@ -70,6 +70,15 @@ pub struct App is
     pub caret_t0:     int
     pub caret_phase:  bool
     pub dragging:     bool
+    pub sel_lo:       int     ;; 0.4: zaznaczenie tekstu dokumentu (offsety strumienia znaków), lo == hi → brak
+    pub sel_hi:       int
+    pub sel_anchor:   int
+    pub sel_drag:     bool
+    pub rz_node:      int     ;; 0.4: węzeł zmieniany uchwytem `resize` (-1 = brak)
+    pub rz_x0:        int
+    pub rz_y0:        int
+    pub rz_w0:        int
+    pub rz_h0:        int
     pub mouse_x:      int
     pub mouse_y:      int
     pub cur_cursor:   string
@@ -84,8 +93,10 @@ pub struct App is
     ;; 0.3: animacje @keyframes i przejścia geometrii/transformacji
     pub kf_nodes:  [int]
     pub kf_start:  [int]
+    pub kf_pause:  [int]    ;; 0.4: chwila rozpoczęcia pauzy animacji (0 = nie wstrzymana)
     pub kf_name:   [string]
     pub prev_st:   [style::ComputedStyle]
+    pub has_tl:    bool            ;; 0.4: są animacje sterowane przewijaniem (animation-timeline)
     pub tr_ids:    [int]
     pub tr_from:   [style::ComputedStyle]
     pub tr_start:  [int]
@@ -133,7 +144,7 @@ fn identity_event(a: App, name: string, payload: string) -> App is
 end
 
 pub fn version() -> string is
-    return "0.3.0"
+    return "0.4.0"
 end
 
 pub fn new(title: string, width: int, height: int) -> App is
@@ -149,10 +160,10 @@ pub fn new(title: string, width: int, height: int) -> App is
         scroll_y: 0, elem_scroll: [], doc_h: 0, viewport_w: width, viewport_h: height,
         boxes: [], dirty_layout: true, dirty_paint: true,
         hovered_node: -1, active_node: -1, focused_node: -1, focus_value: "", cursor_pos: 0, anchor_pos: 0,
-        ime: "", caret_t0: 0, caret_phase: true, dragging: false, mouse_x: -1, mouse_y: -1,
+        ime: "", caret_t0: 0, caret_phase: true, dragging: false, sel_lo: 0, sel_hi: 0, sel_anchor: -1, sel_drag: false, rz_node: -1, rz_x0: 0, rz_y0: 0, rz_w0: 0, rz_h0: 0, mouse_x: -1, mouse_y: -1,
         cur_cursor: "default", has_focus: true, text_input_on: false,
         prev_bg: [], prev_fg: [], prev_op: [], anims: [],
-        kf_nodes: [], kf_start: [], kf_name: [], prev_st: [], tr_ids: [], tr_from: [], tr_start: [], tr_dur: [], tr_delay: [], tr_ease: [],
+        kf_nodes: [], kf_start: [], kf_pause: [], kf_name: [], prev_st: [], has_tl: false, tr_ids: [], tr_from: [], tr_start: [], tr_dur: [], tr_delay: [], tr_ease: [],
         anim_busy: false, scroll_goal: -1, has_motion: false,
         js_layout_watch: false, js_watch_ids: [], js_last_layout: "", storage_path: "", storage_data: "{{}}", storage_dirty: false, storage_last: 0,
         dev_mode: false, mtimes: [], last_dev: 0, tick_ms: 100, last_tick: 0, last_theme: 0,
@@ -645,12 +656,33 @@ fn int_index(xs: [int], v: int) -> int is
 end
 
 ;; Kontekst animacji dla układu w chwili `now`.
+;; Start animacji dla osi czasu sterowanej przewijaniem: [start] albo [] gdy brak osi (czas zegarowy).
+fn timeline_start_for(a: App, nid: int, now: int) -> [int] is
+    let mut i: int = 0
+    while i < array_len(a.boxes) is
+        let b: layout::LayoutBox = a.boxes[i]
+        i += 1
+        if b.node_id == nid && b.kind == "box" is
+            let el: int = layout::timeline_elapsed(a.boxes, a.dom, nid, b.st, a.scroll_y, max_page_scroll(a), a.viewport_w, a.viewport_h)
+            if el < 0 is return [] end
+            return [now - el - b.st.anim_delay]
+        end
+    end
+    return []
+end
+
 fn motion_ctx(a: App, now: int) -> anim::AnimCtx is
     let mut starts: [int] = []
     let mut i: int = 0
     while i < array_len(a.kf_nodes) is
         starts = array_push(starts, a.kf_nodes[i])
-        starts = array_push(starts, a.kf_start[i])
+        let mut stt: int = anim::effective_start(a.kf_start[i], if i < array_len(a.kf_pause) then a.kf_pause[i] else 0, now)
+        ;; 0.4: oś czasu sterowana przewijaniem (scroll()/view()/nazwana) — czas animacji z położenia przewijania
+        if a.has_tl is
+            let tb: [int] = timeline_start_for(a, a.kf_nodes[i], now)
+            if array_len(tb) == 1 is stt = tb[0] end
+        end
+        starts = array_push(starts, stt)
         i += 1
     end
     return anim::AnimCtx { now: now, starts: starts, t_ids: a.tr_ids, t_from: a.tr_from, t_start: a.tr_start,
@@ -664,6 +696,7 @@ fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
     let had_prev: bool = array_len(a.prev_st) == n
     let mut kn: [int] = []
     let mut ks: [int] = []
+    let mut kp: [int] = []
     let mut kname: [string] = []
     let mut nt_ids: [int] = a.tr_ids
     let mut nt_from: [style::ComputedStyle] = a.tr_from
@@ -672,6 +705,7 @@ fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
     let mut nt_delay: [int] = a.tr_delay
     let mut nt_ease: [string] = a.tr_ease
     let mut busy: bool = false
+    let mut any_tl: bool = false
     let mut id: int = 1
     while id < n && id < array_len(a.dom.nodes) is
         let node: dom::DomNode = a.dom.nodes[id]
@@ -680,11 +714,24 @@ fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
         if node.removed || node.tag == "text" is continue end
         let nid: int = id - 1
         if st.anim_name != "" && st.anim_ms > 0 && css::find_keyframes(a.sheet, st.anim_name) >= 0 is
+            if layout::parse_timeline(props::xget(st.xp, "animation-timeline"))[0] != "none" is any_tl = true end
             let k: int = int_index(a.kf_nodes, nid)
             let mut start: int = now
-            if k >= 0 && a.kf_name[k] == st.anim_name is start = a.kf_start[k] end
+            let mut pause_at: int = 0
+            if k >= 0 && a.kf_name[k] == st.anim_name is
+                start = a.kf_start[k]
+                pause_at = if k < array_len(a.kf_pause) then a.kf_pause[k] else 0
+            end
+            ;; animation-play-state: zapamiętaj początek pauzy / po wznowieniu przesuń start o czas pauzy
+            if st.anim_paused is
+                if pause_at == 0 is pause_at = now end
+            elsif pause_at > 0 is
+                start = anim::resume_start(start, pause_at, now)
+                pause_at = 0
+            end
             kn = array_push(kn, nid)
             ks = array_push(ks, start)
+            kp = array_push(kp, pause_at)
             kname = array_push(kname, st.anim_name)
             if anim::anim_running(st, now - start) is busy = true end
         end
@@ -734,6 +781,8 @@ fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
     end
     a.kf_nodes = kn
     a.kf_start = ks
+    a.kf_pause = kp
+    a.has_tl = any_tl
     a.kf_name = kname
     a.tr_ids = t_ids
     a.tr_from = t_from
@@ -1445,7 +1494,7 @@ fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
         end
         if debug_on() is
             ;; pełny ślad dla operacji, które mogą trafić w złe miejsce: text/scroll/remove oraz każda z celem 0 lub -1
-            if kind == "text" || kind == "scroll" || kind == "remove" || (kind != "create" && kind != "createtext" && n <= 0) is
+            if kind == "text" || kind == "scroll" || kind == "scrollx" || kind == "remove" || (kind != "create" && kind != "createtext" && n <= 0) is
                 js::js_debug("op " + to_string(i) + "/" + to_string(array_len(ops)) + " " + kind + " js_id=" + to_string(rawn) + " -> real=" + to_string(n) + " (węzłów=" + to_string(array_len(a.dom.nodes)) + ", js_map=" + to_string(array_len(a.js_map)) + ")")
             end
         end
@@ -1523,6 +1572,8 @@ fn apply_dom_ops(a0: App, ops_raw: string) -> DomOpsRes is
         elsif kind == "scrollinto" is
             let ty: int = layout::scroll_into_y(a.boxes, n)
             if ty >= 0 is a = scroll_page_auto(a, ty) end
+        elsif kind == "scrollx" is
+            if n > 0 is a.elem_scroll = set_pair(a.elem_scroll, layout::scroll_key_x(n), jsonlite::get_int(op, "v")) end
         elsif kind == "scroll" is
             if n == 0 is
                 a.scroll_y = jsonlite::get_int(op, "v")
@@ -1643,7 +1694,7 @@ fn push_layout(app: App) -> App is
         i += 1
         if b.kind == "box" && b.node_id > 0 is
             let t: string = "[" + to_string(b.node_id) + "," + to_string(b.x) + "," + to_string(b.y) + "," + to_string(b.w) + "," + to_string(b.h) + "," +
-                            to_string(b.st.bl) + "," + to_string(b.st.br) + "," + to_string(b.st.bt) + "," + to_string(b.st.bb) + "," + to_string(b.content_h) + "]"
+                            to_string(b.st.bl) + "," + to_string(b.st.br) + "," + to_string(b.st.bt) + "," + to_string(b.st.bb) + "," + to_string(b.content_h) + "," + to_string(b.content_w) + "," + to_string(b.scroll_x) + "]"
             r = if first then r + t else r + "," + t
             first = false
         end
@@ -2349,10 +2400,102 @@ fn on_mouse_down(a0: App, ev: window::InputEvent) -> App is
             end
         end
     end
+    if ev.code == 1 is
+        let rz: int = paint::resize_handle_at(a.boxes, ev.x, ev.y, a.scroll_y)
+        if rz >= 0 is
+            let rb: layout::LayoutBox = box_of(a, rz)
+            a.rz_node = rz
+            a.rz_x0 = ev.x
+            a.rz_y0 = ev.y
+            a.rz_w0 = rb.w
+            a.rz_h0 = rb.h
+            a.dirty_paint = true
+            return a
+        end
+        a = sel_mouse_down(a, ev, hit)
+    end
     dom_event(a, "mousedown", hit, jsonlite::set_int(jsonlite::set_int(jsonlite::object(), "x", ev.x), "y", ev.y))
     if a.state_css is a.dirty_layout = true end
     a.dirty_paint = true
     return a
+end
+
+;; ---------- 0.4: zaznaczanie tekstu dokumentu ----------
+fn sel_clear(a0: App) -> App is
+    let mut a: App = a0
+    if a.sel_hi != a.sel_lo is a.dirty_paint = true end
+    a.sel_lo = 0
+    a.sel_hi = 0
+    a.sel_anchor = -1
+    a.sel_drag = false
+    return a
+end
+
+fn sel_set(a0: App, x: int, y: int) -> App is
+    let mut a: App = a0
+    if x < y is
+        a.sel_lo = x
+        a.sel_hi = y
+    else is
+        a.sel_lo = y
+        a.sel_hi = x
+    end
+    a.dirty_paint = true
+    return a
+end
+
+fn sel_mouse_down(a0: App, ev: window::InputEvent, hit: int) -> App is
+    let mut a: App = a0
+    let target: int = paint::find_handler_node(a.dom, hit, "input")
+    if target >= 0 && is_text_field(a.dom.nodes[target]) is return sel_clear(a) end
+    if hit >= 0 is
+        let tg: string = a.dom.nodes[hit].tag
+        if tg == "button" || tg == "select" || tg == "input" || tg == "textarea" is return sel_clear(a) end
+    end
+    let items: [int] = layout::sel_items(a.boxes)
+    let off: int = layout::sel_offset_at(a.boxes, items, a.win.handle, ev.x, ev.y + a.scroll_y)
+    if off < 0 is return sel_clear(a) end
+    if ev.clicks >= 3 is
+        let l: [int] = layout::sel_line_at(a.boxes, items, off)
+        a.sel_anchor = l[0]
+        a = sel_set(a, l[0], l[1])
+        a.sel_drag = false
+        return a
+    end
+    if ev.clicks == 2 is
+        let w: [int] = layout::sel_word_at(a.boxes, items, off)
+        a.sel_anchor = w[0]
+        a = sel_set(a, w[0], w[1])
+        a.sel_drag = true
+        return a
+    end
+    let sc: [int] = layout::sel_all_scope(a.boxes, items, a.dom, off)
+    if sc[1] > sc[0] is
+        a.sel_anchor = sc[0]
+        a = sel_set(a, sc[0], sc[1])
+        a.sel_drag = false
+        return a
+    end
+    if ev.mods % 2 == 1 && a.sel_anchor >= 0 is
+        a = sel_set(a, a.sel_anchor, off)
+        a.sel_drag = true
+        return a
+    end
+    a.sel_anchor = off
+    a = sel_set(a, off, off)
+    a.sel_drag = true
+    return a
+end
+
+fn sel_text_now(a: App) -> string is
+    let items: [int] = layout::sel_items(a.boxes)
+    return layout::sel_text(a.boxes, items, a.sel_lo, a.sel_hi)
+end
+
+fn sel_rects_now(a: App) -> [int] is
+    if a.sel_hi <= a.sel_lo is return [] end
+    let items: [int] = layout::sel_items(a.boxes)
+    return layout::sel_rects(a.boxes, items, a.win.handle, a.sel_lo, a.sel_hi)
 end
 
 fn find_focusable_ancestor(a: App, start: int) -> int is
@@ -2369,6 +2512,14 @@ fn on_mouse_up(a0: App, ev: window::InputEvent) -> App is
     a.mouse_x = ev.x
     a.mouse_y = ev.y
     a.dragging = false
+    a.sel_drag = false
+    if a.rz_node >= 0 is
+        dom_event(a, "resize", a.rz_node, "")
+        a.rz_node = -1
+        a.active_node = -1
+        a.dirty_paint = true
+        return a
+    end
     let hit: int = node_or_neg(a, paint::hit_test_at(a.boxes, ev.x, ev.y, a.scroll_y))
     let started: int = a.active_node
     a.active_node = -1
@@ -2403,6 +2554,24 @@ fn on_mouse_move(a0: App, ev: window::InputEvent) -> App is
             a.cursor_pos = pos
             a.dirty_paint = true
             a = reset_caret(a)
+        end
+    end
+    if a.rz_node >= 0 && ev.code % 2 == 1 is
+        let axes: [bool] = paint::resize_axes(box_of(a, a.rz_node).st)
+        if array_len(axes) == 2 is
+            let nw: int = if a.rz_w0 + ev.x - a.rz_x0 < 24 then 24 else a.rz_w0 + ev.x - a.rz_x0
+            let nh: int = if a.rz_h0 + ev.y - a.rz_y0 < 24 then 24 else a.rz_h0 + ev.y - a.rz_y0
+            if axes[0] is a.elem_scroll = set_pair(a.elem_scroll, layout::resize_key_w(a.rz_node), nw) end
+            if axes[1] is a.elem_scroll = set_pair(a.elem_scroll, layout::resize_key_h(a.rz_node), nh) end
+            a.dirty_layout = true
+        end
+        return a
+    end
+    if a.sel_drag && a.sel_anchor >= 0 && ev.code % 2 == 1 is
+        let items: [int] = layout::sel_items(a.boxes)
+        let off: int = layout::sel_offset_at(a.boxes, items, a.win.handle, ev.x, ev.y + a.scroll_y)
+        if off >= 0 is
+            a = sel_set(a, a.sel_anchor, off)
         end
     end
     if hit != a.hovered_node is
@@ -2443,6 +2612,7 @@ fn scroll_page_to(a0: App, y: int) -> App is
     if v != a.scroll_y is
         a.scroll_y = v
         a.dirty_paint = true
+        if a.has_tl is a.dirty_layout = true end
         dom_event(a, "scroll", 0, jsonlite::set_int(jsonlite::object(), "y", v))
     end
     return a
@@ -2450,22 +2620,54 @@ end
 
 fn on_scroll(a0: App, ev: window::InputEvent) -> App is
     let mut a: App = a0
-    let dy: int = 0 - ev.y
+    let mut dy: int = 0 - ev.y
+    ;; 0.4: przewijanie poziome — dx kółka/gładzika albo Shift+kółko
+    let mut dxs: int = ev.dx
+    if ev.mods % 2 == 1 && dy != 0 && dxs == 0 is
+        dxs = dy
+        dy = 0
+    end
+    if dxs != 0 && dy == 0 is
+        let xc: int = paint::scroll_container_x_at(a.boxes, a.dom, ev.x, ev.y, a.scroll_y)
+        if xc >= 0 is
+            let key: int = layout::scroll_key_x(xc)
+            let curx: int = get_pair(a.elem_scroll, key)
+            let mxx: int = paint::max_scroll_x_of(a.boxes, xc)
+            let tx: int = curx + dxs
+            let cl0: int = if tx < 0 then 0 elsif tx > mxx then mxx else tx
+            let clx: int = if cl0 != curx then layout::snap_container_x(a.boxes, a.dom, xc, curx, cl0, mxx) else cl0
+            if clx != curx is
+                a.elem_scroll = set_pair(a.elem_scroll, key, clx)
+                a.dirty_layout = true
+                dom_event(a, "scroll", xc, jsonlite::set_int(jsonlite::object(), "x", clx))
+                return a
+            end
+            if layout::overscroll_x_of_node(a.boxes, xc) is return a end
+        end
+        return a
+    end
     if ev.mods % 2 == 1 && dy == 0 is return a end
     let cont: int = paint::scroll_container_at(a.boxes, a.dom, ev.x, ev.y, a.scroll_y)
     if cont >= 0 is
         let cur: int = get_pair(a.elem_scroll, cont)
         let mx: int = paint::max_scroll_of(a.boxes, cont)
         let target: int = cur + dy
-        let clamped: int = if target < 0 then 0 elsif target > mx then mx else target
+        let clamped0: int = if target < 0 then 0 elsif target > mx then mx else target
+        ;; 0.4: scroll-snap-type w kontenerze
+        let clamped: int = if clamped0 != cur then layout::snap_container_y(a.boxes, a.dom, cont, cur, clamped0, mx) else clamped0
         if clamped != cur is
             a.elem_scroll = set_pair(a.elem_scroll, cont, clamped)
             a.dirty_layout = true
             dom_event(a, "scroll", cont, jsonlite::set_int(jsonlite::object(), "y", clamped))
             return a
         end
+        ;; 0.4: overscroll-behavior: contain|none — nie przekazuj przewijania do strony
+        if layout::overscroll_of_node(a.boxes, cont) is return a end
     end
-    return scroll_page_to(a, a.scroll_y + dy)
+    ;; 0.4: scroll-snap-type na korzeniu (przyciąganie strony)
+    let want: int = a.scroll_y + dy
+    let snapped: int = layout::snap_page_y(a.boxes, a.dom, a.scroll_y, want, a.viewport_h, max_page_scroll(a))
+    return scroll_page_to(a, snapped)
 end
 
 ;; ---------- klawiatura ----------
@@ -2499,6 +2701,17 @@ fn on_key_down(a0: App, ev: window::InputEvent) -> App is
     if node >= 0 && is_text_field(a.dom.nodes[node]) is
         return field_key(a, node, code, cmd, shift, ev)
     end
+    ;; 0.4: Ctrl+C kopiuje zaznaczony tekst dokumentu, Ctrl+A zaznacza cały
+    if cmd && code == 99 && a.sel_hi > a.sel_lo is
+        window::clipboard_set(sel_text_now(a))
+        return a
+    end
+    if cmd && code == 97 is
+        let all_items: [int] = layout::sel_items(a.boxes)
+        a.sel_anchor = 0
+        a = sel_set(a, 0, layout::sel_total(a.boxes, all_items))
+        return a
+    end
     if code == 9 is
         return focus_node(a, next_focus(a, !shift))
     end
@@ -2509,7 +2722,7 @@ fn on_key_down(a0: App, ev: window::InputEvent) -> App is
     end
     if node >= 0 && a.dom.nodes[node].tag == "select" && (code == 1073741905 || code == 1073741903) is return cycle_select(a, node, 1) end
     if node >= 0 && a.dom.nodes[node].tag == "select" && (code == 1073741906 || code == 1073741904) is return cycle_select(a, node, 0 - 1) end
-    if code == 27 is return blur_current(a) end
+    if code == 27 is return sel_clear(blur_current(a)) end
     if code == 1073741906 is return scroll_page_to(a, a.scroll_y - 40) end
     if code == 1073741905 is return scroll_page_to(a, a.scroll_y + 40) end
     if code == 1073741899 is return scroll_page_to(a, a.scroll_y - a.viewport_h + 40) end
@@ -2772,6 +2985,19 @@ fn page_background(a: App) -> style::Color is
     let mut i: int = 0
     let mut found: bool = false
     let mut col: style::Color = if a.dark then style::Color { r: 32, g: 33, b: 36, a: 255 } else a.bg
+    ;; 0.4: color-scheme na elemencie głównym decyduje o płótnie: dark → ciemne, light → jasne (także przy ciemnym motywie aplikacji)
+    let mut k: int = 0
+    while k < array_len(a.boxes) is
+        let rb: layout::LayoutBox = a.boxes[k]
+        k += 1
+        if rb.kind != "box" || rb.node_id <= 0 is continue end
+        if a.dom.nodes[rb.node_id].tag == "html" is
+            let sch: string = layout::used_scheme(rb.st, a.dark)
+            if sch == "dark" is col = style::Color { r: 32, g: 33, b: 36, a: 255 } end
+            if sch == "light" is col = a.bg end
+            break
+        end
+    end
     while i < array_len(a.boxes) is
         let b: layout::LayoutBox = a.boxes[i]
         i += 1
@@ -2799,6 +3025,7 @@ fn relayout(a0: App, now: int) -> App is
         a.prev_st = []
         a.kf_nodes = []
         a.kf_start = []
+        a.kf_pause = []
         a.kf_name = []
         a.tr_ids = []
         a.tr_from = []
@@ -2810,8 +3037,10 @@ fn relayout(a0: App, now: int) -> App is
     end
     let res: layout::LayoutResult = layout::layout_full_a(a.dom, a.sheet, a.viewport_w, a.viewport_h, a.win.handle,
                                                           ix_now, a.elem_scroll, act)
+    let anchor_dy: int = layout::scroll_anchor_delta(a.boxes, res.boxes, a.scroll_y, a.viewport_h)
     a.boxes = res.boxes
     a.doc_h = res.height
+    if anchor_dy != 0 is a.scroll_y = a.scroll_y + anchor_dy end
     if debug_on() is
         log::info("silver[debug]: layout viewport=" + to_string(a.viewport_w) + "x" + to_string(a.viewport_h) + " dom=" + to_string(array_len(a.dom.nodes)) + " boxes=" + to_string(array_len(res.boxes)) + " doc_h=" + to_string(res.height) + " css_rules=" + to_string(array_len(a.sheet.rules)))
     end
@@ -2835,7 +3064,8 @@ fn render_frame(a0: App, now: int) -> App is
     let phase: bool = ((now - a.caret_t0) / 530) % 2 == 0
     let rs: paint::RenderState = paint::RenderState {
         scroll_y: a.scroll_y, focused: a.focused_node, cursor: a.cursor_pos, anchor: a.anchor_pos,
-        caret_on: phase && a.has_focus, ime: a.ime, hovered: a.hovered_node, viewport_h: a.viewport_h
+        caret_on: phase && a.has_focus, ime: a.ime, hovered: a.hovered_node, viewport_h: a.viewport_h,
+        sel: sel_rects_now(a)
     }
     a.caret_phase = phase
     let boxes: [layout::LayoutBox] = animated_boxes(a, now)
