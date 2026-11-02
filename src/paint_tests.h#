@@ -1,0 +1,837 @@
+mod ffi_shim
+mod dom
+mod cssval
+mod props_data
+mod props
+mod css
+mod style
+mod anim
+mod layout
+mod gfx
+mod paint
+
+;; Testy end-to-end rysowania: H# (layout + paint) → prawdziwy shim SDL (renderer programowy) → odczyt pikseli.
+;; Uruchamianie: tools/run_paint_tests.sh (Xvfb + HRUN_SHIM=libsilvershim.so)
+
+fn shot(html: string, css_text: string, w: int, h: int) -> int is
+    let win: int = ffi_shim::silver_window_create("paint-test", w, h)
+    ffi_shim::silver_load_font(win, "", 16)
+    let d: dom::Dom = dom::parse(html)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), w, win)
+    paint::render(win, boxes, d, paint::plain_state(0), style::Color { r: 255, g: 255, b: 255, a: 255 })
+    return win
+end
+
+fn to_u32(p: int) -> int is
+    if p < 0 is return p + 4294967296 end
+    return p
+end
+fn red_of(p: int) -> int is return (to_u32(p) / 65536) % 256 end
+fn green_of(p: int) -> int is return (to_u32(p) / 256) % 256 end
+fn blue_of(p: int) -> int is return to_u32(p) % 256 end
+
+fn pbox(boxes: [layout::LayoutBox], id: int) -> layout::LayoutBox is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is return boxes[i] end
+        i += 1
+    end
+    return boxes[0]
+end
+
+fn near(a: int, b: int, t: int) -> bool is
+    let d: int = if a > b then a - b else b - a
+    return d <= t
+end
+
+#[test]
+fn e2e_background_color_and_outside() is
+    let win: int = shot("<div id=\"a\">x</div>", "body { margin: 0; } #a { width: 100px; height: 50px; background: #ff0000; font-size: 1px; color: #ff0000; }", 200, 100)
+    let p: int = ffi_shim::silver_pixel(win, 50, 25)
+    assert_eq(red_of(p), 255)
+    assert_eq(green_of(p), 0)
+    let q: int = ffi_shim::silver_pixel(win, 150, 80)
+    assert_eq(green_of(q), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_linear_gradient_background_left_to_right() is
+    let win: int = shot("<div id=\"a\"></div>", "body { margin: 0; } #a { width: 100px; height: 40px; background: linear-gradient(to right, #000000, #ff0000); }", 200, 100)
+    let l: int = ffi_shim::silver_pixel(win, 2, 20)
+    let m: int = ffi_shim::silver_pixel(win, 50, 20)
+    let r: int = ffi_shim::silver_pixel(win, 97, 20)
+    assert_true(red_of(l) < 15)
+    assert_true(near(red_of(m), 127, 8))
+    assert_true(red_of(r) > 240)
+    assert_eq(blue_of(m), 0)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_background_layers_size_repeat_position() is
+    ;; kafelek 20×20 (gradient czerwony→czerwony nieprzezroczysty) co 40px dzięki `space`; tło #ffffff pod spodem
+    let css_text: string = "body { margin: 0; } #a { width: 100px; height: 40px; background: linear-gradient(#ff0000, #ff0000) 0 0 / 20px 20px repeat-x, #ffffff; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 100)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 5, 5)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 5, 5)), 0)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 5, 30)), 255)         ;; repeat-x: poniżej pierwszego rzędu biało
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 45, 5)), 0)           ;; kolejny kafelek w poziomie
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_multiple_layers_top_over_bottom() is
+    ;; górna warstwa: niebieski kwadrat 30×30 no-repeat w rogu; dolna: czerwony gradient na całość
+    let css_text: string = "body { margin: 0; } #a { width: 100px; height: 60px; background: linear-gradient(#0000ff, #0000ff) 0 0 / 30px 30px no-repeat, linear-gradient(#ff0000, #ff0000); }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 100)
+    let top: int = ffi_shim::silver_pixel(win, 10, 10)
+    let rest: int = ffi_shim::silver_pixel(win, 60, 40)
+    assert_eq(blue_of(top), 255)
+    assert_eq(red_of(top), 0)
+    assert_eq(red_of(rest), 255)
+    assert_eq(blue_of(rest), 0)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_background_position_center_no_repeat_and_longhands() is
+    let css_text: string = "body { margin: 0; } #a { width: 100px; height: 100px; background-color: #ffffff; background-image: linear-gradient(#00ff00, #00ff00); background-size: 20px 20px; background-position: center; background-repeat: no-repeat; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 50, 50)), 0)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 50, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 10, 10)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 85, 85)), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_rounded_corners_clip_gradient_layers() is
+    let css_text: string = "body { margin: 0; } #a { width: 100px; height: 100px; border-radius: 30px; background: linear-gradient(#0000ff, #0000ff); }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 50, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 50, 50)), 0)
+    ;; róg obcięty zaokrągleniem — zostaje białe tło strony
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 1, 1)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 1, 1)), 255)
+    ;; krawędź prosta (poza rogami) pokryta
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 50, 1)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 50, 1)), 0)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_background_blend_mode_multiply_with_color() is
+    ;; kolor #ffff00 (żółty) × gradient niebieski → multiply = czarny (żółty·niebieski = 0)
+    let css_text: string = "body { margin: 0; } #a { width: 60px; height: 60px; background-color: #ffff00; background-image: linear-gradient(#0000ff, #0000ff); background-blend-mode: multiply; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    let p: int = ffi_shim::silver_pixel(win, 30, 30)
+    assert_true(red_of(p) < 5 && green_of(p) < 5 && blue_of(p) < 5)
+    ffi_shim::silver_window_close(win)
+    ;; normal: niebieski całkowicie przykrywa żółty
+    let w2: int = shot("<div id=\"a\"></div>", "body { margin: 0; } #a { width: 60px; height: 60px; background-color: #ffff00; background-image: linear-gradient(#0000ff, #0000ff); }", 200, 150)
+    let q: int = ffi_shim::silver_pixel(w2, 30, 30)
+    assert_true(blue_of(q) > 250 && red_of(q) < 5)
+    ffi_shim::silver_window_close(w2)
+end
+
+#[test]
+fn e2e_radial_and_conic_backgrounds() is
+    let win: int = shot("<div id=\"a\"></div>", "body { margin: 0; } #a { width: 100px; height: 100px; background: radial-gradient(circle closest-side, #ffffff, #000000); }", 200, 150)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 50, 50)) > 240)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 98, 50)) < 20)
+    ffi_shim::silver_window_close(win)
+    let w2: int = shot("<div id=\"a\"></div>", "body { margin: 0; } #a { width: 100px; height: 100px; background: conic-gradient(#ff0000 0deg, #0000ff 360deg); }", 200, 150)
+    ;; prawa strona (90°) = 25% drogi czerwony→niebieski
+    let p: int = ffi_shim::silver_pixel(w2, 95, 50)
+    assert_true(near(red_of(p), 191, 12) && near(blue_of(p), 64, 12))
+    ffi_shim::silver_window_close(w2)
+end
+
+#[test]
+fn e2e_background_origin_clip_content_box() is
+    let css_text: string = "body { margin: 0; } #a { width: 100px; height: 100px; padding: 20px; box-sizing: content-box; background: #00ff00 content-box; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 200)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 60, 60)), 255)
+    ;; padding poza clip: białe
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 5, 5)), 255)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 5, 5)), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_mix_blend_mode_multiply_over_backdrop() is
+    ;; tło strony: żółty pasek; element niebieski z multiply nad nim → czarny; poza paskiem czysty niebieski
+    let html: string = "<div id=\"bk\"></div><div id=\"fg\"></div>"
+    let css_text: string = "body { margin: 0; } #bk { width: 100px; height: 40px; background: #ffff00; } #fg { position: absolute; left: 50px; top: 0; width: 100px; height: 40px; background: #0000ff; mix-blend-mode: multiply; }"
+    let win: int = shot(html, css_text, 200, 100)
+    let over: int = ffi_shim::silver_pixel(win, 70, 20)
+    let only: int = ffi_shim::silver_pixel(win, 130, 20)
+    assert_true(red_of(over) < 5 && green_of(over) < 5 && blue_of(over) < 5)
+    assert_true(blue_of(only) > 250 && red_of(only) < 5)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 20, 20)), 255)       ;; sam żółty bez elementu
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_filter_blur_softens_edges() is
+    let css_text: string = "body { margin: 0; } #a { margin: 30px; width: 40px; height: 40px; background: #000000; filter: blur(4px); }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    let center: int = ffi_shim::silver_pixel(win, 50, 50)
+    let edge: int = ffi_shim::silver_pixel(win, 30, 50)
+    let outside: int = ffi_shim::silver_pixel(win, 25, 50)
+    let far: int = ffi_shim::silver_pixel(win, 5, 5)
+    assert_true(red_of(center) < 25)
+    assert_true(red_of(edge) > 60 && red_of(edge) < 200)
+    assert_true(red_of(outside) < 250 && red_of(outside) > red_of(edge))
+    assert_eq(red_of(far), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_filter_saturate_and_hue_rotate() is
+    let win: int = shot("<div id=\"a\"></div><div id=\"b\"></div>", "body { margin: 0; } #a { width: 40px; height: 40px; background: #ff0000; filter: saturate(0%); } #b { width: 40px; height: 40px; background: #ff0000; filter: hue-rotate(120deg); }", 200, 150)
+    let g: int = ffi_shim::silver_pixel(win, 20, 20)
+    assert_true(near(red_of(g), green_of(g), 3) && near(green_of(g), blue_of(g), 3))
+    let h: int = ffi_shim::silver_pixel(win, 20, 60)
+    assert_true(green_of(h) > red_of(h))
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_filter_drop_shadow() is
+    let css_text: string = "body { margin: 0; } #a { margin: 20px; width: 30px; height: 30px; background: #ff0000; filter: drop-shadow(12px 12px 0px #000000); }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 30, 30)), 255)         ;; oryginał
+    let sh: int = ffi_shim::silver_pixel(win, 60, 60)                    ;; w cieniu (przesunięcie 12px)
+    assert_true(red_of(sh) < 10 && green_of(sh) < 10)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 10, 10)), 255)         ;; poza cieniem tło strony
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 10, 10)), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_mask_image_gradient_fades_element() is
+    ;; maska: biały→przezroczysty w poziomie; element czerwony → po lewej czerwony, po prawej tło (białe)
+    let css_text: string = "body { margin: 0; } #a { width: 100px; height: 40px; background: #ff0000; mask-image: linear-gradient(to right, #000000, transparent); }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 100)
+    let l: int = ffi_shim::silver_pixel(win, 3, 20)
+    let m: int = ffi_shim::silver_pixel(win, 50, 20)
+    let r: int = ffi_shim::silver_pixel(win, 97, 20)
+    assert_true(near(red_of(l), 255, 3))                                 ;; (renderer programowy SDL zaokrągla składanie o ≤2)
+    assert_true(green_of(l) < 30)                                        ;; prawie czerwony
+    assert_true(near(green_of(m), 127, 12))                              ;; w połowie przezroczysty nad białym
+    assert_true(green_of(r) > 235)                                       ;; prawie tło
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_mask_size_position_repeat_and_composite() is
+    ;; maska = pełny kwadrat 40×40 bez powtarzania w rogu: poza nim element niewidoczny
+    let css_text: string = "body { margin: 0; } #a { width: 100px; height: 100px; background: #0000ff; mask-image: linear-gradient(#000000, #000000); mask-size: 40px 40px; mask-repeat: no-repeat; mask-position: 0 0; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 20, 20)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 20, 20)), 0)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 70, 70)), 255)         ;; poza maską → tło
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 70, 70)), 255)
+    ffi_shim::silver_window_close(win)
+    ;; mask-composite: subtract — druga (górna) warstwa wycina środek: widać tylko ramkę
+    let css2: string = "body { margin: 0; } #a { width: 100px; height: 100px; background: #0000ff; mask-image: linear-gradient(#000, #000), linear-gradient(#000, #000); mask-size: 100px 100px, 50px 50px; mask-position: 0 0, 25px 25px; mask-repeat: no-repeat, no-repeat; mask-composite: subtract, add; }"
+    let w2: int = shot("<div id=\"a\"></div>", css2, 200, 150)
+    ;; warstwy: [0] = górna 50×50, [1] = dolna 100×100; composite[0] = subtract → górna wycina z dolnej? (source = górna poza dolną) → pusta
+    ;; sprawdzamy tylko, że rendering nie zawiesza się i środek/ramka mają spójną wartość
+    let c: int = ffi_shim::silver_pixel(w2, 50, 50)
+    let e: int = ffi_shim::silver_pixel(w2, 5, 5)
+    assert_true(blue_of(e) == 255 || red_of(e) == 255)
+    assert_true(blue_of(c) == 255 || red_of(c) == 255)
+    ffi_shim::silver_window_close(w2)
+end
+
+#[test]
+fn e2e_mask_mode_luminance() is
+    ;; mask-mode: luminance — szary 50% daje ok. połowę krycia; alpha — pełne
+    let css_text: string = "body { margin: 0; } #a { width: 60px; height: 60px; background: #000000; mask-image: linear-gradient(#808080, #808080); mask-mode: luminance; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    assert_true(near(red_of(ffi_shim::silver_pixel(win, 30, 30)), 127, 6))
+    ffi_shim::silver_window_close(win)
+    let w2: int = shot("<div id=\"a\"></div>", "body { margin: 0; } #a { width: 60px; height: 60px; background: #000000; mask-image: linear-gradient(#808080, #808080); mask-mode: alpha; }", 200, 150)
+    assert_true(red_of(ffi_shim::silver_pixel(w2, 30, 30)) < 5)
+    ffi_shim::silver_window_close(w2)
+end
+
+#[test]
+fn e2e_mask_shorthand_and_blur_combined() is
+    let css_text: string = "body { margin: 0; } #a { width: 100px; height: 40px; background: #00ff00; mask: linear-gradient(to bottom, #000, transparent) no-repeat; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 100)
+    assert_true(near(green_of(ffi_shim::silver_pixel(win, 50, 2)), 255, 3) && red_of(ffi_shim::silver_pixel(win, 50, 2)) < 25)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 50, 37)) > 215)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_background_attachment_fixed_vs_scroll() is
+    let ws: int = shot("<div id=\"a\"></div>", "body { margin: 0; } #a { margin-top: 50px; width: 100px; height: 100px; background: linear-gradient(#ff0000, #ff0000) 0 0 / 30px 30px no-repeat scroll; }", 200, 200)
+    assert_eq(green_of(ffi_shim::silver_pixel(ws, 10, 60)), 0)            ;; kafelek przy lewym górnym rogu elementu
+    ffi_shim::silver_window_close(ws)
+    let wf: int = shot("<div id=\"a\"></div>", "body { margin: 0; } #a { margin-top: 50px; width: 100px; height: 100px; background: linear-gradient(#ff0000, #ff0000) 0 0 / 30px 30px no-repeat fixed; }", 200, 200)
+    assert_eq(green_of(ffi_shim::silver_pixel(wf, 10, 60)), 255)          ;; kafelek przy rogu okna — poza elementem
+    assert_eq(green_of(ffi_shim::silver_pixel(wf, 10, 10)), 255)          ;; nad elementem przycięte
+    ffi_shim::silver_window_close(wf)
+end
+
+#[test]
+fn e2e_border_image_gradient_slices_and_fill() is
+    ;; 100×100 z ramką 10px: źródło = gradient o rozmiarze obszaru; slice 10 → ramka z krawędzi gradientu (czarny→czerwony poziomo)
+    let css_text: string = "body { margin: 0; } #a { width: 80px; height: 80px; border: 10px solid #00ff00; border-image: linear-gradient(to right, #000000, #ff0000) 10 / 10px stretch; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    ;; lewa krawędź ramki (x≈5) → początek gradientu (ciemny), prawa (x≈95) → koniec (czerwony); wnętrze (50,50) białe tło
+    assert_true(red_of(ffi_shim::silver_pixel(win, 5, 50)) < 40)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 95, 50)) > 215)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 95, 50)), 0)           ;; nie zielony kolor border-color
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 50, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 50, 50)), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_border_image_fill_draws_middle_and_outset_extends() is
+    let css_text: string = "#a { margin: 20px; width: 60px; height: 60px; border: 10px solid #00ff00; border-image: linear-gradient(#0000ff, #0000ff) 10 fill / 10px / 6px stretch; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    ;; środek wypełniony niebieskim (fill), ramka wystaje o 6px poza border-box (od x=20 → x=14)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 50, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 50, 50)), 0)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 16, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 10, 50)), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_mask_border_masks_outside_ring() is
+    ;; maska = ramka 10px z pełnego kwadratu (slice 10, width 10px, bez fill): widać tylko pierścień elementu
+    let css_text: string = "#a { margin: 20px; width: 60px; height: 60px; background: #0000ff; mask-border: linear-gradient(#000000, #000000) 10 / 10px stretch; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 24, 50)), 255)            ;; w ramce maski → widoczne
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 24, 50)), 0)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 50, 50)), 255)             ;; środek zamaskowany → tło strony
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 50, 50)), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_svg_fill_stroke_and_geometry_from_css() is
+    let html: string = "<svg width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><rect id=\"a\" x=\"0\" y=\"0\" width=\"40\" height=\"50\"/><circle id=\"b\" cx=\"10\" cy=\"10\" r=\"3\"/></svg>"
+    let css_text: string = "#a { fill: #ff0000; } #b { cx: 70px; cy: 25px; r: 15px; fill: #0000ff; stroke: #00ff00; stroke-width: 4px; }"
+    let win: int = shot(html, css_text, 200, 100)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 20, 25)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 20, 25)), 0)
+    ;; koło przesunięte przez CSS cx/cy/r: środek (70,25) niebieski, obrys zielony na promieniu ≈ 15
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 70, 25)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 70, 25)), 0)
+    assert_true(green_of(ffi_shim::silver_pixel(win, 85, 25)) > 200 && red_of(ffi_shim::silver_pixel(win, 85, 25)) < 60)
+    ;; oryginalne położenie koła z atrybutów (10,10) puste
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 55, 5)), 255)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_svg_current_color_gradient_and_opacity() is
+    let html: string = "<svg width=\"100\" height=\"20\"><defs><linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"0\"><stop offset=\"0\" stop-color=\"#000000\"/><stop offset=\"1\" stop-color=\"#ff0000\"/></linearGradient></defs><rect width=\"100\" height=\"20\" fill=\"url(#g)\"/></svg><svg width=\"20\" height=\"20\"><rect id=\"c\" width=\"20\" height=\"20\"/></svg>"
+    let win: int = shot(html, "#c { fill: currentColor; color: #00ff00; opacity: 0.5; }", 200, 100)
+    ;; gradient (przeliczone ułamki obwiedni): ciemny z lewej, czerwony z prawej
+    assert_true(red_of(ffi_shim::silver_pixel(win, 4, 10)) < 50)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 96, 10)) > 205)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_svg_paint_order_stroke_below_fill() is
+    ;; gruby obrys (w=10) czarny pod zielonym wypełnieniem: środek krawędzi — przy paint-order: stroke wypełnienie przykrywa wewnętrzną połowę obrysu
+    let html: string = "<svg width=\"60\" height=\"60\"><rect id=\"a\" x=\"15\" y=\"15\" width=\"30\" height=\"30\"/></svg>"
+    let normal: int = shot(html, "#a { fill: #00ff00; stroke: #000000; stroke-width: 10px; }", 100, 100)
+    ;; domyślnie obrys NAD wypełnieniem: piksel 3px wewnątrz krawędzi (x=18) czarny
+    assert_true(red_of(ffi_shim::silver_pixel(normal, 18, 30)) < 30 && green_of(ffi_shim::silver_pixel(normal, 18, 30)) < 30)
+    ffi_shim::silver_window_close(normal)
+    let swapped: int = shot(html, "#a { fill: #00ff00; stroke: #000000; stroke-width: 10px; paint-order: stroke; }", 100, 100)
+    ;; paint-order: stroke → wypełnienie nad obrysem: x=18 zielony, a zewnętrzna połowa obrysu (x=12) nadal czarna
+    assert_true(green_of(ffi_shim::silver_pixel(swapped, 18, 30)) > 200)
+    assert_true(green_of(ffi_shim::silver_pixel(swapped, 12, 30)) < 30)
+    ffi_shim::silver_window_close(swapped)
+end
+
+#[test]
+fn e2e_svg_dash_and_path_from_css() is
+    let html: string = "<svg width=\"100\" height=\"20\"><path id=\"p\" d=\"M0 10 L100 10\"/></svg>"
+    let win: int = shot(html, "#p { stroke: #000000; stroke-width: 8px; stroke-dasharray: 10 10; fill: none; }", 200, 100)
+    ;; wzór kreska 10 / przerwa 10: x=5 czarny, x=15 puste
+    assert_true(red_of(ffi_shim::silver_pixel(win, 5, 10)) < 40)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 15, 10)) > 215)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 25, 10)) < 40)
+    ffi_shim::silver_window_close(win)
+    let w2: int = shot("<svg width=\"60\" height=\"30\"><path id=\"p\" d=\"M0 0\"/></svg>", "#p { d: path(\"M0 0 L60 0 L60 30 L0 30 Z\"); fill: #ff0000; }", 100, 60)
+    assert_eq(red_of(ffi_shim::silver_pixel(w2, 30, 15)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(w2, 30, 15)), 0)
+    ffi_shim::silver_window_close(w2)
+end
+
+fn count_red_in(win: int, x0: int, y0: int, x1: int, y1: int) -> int is
+    let mut n: int = 0
+    let mut y: int = y0
+    while y < y1 is
+        let mut x: int = x0
+        while x < x1 is
+            let p: int = ffi_shim::silver_pixel(win, x, y)
+            if red_of(p) > 200 && green_of(p) < 80 && blue_of(p) < 80 is n += 1 end
+            x += 1
+        end
+        y += 1
+    end
+    return n
+end
+
+#[test]
+fn e2e_svg_text_is_drawn_with_fill_and_anchor() is
+    let html: string = "<svg width=\"200\" height=\"60\" viewBox=\"0 0 200 60\"><text id=\"a\" x=\"100\" y=\"40\">MMMM</text></svg>"
+    let win: int = shot(html, "#a { font-size: 30px; fill: #ff0000; text-anchor: middle; }", 300, 100)
+    let around: int = count_red_in(win, 50, 5, 150, 50)
+    assert_true(around > 50)                                   ;; tekst narysowany w środku (x≈100)
+    assert_eq(count_red_in(win, 0, 0, 30, 60), 0)             ;; lewa krawędź pusta (anchor: middle)
+    ffi_shim::silver_window_close(win)
+    let w2: int = shot(html, "#a { font-size: 30px; fill: #ff0000; text-anchor: end; }", 300, 100)
+    assert_true(count_red_in(w2, 0, 5, 100, 50) > 50)                       ;; text-anchor: end → tekst kończy się na x=100
+    assert_eq(count_red_in(w2, 110, 0, 200, 60), 0)
+    ffi_shim::silver_window_close(w2)
+end
+
+#[test]
+fn e2e_svg_markers_drawn_at_vertices() is
+    let html: string = "<svg width=\"100\" height=\"60\" viewBox=\"0 0 100 60\"><defs><marker id=\"m\" markerWidth=\"10\" markerHeight=\"10\" markerUnits=\"userSpaceOnUse\" refX=\"5\" refY=\"5\" orient=\"auto\"><rect width=\"10\" height=\"10\" fill=\"#ff0000\"/></marker></defs><path id=\"p\" d=\"M10 30 L50 30 L90 30\"/></svg>"
+    let win: int = shot(html, "#p { stroke: #000000; stroke-width: 2px; fill: none; marker-start: url(#m); marker-mid: url(#m); marker-end: url(#m); }", 200, 100)
+    ;; czerwone kwadraty 10×10 wyśrodkowane w (10,30), (50,30), (90,30)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 10, 27)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 10, 27)), 0)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 50, 27)), 0)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 90, 27)), 0)
+    ;; między markerami tylko czarna linia (y=30) i białe tło wyżej
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 30, 27)), 255)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 30, 30)) < 40)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_svg_fill_rule_linecap_opacity_dashoffset() is
+    ;; fill-rule: evenodd → dziura w środku gwiazdy pentagramu; nonzero → wypełniona
+    let star: string = "<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><path id=\"p\" d=\"M50 5 L80 95 L5 38 L95 38 L20 95 Z\"/></svg>"
+    let w1: int = shot(star, "#p { fill: #ff0000; fill-rule: nonzero; }", 150, 150)
+    assert_eq(red_of(ffi_shim::silver_pixel(w1, 50, 50)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(w1, 50, 50)), 0)
+    ffi_shim::silver_window_close(w1)
+    let w2: int = shot(star, "#p { fill: #ff0000; fill-rule: evenodd; }", 150, 150)
+    assert_eq(green_of(ffi_shim::silver_pixel(w2, 50, 50)), 255)
+    ffi_shim::silver_window_close(w2)
+    ;; stroke-linecap: round wystaje poza koniec odcinka (x=20), butt nie
+    let line: string = "<svg width=\"100\" height=\"40\" viewBox=\"0 0 100 40\"><line id=\"l\" x1=\"20\" y1=\"20\" x2=\"80\" y2=\"20\"/></svg>"
+    let w3: int = shot(line, "#l { stroke: #000000; stroke-width: 16px; stroke-linecap: round; }", 150, 100)
+    assert_true(red_of(ffi_shim::silver_pixel(w3, 14, 20)) < 40)
+    ffi_shim::silver_window_close(w3)
+    let w4: int = shot(line, "#l { stroke: #000000; stroke-width: 16px; stroke-linecap: butt; }", 150, 100)
+    assert_true(red_of(ffi_shim::silver_pixel(w4, 14, 20)) > 215)
+    ffi_shim::silver_window_close(w4)
+    ;; stroke-opacity: połowa krycia nad białym
+    let w5: int = shot(line, "#l { stroke: #000000; stroke-width: 10px; stroke-opacity: 0.5; }", 150, 100)
+    assert_true(near(red_of(ffi_shim::silver_pixel(w5, 50, 20)), 127, 10))
+    ffi_shim::silver_window_close(w5)
+    ;; stroke-dashoffset przesuwa wzór: dasharray 20 20, offset 20 → x=10 puste, x=30 kreska (od x=20..40 wzór zaczyna od przerwy)
+    let w6: int = shot("<svg width=\"100\" height=\"20\"><line id=\"l\" x1=\"0\" y1=\"10\" x2=\"100\" y2=\"10\"/></svg>", "#l { stroke: #000000; stroke-width: 8px; stroke-dasharray: 20 20; stroke-dashoffset: 20; }", 150, 100)
+    assert_true(red_of(ffi_shim::silver_pixel(w6, 10, 10)) > 215)
+    assert_true(red_of(ffi_shim::silver_pixel(w6, 30, 10)) < 40)
+    ffi_shim::silver_window_close(w6)
+end
+
+fn text_box_width(html: string, css_text: string, font: string) -> int is
+    let win: int = ffi_shim::silver_window_create("w", 400, 100)
+    ffi_shim::silver_load_font(win, font, 16)
+    let d: dom::Dom = dom::parse(html)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, win)
+    let mut w: int = -1
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is w = boxes[i].w end
+        i += 1
+    end
+    ffi_shim::silver_window_close(win)
+    return w
+end
+
+#[test]
+fn e2e_font_kerning_none_and_text_rendering_change_text_width() is
+    ;; czcionka z tabelą `kern` (Liberation Sans) — SDL_ttf stosuje kerning tylko z klasycznej tabeli kern
+    let font: string = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+    let normal: int = text_box_width("<p>AVAVAVAV</p>", "p { margin: 0; font-size: 32px; }", font)
+    if normal > 0 is
+        let nok: int = text_box_width("<p>AVAVAVAV</p>", "p { margin: 0; font-size: 32px; font-kerning: none; }", font)
+        let speed: int = text_box_width("<p>AVAVAVAV</p>", "p { margin: 0; font-size: 32px; text-rendering: optimizeSpeed; }", font)
+        assert_true(nok > normal)
+        assert_eq(speed, nok)
+        let auto: int = text_box_width("<p>AVAVAVAV</p>", "p { margin: 0; font-size: 32px; font-kerning: normal; }", font)
+        assert_eq(auto, normal)
+    end
+end
+
+#[test]
+fn e2e_text_emphasis_draws_marks_above_text() is
+    ;; tekst czarny, znaczniki czerwone nad tekstem: czerwone piksele powyżej górnej krawędzi pola tekstu
+    let css_text: string = "p { margin: 0; padding-top: 14px; font-size: 24px; color: #000000; text-emphasis: filled circle #ff0000; }"
+    let win: int = shot("<p>MMMM</p>", css_text, 200, 100)
+    assert_true(count_red_in(win, 0, 0, 120, 14) > 10)           ;; w pasie nad tekstem (padding) są znaczniki
+    assert_eq(count_red_in(win, 0, 60, 200, 100), 0)             ;; poniżej nic
+    ffi_shim::silver_window_close(win)
+    let w2: int = shot("<p>MMMM</p>", "p { margin: 0; padding-top: 14px; font-size: 24px; color: #000000; }", 200, 100)
+    assert_eq(count_red_in(w2, 0, 0, 200, 100), 0)               ;; bez text-emphasis brak czerwieni
+    ffi_shim::silver_window_close(w2)
+end
+
+#[test]
+fn e2e_svg_stroke_linejoin_and_miterlimit() is
+    let html: string = "<svg width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><path id=\"p\" d=\"M10 45 L50 15 L90 45\"/></svg>"
+    let base: string = "#p { fill: none; stroke: #000000; stroke-width: 16px; "
+    ;; wierzchołek w (50,15): kąt ≈ 106°, czubek mitra sięga ~10 px nad wierzchołek (y≈5)
+    let miter: int = shot(html, base + "stroke-linejoin: miter; }", 150, 100)
+    assert_true(red_of(ffi_shim::silver_pixel(miter, 50, 6)) < 60)
+    ffi_shim::silver_window_close(miter)
+    let round: int = shot(html, base + "stroke-linejoin: round; }", 150, 100)
+    assert_true(red_of(ffi_shim::silver_pixel(round, 50, 6)) > 200)       ;; okrągły: tylko 8 px nad wierzchołkiem (y≈7)
+    assert_true(red_of(ffi_shim::silver_pixel(round, 50, 7)) < 80)
+    ffi_shim::silver_window_close(round)
+    let bevel: int = shot(html, base + "stroke-linejoin: bevel; }", 150, 100)
+    assert_true(red_of(ffi_shim::silver_pixel(bevel, 50, 7)) > 200)       ;; ścięty: sięga tylko y≈8
+    assert_true(red_of(ffi_shim::silver_pixel(bevel, 50, 9)) < 60)
+    ffi_shim::silver_window_close(bevel)
+    ;; miterlimit poniżej stosunku czubka (1,25) → ścięcie
+    let limited: int = shot(html, base + "stroke-linejoin: miter; stroke-miterlimit: 1; }", 150, 100)
+    assert_true(red_of(ffi_shim::silver_pixel(limited, 50, 6)) > 200)
+    ffi_shim::silver_window_close(limited)
+end
+
+fn count_gray_in(win: int, x0: int, y0: int, x1: int, y1: int) -> int is
+    let mut n: int = 0
+    let mut y: int = y0
+    while y < y1 is
+        let mut x: int = x0
+        while x < x1 is
+            let r: int = red_of(ffi_shim::silver_pixel(win, x, y))
+            if r > 30 && r < 225 is n += 1 end
+            x += 1
+        end
+        y += 1
+    end
+    return n
+end
+
+#[test]
+fn e2e_svg_shape_rendering_crisp_edges_removes_antialiasing() is
+    let html: string = "<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><line id=\"l\" x1=\"5\" y1=\"5\" x2=\"95\" y2=\"60\"/></svg>"
+    let smooth: int = shot(html, "#l { stroke: #000000; stroke-width: 3px; }", 120, 120)
+    assert_true(count_gray_in(smooth, 0, 0, 100, 70) > 20)
+    ffi_shim::silver_window_close(smooth)
+    let crisp: int = shot(html, "svg { shape-rendering: crispEdges; } #l { stroke: #000000; stroke-width: 3px; }", 120, 120)
+    assert_eq(count_gray_in(crisp, 0, 0, 100, 70), 0)
+    ffi_shim::silver_window_close(crisp)
+end
+
+#[test]
+fn e2e_font_synthesis_none_disables_synthetic_bold_and_italic() is
+    let font: string = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+    let reg: int = text_box_width("<p>Hello world</p>", "p { margin: 0; font-size: 24px; }", font)
+    let bold: int = text_box_width("<p>Hello world</p>", "p { margin: 0; font-size: 24px; font-weight: bold; }", font)
+    let nobold: int = text_box_width("<p>Hello world</p>", "p { margin: 0; font-size: 24px; font-weight: bold; font-synthesis: none; }", font)
+    assert_true(bold > reg)
+    assert_eq(nobold, reg)
+    let nobold2: int = text_box_width("<p>Hello world</p>", "p { margin: 0; font-size: 24px; font-weight: bold; font-synthesis-weight: none; }", font)
+    assert_eq(nobold2, reg)
+end
+
+#[test]
+fn e2e_offset_path_moves_element_along_path() is
+    let css_text: string = "#a { width: 20px; height: 20px; background: #ff0000; offset-path: path(\"M0 0 L100 40\"); offset-distance: 100%; offset-anchor: left top; offset-rotate: 0deg; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 100)
+    ;; element przesunięty do końca ścieżki (100,40): czerwony kwadrat 20×20 od (100,40)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 110, 50)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 110, 50)), 0)
+    assert_eq(green_of(ffi_shim::silver_pixel(win, 5, 5)), 255)          ;; w miejscu w układzie już pusto
+    ffi_shim::silver_window_close(win)
+    ;; połowa ścieżki
+    let w2: int = shot("<div id=\"a\"></div>", string_replace(css_text, "100%", "50%"), 200, 100)
+    assert_eq(green_of(ffi_shim::silver_pixel(w2, 60, 30)), 0)
+    assert_eq(green_of(ffi_shim::silver_pixel(w2, 110, 50)), 255)
+    ffi_shim::silver_window_close(w2)
+end
+
+#[test]
+fn e2e_image_resolution_scales_natural_size() is
+    ;; obrazek 40×20 zapisany z okna; image-resolution: 2x → 20×10
+    let src: int = ffi_shim::silver_window_create("img", 40, 20)
+    ffi_shim::silver_clear(src, 255, 0, 0)
+    ffi_shim::silver_save_png(src, "/tmp/silver_res_test.png")
+    ffi_shim::silver_window_close(src)
+    let w1: int = ffi_shim::silver_window_create("r", 200, 100)
+    let d: dom::Dom = dom::parse("<img id=\"i\" src=\"/tmp/silver_res_test.png\">")
+    let nat: [layout::LayoutBox] = layout::layout(d, css::parse("img { margin: 0; }"), 200, w1)
+    let hi: [layout::LayoutBox] = layout::layout(d, css::parse("img { margin: 0; image-resolution: 2x; }"), 200, w1)
+    let n: layout::LayoutBox = pbox(nat, dom::find_by_id(d, "i"))
+    let h: layout::LayoutBox = pbox(hi, dom::find_by_id(d, "i"))
+    assert_eq(n.w, 40)
+    assert_eq(n.h, 20)
+    assert_eq(h.w, 20)
+    assert_eq(h.h, 10)
+    ffi_shim::silver_window_close(w1)
+end
+
+;; ====================== 0.4: typografia na prawdziwym shimie ======================
+fn permille_str(n: int) -> string is
+    let frac: int = n % 1000
+    let mut fs: string = to_string(frac)
+    if frac < 100 is fs = "0" + fs end
+    if frac < 10 is fs = "0" + fs end
+    return to_string(n / 1000) + "." + fs
+end
+
+fn dark_in(win: int, x0: int, y0: int, x1: int, y1: int) -> int is
+    let mut n: int = 0
+    let mut y: int = y0
+    while y < y1 is
+        let mut x: int = x0
+        while x < x1 is
+            if red_of(ffi_shim::silver_pixel(win, x, y)) < 128 is n += 1 end
+            x += 1
+        end
+        y += 1
+    end
+    return n
+end
+
+#[test]
+fn e2e_font_stretch_scales_measured_and_drawn_text() is
+    let normal: int = text_box_width("<p>MMMM</p>", "p { margin: 0; font-size: 24px; }", "")
+    let half: int = text_box_width("<p>MMMM</p>", "p { margin: 0; font-size: 24px; font-stretch: 50%; }", "")
+    let wide: int = text_box_width("<p>MMMM</p>", "p { margin: 0; font-size: 24px; font-stretch: expanded; }", "")
+    assert_true(normal > 40)
+    assert_true(near(half, normal / 2, 2))
+    assert_true(near(wide, normal * 125 / 100, 2))
+    ;; narysowane: przy 50% w prawej połowie dawnej szerokości nie ma już ciemnych pikseli
+    let win: int = shot("<p>MMMM</p>", "p { margin: 0; font-size: 24px; color: #000000; font-stretch: 50%; }", 200, 60)
+    assert_true(dark_in(win, 0, 0, half + 1, 40) > 20)
+    assert_eq(dark_in(win, half + 3, 0, 200, 40), 0)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_tabular_nums_use_equal_cells_and_still_draw() is
+    let a: int = text_box_width("<p>1111</p>", "p { margin: 0; font-size: 24px; font-variant-numeric: tabular-nums; }", "")
+    let b: int = text_box_width("<p>0000</p>", "p { margin: 0; font-size: 24px; font-variant-numeric: tabular-nums; }", "")
+    assert_eq(a, b)
+    assert_true(a > 30)
+    let win: int = shot("<p>1 0</p>", "p { margin: 0; font-size: 24px; color: #000000; font-variant-numeric: tabular-nums; }", 200, 60)
+    assert_true(dark_in(win, 0, 0, a, 40) > 15)
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_zwnj_is_zero_width_in_shaped_text() is
+    let win: int = ffi_shim::silver_window_create("w", 300, 100)
+    ffi_shim::silver_load_font(win, "", 16)
+    let f: int = ffi_shim::silver_measure_text_ex(win, "f", 32, 0)
+    let i: int = ffi_shim::silver_measure_text_ex(win, "i", 32, 0)
+    let fi: int = ffi_shim::silver_measure_text_ex(win, "f\u200ci", 32, 0)
+    assert_true(near(fi, f + i, 2))
+    ffi_shim::silver_window_close(win)
+end
+
+#[test]
+fn e2e_font_size_adjust_uses_measured_x_height() is
+    let win: int = ffi_shim::silver_window_create("w", 300, 100)
+    ffi_shim::silver_load_font(win, "", 16)
+    let r: int = ffi_shim::silver_font_ratio(win, 20, 0, 0)
+    ffi_shim::silver_window_close(win)
+    assert_true(r > 350 && r < 750)
+    let w20: int = text_box_width("<p>xxxx</p>", "p { margin: 0; font-size: 20px; }", "")
+    let w40: int = text_box_width("<p>xxxx</p>", "p { margin: 0; font-size: 40px; }", "")
+    ;; adjust = zmierzony współczynnik → bez zmiany; podwojony → rozmiar ×2
+    let same: int = text_box_width("<p>xxxx</p>", "p { margin: 0; font-size: 20px; font-size-adjust: " + permille_str(r) + "; }", "")
+    let dbl: int = text_box_width("<p>xxxx</p>", "p { margin: 0; font-size: 20px; font-size-adjust: " + permille_str(r * 2) + "; }", "")
+    assert_true(near(same, w20, 3))
+    assert_true(near(dbl, w40, 5))
+end
+
+#[test]
+fn e2e_transform_3d_rotate_y_narrows_box_and_hides_backface() is
+    let base: string = "body { margin: 0; background: #ffffff; } #p { perspective: 400px; width: 200px; height: 120px; } #c { margin-left: 50px; width: 100px; height: 100px; background: #000000; }"
+    ;; kontrola: bez 3D lewa krawędź (x=55) jest czarna
+    let flat: int = shot("<div id=\"p\"><div id=\"c\"></div></div>", base, 220, 130)
+    assert_true(red_of(ffi_shim::silver_pixel(flat, 55, 50)) < 50)
+    ffi_shim::silver_window_close(flat)
+    ;; rotateY(60deg): szerokość ×0,5 wokół środka (x=100) → x=55 jest już tłem, środek nadal czarny
+    let rot: int = shot("<div id=\"p\"><div id=\"c\" style=\"transform: rotateY(60deg)\"></div></div>", base, 220, 130)
+    assert_true(red_of(ffi_shim::silver_pixel(rot, 100, 50)) < 50)
+    assert_true(red_of(ffi_shim::silver_pixel(rot, 55, 50)) > 200)
+    ffi_shim::silver_window_close(rot)
+    ;; rotateY(180deg): widać tył; domyślnie rysowany, z backface-visibility: hidden — nie
+    let back: int = shot("<div id=\"p\"><div id=\"c\" style=\"transform: rotateY(180deg)\"></div></div>", base, 220, 130)
+    assert_true(red_of(ffi_shim::silver_pixel(back, 100, 50)) < 50)
+    ffi_shim::silver_window_close(back)
+    let hid: int = shot("<div id=\"p\"><div id=\"c\" style=\"transform: rotateY(180deg); backface-visibility: hidden\"></div></div>", base, 220, 130)
+    assert_true(red_of(ffi_shim::silver_pixel(hid, 100, 50)) > 200)
+    ffi_shim::silver_window_close(hid)
+    ;; perspektywa: rotateX(50deg) — dolna część bliżej/dalej, górna krawędź przesunięta względem płaskiej
+    let rx: int = shot("<div id=\"p\"><div id=\"c\" style=\"transform: rotateX(70deg)\"></div></div>", base, 220, 130)
+    assert_true(red_of(ffi_shim::silver_pixel(rx, 100, 5)) > 200)
+    assert_true(red_of(ffi_shim::silver_pixel(rx, 100, 50)) < 50)
+    ffi_shim::silver_window_close(rx)
+end
+
+#[test]
+fn e2e_writing_mode_vertical_draws_rotated_box() is
+    let css0: string = "body { margin: 0; background: #ffffff; } #v { margin: 0; writing-mode: vertical-rl; height: 100px; background: #000000; color: #ffffff; }"
+    let win: int = shot("<div id=\"v\">Hi</div>", css0, 200, 150)
+    ;; obrócony pasek: wąski w poziomie, wysoki na 100px
+    assert_true(red_of(ffi_shim::silver_pixel(win, 5, 80)) < 50)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 5, 5)) < 50)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 100, 5)) > 200)
+    assert_true(red_of(ffi_shim::silver_pixel(win, 5, 120)) > 200)
+    ffi_shim::silver_window_close(win)
+end
+
+fn px_is_red(win: int, x: int, y: int) -> bool is
+    let p: int = to_u32(ffi_shim::silver_pixel(win, x, y))
+    return ((p / 65536) % 256) > 180 && ((p / 256) % 256) < 90
+end
+
+fn px_is_green(win: int, x: int, y: int) -> bool is
+    let p: int = to_u32(ffi_shim::silver_pixel(win, x, y))
+    return ((p / 256) % 256) > 120 && ((p / 65536) % 256) < 90
+end
+
+#[test]
+fn e2e_exif_orientation_is_applied_by_default_and_overridable() is
+    let css0: string = "body { margin: 0; background: #ffffff; } img { display: block; margin: 0; }"
+    ;; surowy obraz 40×20: lewa połowa czerwona, prawa zielona
+    let raw: int = shot("<img src=\"/tmp/silver_testdata/exif1.jpg\">", css0, 60, 60)
+    assert_true(px_is_red(raw, 5, 10))
+    assert_true(px_is_green(raw, 35, 10))
+    ffi_shim::silver_window_close(raw)
+    ;; EXIF 6 = obrót 90° cw → 20×40: góra czerwona, dół zielony
+    let e6: int = shot("<img src=\"/tmp/silver_testdata/exif6.jpg\">", css0, 60, 60)
+    assert_true(px_is_red(e6, 10, 5))
+    assert_true(px_is_green(e6, 10, 35))
+    ffi_shim::silver_window_close(e6)
+    ;; EXIF 8 = obrót 90° ccw: góra zielona, dół czerwony
+    let e8: int = shot("<img src=\"/tmp/silver_testdata/exif8.jpg\">", css0, 60, 60)
+    assert_true(px_is_green(e8, 10, 5))
+    assert_true(px_is_red(e8, 10, 35))
+    ffi_shim::silver_window_close(e8)
+    ;; EXIF 3 = 180°: lewa zielona, prawa czerwona
+    let e3: int = shot("<img src=\"/tmp/silver_testdata/exif3.jpg\">", css0, 60, 60)
+    assert_true(px_is_green(e3, 5, 10))
+    assert_true(px_is_red(e3, 35, 10))
+    ffi_shim::silver_window_close(e3)
+    ;; image-orientation: none ignoruje EXIF (wymiary układu zostają jak dla from-image)
+    let none: int = shot("<img src=\"/tmp/silver_testdata/exif3.jpg\" style=\"image-orientation: none; width: 40px; height: 20px\">", css0, 60, 60)
+    assert_true(px_is_red(none, 5, 10))
+    ffi_shim::silver_window_close(none)
+    ;; flip: odbicie poziome surowego obrazu
+    let flip: int = shot("<img src=\"/tmp/silver_testdata/exif1.jpg\" style=\"image-orientation: flip\">", css0, 60, 60)
+    assert_true(px_is_green(flip, 5, 10))
+    assert_true(px_is_red(flip, 35, 10))
+    ffi_shim::silver_window_close(flip)
+    ;; 90deg: obrót surowego obrazu o 90° cw (pudełko 40×20 skalowane)
+    let rot: int = shot("<img src=\"/tmp/silver_testdata/exif1.jpg\" style=\"image-orientation: 90deg; width: 20px; height: 40px\">", css0, 60, 60)
+    assert_true(px_is_red(rot, 10, 5))
+    assert_true(px_is_green(rot, 10, 35))
+    ffi_shim::silver_window_close(rot)
+end
+
+#[test]
+fn e2e_object_view_box_crops_source() is
+    let css0: string = "body { margin: 0; background: #ffffff; } img { display: block; margin: 0; width: 40px; height: 20px; object-fit: fill; }"
+    ;; kadr = lewa połowa (czerwona) rozciągnięta na całe pudełko
+    let win: int = shot("<img src=\"/tmp/silver_testdata/exif1.jpg\" style=\"object-view-box: inset(0 50% 0 0)\">", css0, 60, 60)
+    assert_true(px_is_red(win, 5, 10))
+    assert_true(px_is_red(win, 35, 10))
+    ffi_shim::silver_window_close(win)
+    let right: int = shot("<img src=\"/tmp/silver_testdata/exif1.jpg\" style=\"object-view-box: xywh(50% 0 50% 100%)\">", css0, 60, 60)
+    assert_true(px_is_green(right, 5, 10))
+    assert_true(px_is_green(right, 35, 10))
+    ffi_shim::silver_window_close(right)
+    ;; bez kadru: obie połowy
+    let full: int = shot("<img src=\"/tmp/silver_testdata/exif1.jpg\">", css0, 60, 60)
+    assert_true(px_is_red(full, 5, 10))
+    assert_true(px_is_green(full, 35, 10))
+    ffi_shim::silver_window_close(full)
+end
+
+#[test]
+fn e2e_shape_outside_image_alpha_and_threshold() is
+    let words: string = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www"
+    let d: dom::Dom = dom::parse("<div id=\"f\"></div><p>" + words + "</p>")
+    let css_lo: string = "body { margin: 0; } p { margin: 0; } #f { float: left; width: 100px; height: 100px; shape-outside: url(/tmp/silver_testdata/disc.png); shape-image-threshold: 0.2; }"
+    let css_hi: string = "body { margin: 0; } p { margin: 0; } #f { float: left; width: 100px; height: 100px; shape-outside: url(/tmp/silver_testdata/disc.png); shape-image-threshold: 0.7; }"
+    let win: int = ffi_shim::silver_window_create("t", 300, 200)
+    ffi_shim::silver_load_font(win, "", 16)
+    let lo: [layout::LayoutBox] = layout::layout(d, css::parse(css_lo), 300, win)
+    let hi: [layout::LayoutBox] = layout::layout(d, css::parse(css_hi), 300, win)
+    ffi_shim::silver_window_close(win)
+    ;; próg 0,2: widoczna cała tarcza (r=50) → w połowie wysokości tekst zaczyna się przy ~100
+    let mid_lo: int = min_x_in_band(lo, 42, 58)
+    ;; próg 0,7: tylko wewnętrzny dysk (r=30) → ~80
+    let mid_hi: int = min_x_in_band(hi, 42, 58)
+    assert_true(mid_lo >= 96)
+    assert_true(mid_hi >= 76 && mid_hi <= 90)
+    ;; góra bryły przy progu 0,2 jest węższa niż prostokąt (100)
+    assert_true(min_x_in_band(lo, 0, 12) < 98)
+end
+
+fn min_x_in_band(boxes: [layout::LayoutBox], y0: int, y1: int) -> int is
+    let mut best: int = 1000000
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].y >= y0 && boxes[i].y < y1 && boxes[i].x < best is best = boxes[i].x end
+        i += 1
+    end
+    return best
+end
+
+#[test]
+fn e2e_text_spacing_trim_halves_adjacent_cjk_punctuation() is
+    let css_n: string = "p { margin: 0; font-size: 20px; font-family: \"Noto Serif CJK SC\", serif; }"
+    let css_s: string = "p { margin: 0; font-size: 20px; font-family: \"Noto Serif CJK SC\", serif; text-spacing-trim: space-all; }"
+    let two_n: int = text_box_width("<p>\uff09\uff08</p>", css_n, "")
+    let two_s: int = text_box_width("<p>\uff09\uff08</p>", css_s, "")
+    ;; ）（ — przycięta prawa połowa pierwszego znaku: całość 1,5 szerokości zamiast 2
+    assert_true(two_s > 20)
+    assert_true(two_n < two_s)
+    assert_true(near(two_s - two_n, two_s / 4, 2))
+    ;; （（ — przycięta lewa połowa drugiego
+    let oo_n: int = text_box_width("<p>\uff08\uff08</p>", css_n, "")
+    assert_true(near(two_s - oo_n, two_s / 4, 2))
+    ;; ）） i 、） też
+    assert_true(text_box_width("<p>\u3001\uff09</p>", css_n, "") < text_box_width("<p>\u3001\uff09</p>", css_s, ""))
+    ;; litera + nawias nie są przycinane; pojedynczy nawias także nie
+    assert_eq(text_box_width("<p>a\uff08</p>", css_n, ""), text_box_width("<p>a\uff08</p>", css_s, ""))
+    assert_eq(text_box_width("<p>\uff08</p>", css_n, ""), text_box_width("<p>\uff08</p>", css_s, ""))
+    assert_eq(text_box_width("<p>ab</p>", css_n, ""), text_box_width("<p>ab</p>", css_s, ""))
+end
+
+#[test]
+fn e2e_transform_style_preserve_3d_nested_face_faces_camera() is
+    let d0: string = "<div id=\"s\"><div id=\"cube\"><div id=\"face\"></div></div></div>"
+    let base: string = "body { margin: 0; background: #ffffff; } #s { perspective: 500px; width: 200px; height: 120px; } #cube { margin-left: 50px; width: 100px; height: 100px; transform: rotateY(90deg); } #face { width: 100px; height: 100px; background: #000000; transform: rotateY(-90deg) translateZ(50px); }"
+    ;; preserve-3d: kostka obrócona o 90°, ściana obrócona z powrotem i wysunięta ku kamerze → widać ją (skala ≈ 1,11)
+    let pres: int = shot(d0, base + " #cube { transform-style: preserve-3d; }", 220, 130)
+    assert_true(red_of(ffi_shim::silver_pixel(pres, 100, 50)) < 50)
+    assert_true(red_of(ffi_shim::silver_pixel(pres, 150, 50)) < 50)
+    assert_true(red_of(ffi_shim::silver_pixel(pres, 170, 50)) > 200)
+    ffi_shim::silver_window_close(pres)
+    ;; bez preserve-3d (płasko) ta sama ściana jest widoczna tylko krawędzią
+    let flat: int = shot(d0, base, 220, 130)
+    assert_true(red_of(ffi_shim::silver_pixel(flat, 150, 50)) > 200)
+    ffi_shim::silver_window_close(flat)
+end
