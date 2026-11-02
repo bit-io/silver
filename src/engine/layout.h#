@@ -4,6 +4,11 @@ mod css
 mod style
 mod anim
 mod cssval
+mod gfx
+mod svg
+mod typo
+mod shape
+mod anchor
 use "std -> conv" from "conv"
 
 pub struct LayoutBox is
@@ -24,12 +29,17 @@ pub struct LayoutBox is
     pub fixed:   bool     ;; position: fixed — nie przewija się z dokumentem
     pub content_h: int    ;; pełna wysokość treści (dla pasków przewijania)
     pub scroll_y:  int    ;; zastosowane przesunięcie przewijania kontenera
+    pub svg:       string ;; 0.4: znacznik SVG do narysowania (element <svg>)
+    pub fx:        string ;; 0.4: specyfikacja efektów warstwy (filter/mask/blend) dla grupy
+    pub content_w: int    ;; 0.4: pełna szerokość treści (poziomy pasek przewijania)
+    pub scroll_x:  int    ;; 0.4: zastosowane przesunięcie poziome kontenera
     pub sticky:    bool   ;; position: sticky — przesunięcie liczone przy rysowaniu
     pub stk_top:   int    ;; odstęp od góry okna, przy którym element „przykleja się"
     pub stk_y:     int    ;; naturalne y elementu
     pub stk_max:   int    ;; maksymalne dodatkowe przesunięcie (do końca rodzica)
     pub xf_id:     int    ;; 0.3: id elementu z transformacją macierzową (obrót/pochylenie), do której należy box; 0 = brak
     pub xf:        [int]  ;; [a,b,c,d,e,f, pivot_x,pivot_y, x,y,w,h warstwy] (a-d x1000, e/f px x1000)
+    pub m3d:       string ;; 0.4: macierz 4×4 (16 liczb ×1e6, współrzędne dokumentu) + "|1" gdy backface-visibility: hidden; "" = brak 3D
 end
 
 pub struct LayoutResult is
@@ -80,8 +90,8 @@ fn auto_v() -> int is return style::auto_val() end
 pub fn no_clip_box(node_id: int, x: int, y: int, w: int, h: int, st: style::ComputedStyle, kind: string) -> LayoutBox is
     return LayoutBox {
         node_id: node_id, x: x, y: y, w: w, h: h, st: st, text: "", img_src: "", kind: kind,
-        has_clip: false, cx: 0, cy: 0, cw: 0, ch: 0, fixed: false, content_h: 0, scroll_y: 0,
-        sticky: false, stk_top: 0, stk_y: 0, stk_max: 0, xf_id: 0, xf: []
+        has_clip: false, cx: 0, cy: 0, cw: 0, ch: 0, fixed: false, content_h: 0, scroll_y: 0, content_w: 0, scroll_x: 0, fx: "", svg: "",
+        sticky: false, stk_top: 0, stk_y: 0, stk_max: 0, xf_id: 0, xf: [], m3d: ""
     }
 end
 
@@ -143,17 +153,66 @@ pub fn normal_line_height(font_size: int) -> int is
 end
 
 fn line_h_of(st: style::ComputedStyle) -> int is
-    if st.line_height > 0 is return st.line_height end
-    return normal_line_height(st.font_size)
+    let mut lh: int = normal_line_height(st.font_size)
+    if st.line_height > 0 is lh = st.line_height end
+    ;; 0.4: line-height-step — wysokość wiersza zaokrąglana w górę do wielokrotności kroku
+    let stp: string = props::xget(st.xp, "line-height-step")
+    if stp != "" && stp != "0" && stp != "0px" is
+        let step: int = gfx::len_px(stp, 0, st.font_size)
+        if step > 0 is lh = ((lh + step - 1) / step) * step end
+    end
+    return lh
 end
 
-fn style_flags(st: style::ComputedStyle) -> int is
+;; 0.4: font-synthesis — czy wolno syntetyzować (weight | style | small-caps). Skrót: none | [weight] [style] [small-caps] [position];
+;; longhandy font-synthesis-weight/-style/-small-caps: auto | none.
+pub fn synth_allowed(st: style::ComputedStyle, what: string) -> bool is
+    let lh: string = string_lower(props::xget(st.xp, "font-synthesis-" + what))
+    if lh == "none" is return false end
+    let sh: string = string_lower(props::xget(st.xp, "font-synthesis"))
+    if sh == "" is return true end
+    if sh == "none" is return false end
+    return trim_token(sh, what)
+end
+
+;; text-transform z uwzględnieniem kapitalików (font-variant-caps ≠ normal, gdy wolno syntetyzować)
+pub fn eff_transform(st: style::ComputedStyle) -> string is
+    let caps: string = string_lower(props::xget(st.xp, "font-variant-caps"))
+    if caps != "" && caps != "normal" && synth_allowed(st, "small-caps") && st.text_transform == "none" is return "uppercase" end
+    return st.text_transform
+end
+
+pub fn style_flags(st: style::ComputedStyle) -> int is
     let mut f: int = 0
     if st.bold is f += 1 end
     if st.italic is f += 2 end
     if st.underline is f += 4 end
     if st.strike is f += 8 end
-    return f + st.font_key * 256
+    ;; 0.4: font-kerning: none / text-rendering: optimizeSpeed → bez kerningu (16); geometricPrecision → bez hintingu (32)
+    let tr: string = string_lower(props::xget(st.xp, "text-rendering"))
+    if string_lower(props::xget(st.xp, "font-kerning")) == "none" || tr == "optimizespeed" || typo::feat(st.xp, "kern") == 0 is f += 16 end
+    if tr == "geometricprecision" is f += 32 end
+    ;; font-synthesis: weight/style none → bez syntetycznego pogrubienia (64) / pochylenia (128)
+    if !synth_allowed(st, "weight") is f += 64 end
+    if !synth_allowed(st, "style") is f += 128 end
+    ;; 0.4: cyfry tabelaryczne (256) i font-stretch / "wdth" jako skalowanie poziome w krokach 5% (bity 9..15)
+    if typo::tabular(st.xp) is f += 256 end
+    let sp: int = typo::stretch_pct(st.xp)
+    if sp != 100 is f += (sp / 5) * 512 end
+    ;; text-spacing-trim: normal (domyślnie) przycina odstępy między sąsiednią interpunkcją CJK (32768)
+    let tst: string = string_lower(string_trim(props::xget(st.xp, "text-spacing-trim")))
+    if tst == "" || tst == "normal" is f += 32768 end
+    return f + st.font_key * 65536
+end
+
+;; Tekst do pomiaru i rysowania: text-transform (z kapitalikami), cechy typograficzne (typo.h#), bidi-override.
+pub fn shaped_text(text: string, st: style::ComputedStyle) -> string is
+    let t0: string = apply_transform(text, eff_transform(st))
+    if st.xp == "" is return t0 end
+    let t1: string = typo::shape(t0, st.xp)
+    if typo::bidi_override_on(st.xp, st.direction) is return typo::reverse_words(t1) end
+    if upright_mode(st.xp) is return stack_chars(t1, combine_limit(st.xp)) end
+    return t1
 end
 
 pub fn est_text_width(text: string, font_size: int) -> int is
@@ -234,6 +293,43 @@ fn is_live(d: dom::Dom, id: int) -> bool is
 end
 
 ;; Styl każdego węzła (indeks = id węzła), dziedziczenie od rodzica.
+;; 0.4: animacje sterowane przewijaniem mają `animation-duration: auto` → czas wirtualny 1000 ms (postęp = pozycja na osi)
+pub fn apply_timeline_defaults(st0: style::ComputedStyle) -> style::ComputedStyle is
+    let mut st: style::ComputedStyle = st0
+    if st.anim_name != "" && st.anim_ms <= 0 is
+        let tv: string = string_lower(string_trim(props::xget(st.xp, "animation-timeline")))
+        if tv != "" && tv != "auto" && tv != "none" is st.anim_ms = 1000 end
+    end
+    return st
+end
+
+;; 0.4: color-scheme — użyty schemat: "dark" | "light" | "" (normal). `light dark` wybiera wg preferencji systemu (dark_pref).
+pub fn used_scheme(st: style::ComputedStyle, dark_pref: bool) -> string is
+    let v: string = string_lower(props::xget(st.xp, "color-scheme"))
+    if v == "" || v == "normal" is return "" end
+    let has_dark: bool = trim_token(v, "dark")
+    let has_light: bool = trim_token(v, "light")
+    if has_dark && has_light is
+        if dark_pref is return "dark" end
+        return "light"
+    end
+    if has_dark is return "dark" end
+    if has_light is return "light" end
+    return ""
+end
+
+;; Tekst domyślny (CanvasText) w ciemnym schemacie: element, w którym zaczyna się `color-scheme: dark`, dostaje jasny kolor, jeśli odziedziczył czarny.
+pub fn apply_scheme_defaults(st0: style::ComputedStyle, parent: style::ComputedStyle, dark_pref: bool) -> style::ComputedStyle is
+    let mut st: style::ComputedStyle = st0
+    if used_scheme(st, dark_pref) == "dark" && used_scheme(parent, dark_pref) != "dark" is
+        let dflt: style::Color = style::root_style().color
+        if st.color.r == dflt.r && st.color.g == dflt.g && st.color.b == dflt.b && st.color.a == dflt.a is
+            st.color = style::Color { r: 232, g: 234, b: 237, a: 255 }
+        end
+    end
+    return st
+end
+
 pub fn compute_styles(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionState) -> [style::ComputedStyle] is
     return compute_styles_a(d, sheet, ix, anim::no_anim())
 end
@@ -267,6 +363,8 @@ pub fn compute_styles_a(d: dom::Dom, sheet: css::Stylesheet, ix: css::Interactio
             styles[id] = style::text_style(parent_st)
         else is
             styles[id] = style::resolve_ctx(sheet, d, id, parent_st, ix)
+            styles[id] = apply_scheme_defaults(styles[id], parent_st, ix.dark)
+            styles[id] = apply_timeline_defaults(styles[id])
             if animating is styles[id] = anim::animate_style(sheet, styles[id], parent_st, act, id) end
         end
         let mut c: int = array_len(node.children) - 1
@@ -283,7 +381,7 @@ fn style_of(cx: LayoutCtx, id: int) -> style::ComputedStyle is
 end
 
 fn is_replaced(tag: string) -> bool is
-    return tag == "img" || tag == "input" || tag == "textarea" || tag == "select"
+    return tag == "img" || tag == "svg" || tag == "input" || tag == "textarea" || tag == "select"
 end
 
 fn is_out_of_flow(st: style::ComputedStyle) -> bool is
@@ -347,6 +445,10 @@ fn replaced_natural(cx: LayoutCtx, id: int) -> style::BoxSides is
     ;; zwraca (w=right, h=bottom) naturalnego rozmiaru zawartości (bez padding/border)
     let n: dom::DomNode = cx.dom.nodes[id]
     let st: style::ComputedStyle = cx.styles[id]
+    if n.tag == "svg" is
+        let ns: [int] = svg::natural_size(n)
+        return style::BoxSides { top: 0, right: ns[0], bottom: ns[1], left: 0 }
+    end
     if n.tag == "img" is
         let mut nw: int = 0
         let mut nh: int = 0
@@ -356,6 +458,14 @@ fn replaced_natural(cx: LayoutCtx, id: int) -> style::BoxSides is
         end
         if nw <= 0 is nw = 100 end
         if nh <= 0 is nh = 100 end
+        ;; 0.4: image-resolution — gęstość obrazka (np. 2x, 192dpi) zmniejsza rozmiar naturalny
+        let res1000: int = image_resolution_x1000(st)
+        if res1000 > 0 && res1000 != 1000 is
+            nw = (nw * 1000 + res1000 / 2) / res1000
+            nh = (nh * 1000 + res1000 / 2) / res1000
+            if nw < 1 is nw = 1 end
+            if nh < 1 is nh = 1 end
+        end
         return style::BoxSides { top: 0, right: nw, bottom: nh, left: 0 }
     end
     let lh: int = line_h_of(st)
@@ -389,7 +499,7 @@ end
 
 ;; ---------- szerokość max-content (shrink-to-fit) ----------
 fn text_max_width(cx: LayoutCtx, text: string, st: style::ComputedStyle) -> int is
-    let t: string = apply_transform(text, st.text_transform)
+    let t: string = shaped_text(text, st)
     if st.white_space == "pre" || st.white_space == "pre-wrap" is
         let lines: [string] = string_split(t, "\n")
         let mut best: int = 0
@@ -428,7 +538,7 @@ fn max_content(cx: LayoutCtx, id: int, depth: int) -> int is
     if is_replaced(n.tag) is
         let nat: style::BoxSides = replaced_natural(cx, id)
         let mut w: int = nat.right
-        if n.tag == "img" && st.height_mode == "px" && nat.bottom > 0 is w = st.height * nat.right / nat.bottom end
+        if (n.tag == "img" || n.tag == "svg") && st.height_mode == "px" && nat.bottom > 0 is w = st.height * nat.right / nat.bottom end
         return w + own
     end
     let kids: [int] = n.children
@@ -473,6 +583,113 @@ end
 
 fn nowrap_of(st: style::ComputedStyle) -> bool is
     return st.white_space == "nowrap" || st.white_space == "pre"
+end
+
+;; ---------- hyphens (0.4): miękki łącznik U+00AD, `hyphens: auto` (heurystyka sylab) ----------
+;; hyphenate-limit-chars: "<min słowo> [<przed> [<po>]]" (auto = domyślne 7/3/3 — w CSS 5/2/2; Silver zachowuje 0.4: 7/3/3)
+pub fn hyph_limits(st: style::ComputedStyle) -> [int] is
+    let v: string = string_lower(props::xget(st.xp, "hyphenate-limit-chars"))
+    let t: [string] = cssval::split_top(v)
+    let mut w: int = 7
+    let mut b: int = 3
+    let mut a: int = 3
+    if array_len(t) >= 1 && t[0] != "auto" is w = str_to_int(t[0]) end
+    if array_len(t) >= 2 && t[1] != "auto" is b = str_to_int(t[1]) end
+    if array_len(t) >= 3 && t[2] != "auto" is a = str_to_int(t[2]) elsif array_len(t) == 2 && t[1] != "auto" is a = b end
+    if b < 1 is b = 1 end
+    if a < 1 is a = 1 end
+    return [w, b, a]
+end
+
+fn hyph_auto_for(st: style::ComputedStyle, word: string) -> string is
+    let l: [int] = hyph_limits(st)
+    return hyph_auto_lim(word, l[0], l[1], l[2])
+end
+
+;; hyphenate-character: znak doklejany na końcu wiersza ("auto" → "-")
+pub fn hyph_char(st: style::ComputedStyle) -> string is
+    let v: string = string_trim(props::xget(st.xp, "hyphenate-character"))
+    if v == "" || string_lower(v) == "auto" is return "-" end
+    if string_len(v) >= 2 && (string_starts_with(v, "\"") || string_starts_with(v, "'")) is return string_slice(v, 1, string_len(v) - 1) end
+    return v
+end
+
+pub fn shy_strip(s: string) -> string is
+    if string_find(s, "\u00AD") < 0 is return s end
+    return string_replace(s, "\u00AD", "")
+end
+
+fn is_vowel_ch(c: string) -> bool is
+    return string_find("aeiouyAEIOUYąęóĄĘÓ", c) >= 0
+end
+
+fn is_alpha_ch(c: string) -> bool is
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || string_find("ąćęłńóśźżĄĆĘŁŃÓŚŹŻäöüßÄÖÜéèàçñ", c) >= 0
+end
+
+;; Wstawia U+00AD w miejscach dozwolonych dla `hyphens: auto` (V-CV oraz VC-CV, min. 3 znaki z każdej strony).
+pub fn hyph_auto(word: string) -> string is
+    return hyph_auto_lim(word, 7, 3, 3)
+end
+
+;; hyphenate-limit-chars: min. długość słowa, min. znaków przed i po myślniku
+pub fn hyph_auto_lim(word: string, min_word: int, min_before: int, min_after: int) -> string is
+    if string_find(word, "\u00AD") >= 0 is return word end
+    let nch: int = ffi_shim::silver_utf8_len(word)
+    if nch < min_word is return word end
+    let mut chars: [string] = []
+    let mut pos: int = 0
+    while pos < string_len(word) is
+        let nx: int = ffi_shim::silver_utf8_next(word, pos)
+        chars = array_push(chars, string_slice(word, pos, nx))
+        pos = nx
+    end
+    let mut i: int = 0
+    while i < array_len(chars) is
+        if !is_alpha_ch(chars[i]) is return word end
+        i += 1
+    end
+    let mut out: string = ""
+    i = 0
+    while i < array_len(chars) is
+        out = out + chars[i]
+        let left: int = i + 1
+        let right: int = array_len(chars) - left
+        if left >= min_before && right >= min_after && i + 2 < array_len(chars) is
+            let c0: bool = is_vowel_ch(chars[i])
+            let c1: bool = is_vowel_ch(chars[i + 1])
+            let c2: bool = is_vowel_ch(chars[i + 2])
+            if c0 && !c1 && c2 is out = out + "\u00AD" end
+            if !c0 && !c1 && i + 3 < array_len(chars) && is_vowel_ch(chars[i - 1]) && c2 is
+                ;; samogłoska + spółgłoska | spółgłoska + samogłoska — dzielimy po pierwszej spółgłosce tylko gdy nie ma dwuznaku
+                if !(chars[i] == "s" && chars[i + 1] == "z") && !(chars[i] == "c" && chars[i + 1] == "z") is out = out + "\u00AD" end
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+;; Dzieli atom-słowo w ostatnim miękkim łączniku, który mieści się w `room` px (głowa dostaje "-"). "" gdy brak.
+;; Zwraca "<głowa>\u0001<ogon>".
+fn hyph_split(cx: LayoutCtx, text: string, st: style::ComputedStyle, room: int) -> string is
+    let mut best: string = ""
+    let mut from: int = 0
+    let n: int = string_len(text)
+    while from < n is
+        let q: int = string_find(string_slice(text, from, n), "\u00AD")
+        if q < 0 is break end
+        let at: int = from + q
+        let head: string = string_slice(text, 0, at)
+        let tail: string = string_slice(text, at + 2, n)
+        if string_len(shy_strip(head)) > 0 && string_len(shy_strip(tail)) > 0 is
+            let hc: string = hyph_char(st)
+            let hw: int = text_w(cx, shy_strip(head) + hc, st)
+            if hw <= room is best = head + hc + "\u0001" + tail end
+        end
+        from = at + 2
+    end
+    return best
 end
 
 ;; tab-size: liczba kolumn (liczba całkowita) albo długość przeliczona na szerokość spacji.
@@ -521,7 +738,7 @@ fn text_atoms(cx: LayoutCtx, text_id: int, owner: int, deco: int, avail_w: int, 
     let n: dom::DomNode = cx.dom.nodes[text_id]
     let st: style::ComputedStyle = cx.styles[owner]
     let pre: bool = st.white_space == "pre" || st.white_space == "pre-wrap"
-    let t0: string = apply_transform(n.text, st.text_transform)
+    let t0: string = shaped_text(n.text, st)
     let lh: int = line_h_of(st)
     let sw: int = space_w(cx, st)
     let t: string = if pre && string_find(t0, "\t") >= 0 then expand_tabs(t0, tab_columns(st, sw)) else t0
@@ -561,14 +778,16 @@ fn text_atoms(cx: LayoutCtx, text_id: int, owner: int, deco: int, avail_w: int, 
     let mut first: bool = true
     let mut wi: int = 0
     while wi < array_len(words) is
-        let word: string = words[wi]
+        let word0: string = words[wi]
         wi += 1
-        if word == "" is continue end
-        let ww: int = text_w(cx, word, st)
+        if word0 == "" is continue end
+        let word: string = if st.hyphens == "auto" then hyph_auto_for(st, word0) elsif st.hyphens == "none" then shy_strip(word0) else word0
+        let ww: int = text_w(cx, shy_strip(word), st)
         let lead_sp: bool = if first then (!n.glue && array_len(acc) > 0) else true
         first = false
-        if ww > avail_w && avail_w > 8 is
-            let pieces: [string] = break_word(cx, word, st, avail_w)
+        let has_shy: bool = string_find(word, "\u00AD") >= 0
+        if ww > avail_w && avail_w > 8 && !has_shy is
+            let pieces: [string] = break_word(cx, shy_strip(word), st, avail_w)
             let mut pi: int = 0
             while pi < array_len(pieces) is
                 let mut a: Atom = new_atom("word", owner)
@@ -724,8 +943,48 @@ fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs0: [int], line_y: int,
     end
     let first_x: int = xs[0] + (if atoms[idxs[0]].sp then 0 else 0)
     let mut used: int = right - first_x
-    ;; justify: dodatkowe miejsce rozdzielone równo między odstępy między słowami
-    if text_align == "justify" && used < inner_w is
+    ;; 0.4: text-justify — none wyłącza justowanie, inter-character/distribute rozkłada miejsce między znaki
+    let tj: string = string_lower(props::xget(cx.styles[atoms[idxs[0]].owner].xp, "text-justify"))
+    let mut ls_add: int = 0
+    let mut wadd: [int] = []
+    let mut wz: int = 0
+    while wz < n is
+        wadd = array_push(wadd, 0)
+        wz += 1
+    end
+    if text_align == "justify" && used < inner_w && (tj == "inter-character" || tj == "distribute") is
+        let mut sum_chars: int = 0
+        let mut cz: int = 0
+        let mut cfirst: [int] = []
+        while cz < n is
+            cfirst = array_push(cfirst, sum_chars)
+            if atoms[idxs[cz]].kind == "word" is sum_chars += ffi_shim::silver_utf8_len(shy_strip(atoms[idxs[cz]].text)) end
+            cz += 1
+        end
+        let slots: int = sum_chars - 1
+        if slots > 0 is
+            let extra_c: int = inner_w - used
+            ls_add = extra_c / slots
+            let left_over: int = extra_c - ls_add * slots
+            let mut gaps2: int = 0
+            let mut g2: int = 1
+            while g2 < n is
+                if atoms[idxs[g2]].sp is gaps2 += 1 end
+                g2 += 1
+            end
+            let mut seen2: int = 0
+            g2 = 0
+            while g2 < n is
+                if g2 > 0 && atoms[idxs[g2]].sp is seen2 += 1 end
+                let nch: int = if atoms[idxs[g2]].kind == "word" then ffi_shim::silver_utf8_len(shy_strip(atoms[idxs[g2]].text)) else 0
+                xs[g2] = xs[g2] + cfirst[g2] * ls_add + (if gaps2 > 0 then left_over * seen2 / gaps2 else 0)
+                wadd[g2] = nch * ls_add
+                g2 += 1
+            end
+            used = inner_w
+        end
+    end
+    if text_align == "justify" && used < inner_w && tj != "none" && tj != "inter-character" && tj != "distribute" is
         let mut gaps: int = 0
         let mut g: int = 1
         while g < n is
@@ -797,17 +1056,18 @@ fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs0: [int], line_y: int,
         if a.kind == "word" is
             let ost: style::ComputedStyle = cx.styles[a.owner]
             let mut text: string = a.text
-            let mut end_x: int = xs[i] + a.w
+            let mut end_x: int = xs[i] + a.w + wadd[i]
             let mut j: int = i + 1
             while j < n && atoms[idxs[j]].kind == "word" && atoms[idxs[j]].owner == a.owner is
                 let nxt: Atom = atoms[idxs[j]]
                 if nxt.sp is text = text + " " end
                 text = text + nxt.text
-                end_x = xs[j] + nxt.w
+                end_x = xs[j] + nxt.w + wadd[j]
                 j += 1
             end
             let mut b: LayoutBox = no_clip_box(a.owner, base_x + xs[i], line_y + valign_y(ost, line_h, a.h), end_x - xs[i], a.h, ost, "text")
-            b.text = text
+            b.text = shy_strip(text)
+            if ls_add > 0 is b.st.letter_spacing = b.st.letter_spacing + ls_add end
             acc = array_push(acc, b)
             i = j
             continue
@@ -822,9 +1082,137 @@ fn emit_line(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs0: [int], line_y: int,
 end
 
 
+;; ---------- 0.4: hanging-punctuation ----------
+fn first_char_of(s: string) -> string is
+    if s == "" is return "" end
+    let nx: int = ffi_shim::silver_utf8_next(s, 0)
+    return string_slice(s, 0, if nx <= 0 then 1 else nx)
+end
+
+fn last_char_of(s: string) -> string is
+    let n: int = string_len(s)
+    let mut pos: int = 0
+    let mut last: int = 0
+    while pos < n is
+        last = pos
+        let nx: int = ffi_shim::silver_utf8_next(s, pos)
+        pos = if nx <= pos then pos + 1 else nx
+    end
+    return string_slice(s, last, n)
+end
+
+pub fn hp_is_opening(c: string) -> bool is
+    return string_find("\"'([{\u201c\u2018\u00ab\u2039\u201e\u201a\u300c\u300e\uff08\u3008\u300a", c) >= 0 && c != ""
+end
+
+pub fn hp_is_closing(c: string) -> bool is
+    return string_find("\"')]}\u201d\u2019\u00bb\u203a\u300d\u300f\uff09\u3009\u300b", c) >= 0 && c != ""
+end
+
+pub fn hp_is_stop(c: string) -> bool is
+    return string_find(".,\u060c\u06d4\u3002\u3001\uff0e\uff0c", c) >= 0 && c != ""
+end
+
+;; Zwraca [wysunięcie z lewej, wysunięcie z prawej] w px dla wiersza złożonego z atomów `idxs`.
+fn hang_widths(cx: LayoutCtx, atoms: [Atom], idxs: [int], first_line: bool, last_line: bool) -> [int] is
+    let n: int = array_len(idxs)
+    if n == 0 is return [0, 0] end
+    let a0: Atom = atoms[idxs[0]]
+    let hp: string = string_lower(props::xget(cx.styles[a0.owner].xp, "hanging-punctuation"))
+    if hp == "" || hp == "none" is return [0, 0] end
+    let mut dl: int = 0
+    let mut dr: int = 0
+    if first_line && a0.kind == "word" && string_find(hp, "first") >= 0 is
+        let c: string = first_char_of(shy_strip(a0.text))
+        if hp_is_opening(c) is dl = text_w(cx, c, cx.styles[a0.owner]) end
+    end
+    let a1: Atom = atoms[idxs[n - 1]]
+    if a1.kind == "word" is
+        let c2: string = last_char_of(shy_strip(a1.text))
+        let st1: style::ComputedStyle = cx.styles[a1.owner]
+        if last_line && string_find(hp, "last") >= 0 && hp_is_closing(c2) is dr = text_w(cx, c2, st1) end
+        if dr == 0 && string_find(hp, "force-end") >= 0 && hp_is_stop(c2) is dr = text_w(cx, c2, st1) end
+        if dr == 0 && last_line && string_find(hp, "allow-end") >= 0 && hp_is_stop(c2) is dr = text_w(cx, c2, st1) end
+    end
+    return [dl, dr]
+end
+
+fn emit_line_h(cx: LayoutCtx, atoms: [Atom], idxs: [int], xs: [int], line_y: int, lb: [int],
+               text_align: string, last_line: bool, first_line: bool, boxes: [LayoutBox]) -> InlineRes is
+    let h: [int] = hang_widths(cx, atoms, idxs, first_line, last_line)
+    return emit_line(cx, atoms, idxs, xs, line_y, lb[0] - h[0], lb[1] + h[0] + h[1], text_align, last_line, boxes)
+end
+
 ;; ---------- float / BFC / zwijanie marginesów ----------
 fn is_float(st: style::ComputedStyle) -> bool is
     return st.float_side != "none" && !is_out_of_flow(st) && st.display != "none"
+end
+
+;; ---------- 0.4: shape-outside ----------
+fn concat_ints(a: [int], b: [int]) -> [int] is
+    let mut out: [int] = a
+    let mut i: int = 0
+    while i < array_len(b) is
+        out = array_push(out, b[i])
+        i += 1
+    end
+    return out
+end
+
+;; Wpisy floatu: prostokąt (domyślnie) albo pasy kształtu z `shape-outside` (+ `shape-margin`).
+fn float_records(cx: LayoutCtx, cst: style::ComputedStyle, res: BlockRes, to_right: bool, fx: int, py: int, tw: int, th: int) -> [int] is
+    let side: int = if to_right then 1 else 0
+    let sov: string = props::xget(cst.xp, "shape-outside")
+    if sov != "" && string_find(string_lower(sov), "url(") >= 0 && cx.win >= 0 is
+        ;; kształt z kanału alfa obrazu; pole odniesienia = margin-box (domyślnie) rozciągnięte obrazem
+        let path: string = gfx::url_of(sov)
+        let thr_raw: string = props::xget(cst.xp, "shape-image-threshold")
+        let mut thr: f64 = 0.0
+        if props::is_num(thr_raw) is thr = conv::str_to_float(thr_raw) end
+        let m0: int = shape::len_px(props::xget(cst.xp, "shape-margin"), tw, cst.font_size)
+        let mut nb: int = th / shape::step()
+        if nb < 1 is nb = 1 end
+        if nb > 200 is nb = 200 end
+        let thr_pm: int = conv::float_to_int(thr * 1000.0)
+        let mut bands: string = ""
+        let mut bi: int = 0
+        while bi < nb is
+            let v: int = ffi_shim::silver_image_alpha_band(cx.win, path, nb, bi, thr_pm)
+            bands = (if bi == 0 then "" else bands + " ") + (if v < 0 then "-1 -1" else to_string(v / 2048) + " " + to_string(v % 2048))
+            bi += 1
+        end
+        let di: [int] = shape::build_image(bands, fx, py, tw, th, m0)
+        if array_len(di) > 0 is return shape::records(di, side, fx, py, tw, th) end
+    end
+    if sov != "" && string_lower(string_trim(sov)) != "none" && shape::supported(sov) is
+        let kw: string = shape::ref_box_kw(sov)
+        let mut rx: int = fx
+        let mut ry: int = py
+        let mut rw: int = tw
+        let mut rh: int = th
+        if kw != "margin-box" is
+            rx = fx + res.ml
+            ry = py + res.mt
+            rw = res.w
+            rh = res.h
+        end
+        if kw == "padding-box" || kw == "content-box" is
+            rx += cst.bl
+            ry += cst.bt
+            rw = rw - cst.bl - cst.br
+            rh = rh - cst.bt - cst.bb
+        end
+        if kw == "content-box" is
+            rx += cst.pad_left
+            ry += cst.pad_top
+            rw = rw - cst.pad_left - cst.pad_right
+            rh = rh - cst.pad_top - cst.pad_bottom
+        end
+        let m: int = shape::len_px(props::xget(cst.xp, "shape-margin"), rw, cst.font_size)
+        let d: [int] = shape::build(sov, rx, ry, rw, rh, m, cst.font_size)
+        if array_len(d) > 0 is return shape::records(d, side, fx, py, tw, th) end
+    end
+    return [side, py, py + th, fx, fx + tw]
 end
 
 fn is_bfc_root(st: style::ComputedStyle) -> bool is
@@ -1006,7 +1394,7 @@ end
 
 fn flow_inline_f0(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: int, inner_w: int,
                   text_align: string, boxes: [LayoutBox], fls: [int], indent: int) -> InlineRes is
-    let atoms: [Atom] = collect_atoms(cx, ids, owner, -1, inner_w, [], 0)
+    let mut atoms: [Atom] = collect_atoms(cx, ids, owner, -1, inner_w, [], 0)
     let ost: style::ComputedStyle = cx.styles[owner]
     let nowrap: bool = nowrap_of(ost)
     let guess_lh: int = line_h_of(ost)
@@ -1017,14 +1405,17 @@ fn flow_inline_f0(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: 
     let mut x: int = indent
     let mut max_used: int = 0
     let mut lb: [int] = line_bounds(fls, y, guess_lh, inner_x, inner_w)
-    let total: int = array_len(atoms)
+    let mut total: int = array_len(atoms)
     let mut i: int = 0
+    let mut split_guard: int = 0
+    let mut lines_out: int = 0
     while i < total is
         let a: Atom = atoms[i]
         if a.kind == "br" is
             line_idx = array_push(line_idx, i)
             line_x = array_push(line_x, x)
-            let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, lb[0], lb[1], text_align, true, acc)
+            let r: InlineRes = emit_line_h(cx, atoms, line_idx, line_x, y, lb, text_align, true, lines_out == 0, acc)
+            lines_out += 1
             acc = r.boxes
             y = y + r.height
             if r.used_w > max_used is max_used = r.used_w end
@@ -1038,7 +1429,7 @@ fn flow_inline_f0(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: 
         ;; pusty wiersz, a atom nie mieści się obok floatu: zejdź poniżej floatu
         if array_len(line_idx) == 0 && array_len(fls) > 0 && a.w > lb[1] is
             let mut guard: int = 0
-            while guard < 20 && a.w > lb[1] is
+            while guard < 120 && a.w > lb[1] is
                 let nb: int = float_next_bottom(fls, y)
                 if nb < 0 is break end
                 y = nb
@@ -1047,8 +1438,38 @@ fn flow_inline_f0(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: 
             end
         end
         let gap: int = if a.sp && array_len(line_idx) > 0 then a.sw else 0
+        ;; hyphens: słowo z miękkim łącznikiem, które się nie mieści — dziel w ostatnim możliwym miejscu
+        if !nowrap && a.kind == "word" && x + gap + a.w > lb[1] && split_guard < 4000 && string_find(a.text, "\u00AD") >= 0 is
+            let hs: string = hyph_split(cx, a.text, cx.styles[a.owner], lb[1] - x - gap)
+            if hs != "" is
+                let parts: [string] = string_split(hs, "\u0001")
+                let mut head: Atom = a
+                head.text = parts[0]
+                head.w = text_w(cx, parts[0], cx.styles[a.owner])
+                let mut tail: Atom = a
+                tail.text = parts[1]
+                tail.w = text_w(cx, shy_strip(parts[1]), cx.styles[a.owner])
+                tail.sp = false
+                let mut na: [Atom] = []
+                let mut k: int = 0
+                while k < total is
+                    if k == i is
+                        na = array_push(na, head)
+                        na = array_push(na, tail)
+                    else is
+                        na = array_push(na, atoms[k])
+                    end
+                    k += 1
+                end
+                atoms = na
+                total = array_len(atoms)
+                split_guard += 1
+                continue
+            end
+        end
         if !nowrap && array_len(line_idx) > 0 && x + gap + a.w > lb[1] && a.kind != "close" is
-            let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, lb[0], lb[1], text_align, false, acc)
+            let r: InlineRes = emit_line_h(cx, atoms, line_idx, line_x, y, lb, text_align, false, lines_out == 0, acc)
+            lines_out += 1
             acc = r.boxes
             y = y + r.height
             if r.used_w > max_used is max_used = r.used_w end
@@ -1067,7 +1488,7 @@ fn flow_inline_f0(cx: LayoutCtx, ids: [int], owner: int, inner_x: int, start_y: 
         i += 1
     end
     if array_len(line_idx) > 0 is
-        let r: InlineRes = emit_line(cx, atoms, line_idx, line_x, y, lb[0], lb[1], text_align, true, acc)
+        let r: InlineRes = emit_line_h(cx, atoms, line_idx, line_x, y, lb, text_align, true, lines_out == 0, acc)
         acc = r.boxes
         y = y + r.height
         if r.used_w > max_used is max_used = r.used_w end
@@ -1173,6 +1594,24 @@ fn li_marker(cx: LayoutCtx, id: int) -> string is
     return to_string(idx) + "."
 end
 
+pub fn scroll_key_x(id: int) -> int is return 0 - id - 1 end
+
+;; 0.4: klucze nadpisań rozmiaru z `resize` (w tej samej liście par co przewinięcia)
+pub fn resize_key_w(id: int) -> int is return 0 - 200000000 - id * 2 end
+pub fn resize_key_h(id: int) -> int is return 0 - 200000000 - id * 2 - 1 end
+
+;; 0.4: największa prawa krawędź (x+w) pudełek z listy — szerokość treści kontenera przewijanego poziomo.
+fn max_right_edge(kids: [LayoutBox], floor_x: int) -> int is
+    let mut m: int = floor_x
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let b: LayoutBox = kids[i]
+        i += 1
+        if (b.kind == "box" || b.kind == "text" || b.kind == "inlinebg") && b.x + b.w > m is m = b.x + b.w end
+    end
+    return m
+end
+
 fn scroll_offset(cx: LayoutCtx, id: int) -> int is
     let mut i: int = 0
     while i + 1 < array_len(cx.scrolls) is
@@ -1255,7 +1694,7 @@ fn layout_flow(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
                 tries += 1
             end
             acc = concat_boxes(acc, shift_boxes(res.boxes, fx - x, py - fy))
-            fls = array_push(array_push(array_push(array_push(array_push(fls, if to_right then 1 else 0), py), py + th), fx), fx + tw)
+            fls = concat_ints(fls, float_records(cx, cst, res, to_right, fx, py, tw, th))
             cxf = with_floats(cx, fls)
             if tw > max_used is max_used = tw end
             continue
@@ -1821,11 +2260,218 @@ fn justify_kw(st: style::ComputedStyle, container: style::ComputedStyle) -> stri
     return container.justify_items
 end
 
+;; =====================================================================
+;; 0.4: masonry — `grid-template-rows: masonry` (kolumny jawne, elementy układane w najkrótszej kolumnie)
+;; i `grid-template-columns: masonry` (ta sama zasada w poprzek wierszy). `masonry-auto-flow`: pack | next, definite-first | ordered.
+;; =====================================================================
+pub fn masonry_axis(st: style::ComputedStyle) -> int is
+    ;; 1 = oś masonry to wiersze (kolumny jawne), 2 = oś masonry to kolumny (wiersze jawne), 0 = brak
+    if string_lower(string_trim(st.grid_rows)) == "masonry" is return 1 end
+    if string_lower(string_trim(st.grid_cols)) == "masonry" is return 2 end
+    return 0
+end
+
+;; Indeks kolumny o najmniejszej wysokości (remis → pierwsza); `from` = od której zaczynać przy `next`.
+pub fn shortest_track(heights: [int], lo: int, hi: int) -> int is
+    let mut best: int = lo
+    let mut i: int = lo
+    while i < hi is
+        if heights[i] < heights[best] is best = i end
+        i += 1
+    end
+    return best
+end
+
+fn track_weight(t: Track) -> int is
+    if t.kind == "fr" is return t.val end
+    return 1000
+end
+
+fn layout_masonry(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox], items: [FItem], axis: int) -> InlineRes is
+    let st: style::ComputedStyle = cx.styles[id]
+    let flow: string = string_lower(props::xget(st.xp, "masonry-auto-flow"))
+    let next_mode: bool = string_find(flow, "next") >= 0
+    let ordered: bool = string_find(flow, "ordered") >= 0
+    let count: int = array_len(items)
+    let mut acc: [LayoutBox] = boxes
+    if axis == 1 is
+        ;; ----- kolumny jawne, elementy spływają w dół -----
+        let mut tracks: [Track] = parse_tracks(st.grid_cols, w, st.gap)
+        if array_len(tracks) == 0 is tracks = [Track { kind: "fr", val: 1000 }] end
+        let ncols: int = array_len(tracks)
+        let mut fixed: int = st.gap * (ncols - 1)
+        let mut fr_sum: int = 0
+        let mut i: int = 0
+        while i < ncols is
+            if tracks[i].kind == "px" is
+                fixed += tracks[i].val
+            else is
+                fr_sum += track_weight(tracks[i])
+            end
+            i += 1
+        end
+        let remaining: int = if w - fixed > 0 then w - fixed else 0
+        let mut col_w: [int] = []
+        let mut col_x: [int] = []
+        let mut run_x: int = 0
+        i = 0
+        while i < ncols is
+            let mut cw: int = tracks[i].val
+            if tracks[i].kind != "px" is
+                cw = if fr_sum > 0 then remaining * track_weight(tracks[i]) / fr_sum else 0
+            end
+            col_w = array_push(col_w, cw)
+            col_x = array_push(col_x, run_x)
+            run_x = run_x + cw + st.gap
+            i += 1
+        end
+        let mut col_h: [int] = []
+        i = 0
+        while i < ncols is
+            col_h = array_push(col_h, 0)
+            i += 1
+        end
+        let mut used_col: [bool] = []
+        i = 0
+        while i < ncols is
+            used_col = array_push(used_col, false)
+            i += 1
+        end
+        let mut cursor: int = 0
+        let mut pass: int = 0
+        while pass < 2 is
+            i = 0
+            while i < count is
+                let it: FItem = items[i]
+                let ist: style::ComputedStyle = cx.styles[it.id]
+                let definite: bool = !it.is_text && ist.grid_col_start > 0 && ist.grid_col_start <= ncols
+                let mut mine: bool = false
+                if ordered is
+                    mine = pass == 0
+                elsif definite is
+                    mine = pass == 0
+                else is
+                    mine = pass == 1
+                end
+                if !mine is
+                    i += 1
+                    continue
+                end
+                let span: int = if it.is_text || ist.grid_col_span < 1 then 1 else ist.grid_col_span
+                let mut c: int = 0
+                if definite is
+                    c = ist.grid_col_start - 1
+                elsif next_mode is
+                    c = cursor % ncols
+                else is
+                    c = shortest_track(col_h, 0, ncols)
+                end
+                let mut sp: int = if span > ncols - c then ncols - c else span
+                if sp < 1 is sp = 1 end
+                let mut cw2: int = st.gap * (sp - 1)
+                let mut top: int = 0
+                let mut k: int = 0
+                while k < sp is
+                    cw2 += col_w[c + k]
+                    if col_h[c + k] > top is top = col_h[c + k] end
+                    k += 1
+                end
+                let r: BlockRes = layout_item(cx, it, id, cw2 - it.ml - it.mr, w, -1, false)
+                let yy: int = if used_col[c] || top > 0 then top + st.row_gap else 0
+                acc = concat_boxes(acc, shift_boxes(r.boxes, x + col_x[c] + it.ml, y + yy + it.mt))
+                k = 0
+                while k < sp is
+                    col_h[c + k] = yy + it.mt + r.h + it.mb
+                    used_col[c + k] = true
+                    k += 1
+                end
+                cursor = c + sp
+                i += 1
+            end
+            pass += 1
+        end
+        let mut total: int = 0
+        i = 0
+        while i < ncols is
+            if col_h[i] > total is total = col_h[i] end
+            i += 1
+        end
+        return InlineRes { boxes: acc, height: total, used_w: w }
+    end
+    ;; ----- wiersze jawne, elementy spływają w prawo -----
+    let mut rt: [Track] = parse_tracks(st.grid_rows, 100000, st.row_gap)
+    if array_len(rt) == 0 is rt = [Track { kind: "auto", val: 0 }] end
+    let nrows: int = array_len(rt)
+    let mut row_w: [int] = []
+    let mut row_h: [int] = []
+    let mut row_it: [int] = []
+    let mut results: [BlockRes] = []
+    let mut which: [int] = []
+    let mut xoff: [int] = []
+    let mut i: int = 0
+    while i < nrows is
+        row_w = array_push(row_w, 0)
+        row_h = array_push(row_h, if rt[i].kind == "px" then rt[i].val else 0)
+        row_it = array_push(row_it, 0)
+        i += 1
+    end
+    let mut cursor: int = 0
+    i = 0
+    while i < count is
+        let it: FItem = items[i]
+        let r: BlockRes = layout_item(cx, it, id, -1, w, -1, true)
+        let ist: style::ComputedStyle = cx.styles[it.id]
+        let definite: bool = !it.is_text && ist.grid_row_start > 0 && ist.grid_row_start <= nrows
+        let mut rr: int = 0
+        if definite is
+            rr = ist.grid_row_start - 1
+        elsif next_mode is
+            rr = cursor % nrows
+        else is
+            rr = shortest_track(row_w, 0, nrows)
+        end
+        let ow: int = r.w + it.ml + it.mr
+        let xx: int = if row_it[rr] > 0 then row_w[rr] + st.gap else 0
+        results = array_push(results, r)
+        which = array_push(which, rr)
+        xoff = array_push(xoff, xx)
+        row_w[rr] = xx + ow
+        row_it[rr] = row_it[rr] + 1
+        let oh: int = r.h + it.mt + it.mb
+        if rt[rr].kind != "px" && oh > row_h[rr] is row_h[rr] = oh end
+        cursor = rr + 1
+        i += 1
+    end
+    let mut row_y: [int] = []
+    let mut run_y: int = 0
+    i = 0
+    while i < nrows is
+        row_y = array_push(row_y, run_y)
+        run_y = run_y + row_h[i] + st.row_gap
+        i += 1
+    end
+    i = 0
+    while i < count is
+        let it: FItem = items[i]
+        acc = concat_boxes(acc, shift_boxes(results[i].boxes, x + xoff[i] + it.ml, y + row_y[which[i]] + it.mt))
+        i += 1
+    end
+    let mut maxw: int = 0
+    i = 0
+    while i < nrows is
+        if row_w[i] > maxw is maxw = row_w[i] end
+        i += 1
+    end
+    return InlineRes { boxes: acc, height: if nrows > 0 then run_y - st.row_gap else 0, used_w: if maxw > w then maxw else w }
+end
+
 fn layout_grid(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox]) -> InlineRes is
     let st: style::ComputedStyle = cx.styles[id]
     let items: [FItem] = flex_items(cx, id, true, "stretch", w)
     let count: int = array_len(items)
     if count == 0 is return InlineRes { boxes: boxes, height: 0, used_w: 0 } end
+    let mas: int = masonry_axis(st)
+    if mas > 0 is return layout_masonry(cx, id, x, y, w, boxes, items, mas) end
     let mut tracks: [Track] = parse_tracks(st.grid_cols, w, st.gap)
     if array_len(tracks) == 0 && string_find(st.grid_auto_flow, "column") < 0 is
         let ac: int = area_cols(st.grid_areas)
@@ -1879,8 +2525,8 @@ fn layout_grid(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox
             elsif ist.grid_row_start > 0 && ist.grid_col_start > 0 && ist.grid_col_start <= ncols is
                 pr[i] = ist.grid_row_start - 1
                 pc[i] = ist.grid_col_start - 1
-                prs[i] = ist.grid_row_span
-                pcs[i] = if ist.grid_col_span > ncols - pc[i] then ncols - pc[i] else ist.grid_col_span
+                prs[i] = if ist.grid_row_span < 1 then 1 else ist.grid_row_span
+                pcs[i] = if ist.grid_col_span < 1 then 1 elsif ist.grid_col_span > ncols - pc[i] then ncols - pc[i] else ist.grid_col_span
                 placed[i] = true
             end
             if placed[i] is
@@ -2067,6 +2713,30 @@ fn layout_grid(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBox
         col_x = array_push(col_x, run_x)
         run_x = run_x + col_w[i] + st.gap
         i += 1
+    end
+    ;; 0.4: justify-content / place-content dla ścieżek gridu (gdy nie wypełniają kontenera)
+    let free_x: int = w - (run_x - st.gap)
+    if free_x > 0 && ncols > 0 is
+        let jc: string = st.justify
+        let mut base_off: int = 0
+        let mut extra_gap: int = 0
+        if jc == "center" is base_off = free_x / 2
+        elsif jc == "flex-end" is base_off = free_x
+        elsif jc == "space-between" && ncols > 1 is extra_gap = free_x / (ncols - 1)
+        elsif jc == "space-around" is
+            extra_gap = free_x / ncols
+            base_off = extra_gap / 2
+        elsif jc == "space-evenly" is
+            extra_gap = free_x / (ncols + 1)
+            base_off = extra_gap
+        end
+        if base_off > 0 || extra_gap > 0 is
+            let mut q: int = 0
+            while q < ncols is
+                col_x[q] = col_x[q] + base_off + extra_gap * q
+                q += 1
+            end
+        end
     end
     ;; ----- wysokości wierszy -----
     let mut nrows: int = 0
@@ -2301,7 +2971,7 @@ fn min_content(cx: LayoutCtx, id: int, depth: int) -> int is
     if n.removed || depth > 40 is return 0 end
     if n.tag == "text" is
         let st: style::ComputedStyle = cx.styles[id]
-        let words: [string] = string_split(apply_transform(n.text, st.text_transform), " ")
+        let words: [string] = string_split(shaped_text(n.text, st), " ")
         let mut best: int = 0
         let mut i: int = 0
         while i < array_len(words) is
@@ -2424,12 +3094,20 @@ fn layout_table(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBo
     let g: TGrid = table_grid(cx, id)
     let mut acc: [LayoutBox] = boxes
     let mut cursor: int = y
-    if g.caption >= 0 is
+    let cap_bottom: bool = g.caption >= 0 && string_lower(props::xget(cx.styles[g.caption].xp, "caption-side")) == "bottom"
+    if g.caption >= 0 && !cap_bottom is
         let cr: BlockRes = layout_block(cx, g.caption, x, cursor, w, -1, -1, false)
         acc = concat_boxes(acc, cr.boxes)
         cursor = cursor + cr.mt + cr.h + cr.mb
     end
-    if g.ncols == 0 is return InlineRes { boxes: acc, height: cursor - y, used_w: 0 } end
+    if g.ncols == 0 is
+        if cap_bottom is
+            let cr0: BlockRes = layout_block(cx, g.caption, x, cursor, w, -1, -1, false)
+            acc = concat_boxes(acc, cr0.boxes)
+            cursor = cursor + cr0.mt + cr0.h + cr0.mb
+        end
+        return InlineRes { boxes: acc, height: cursor - y, used_w: 0 }
+    end
     let sp: int = table_spacing(st)
     let nc: int = g.ncols
     let nr: int = array_len(g.rows)
@@ -2570,6 +3248,8 @@ fn layout_table(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBo
         let used: int = res.h + res.mt + res.mb
         let mut placed: [LayoutBox] = res.boxes
         let cst: style::ComputedStyle = cx.styles[c.id]
+        ;; empty-cells: hide — pusta komórka bez ramek/tła (tylko przy border-collapse: separate)
+        if !st.border_collapse && string_lower(props::xget(cst.xp, "empty-cells")) == "hide" && cell_is_empty(cx, c.id) is continue end
         ;; rozciągnięcie tła komórki do wysokości wiersza
         if array_len(placed) > 0 is placed[0].h = cell_h - res.mt - res.mb end
         let spare: int = cell_h - used
@@ -2590,7 +3270,30 @@ fn layout_table(cx: LayoutCtx, id: int, x: int, y: int, w: int, boxes: [LayoutBo
         end
         acc = concat_boxes(acc, shift_boxes(placed, colx[c.col] - res.ml, rowy[c.row]))
     end
-    return InlineRes { boxes: acc, height: table_end - y, used_w: cxp - x }
+    let mut end_y: int = table_end
+    if cap_bottom is
+        let cr1: BlockRes = layout_block(cx, g.caption, x, table_end, w, -1, -1, false)
+        acc = concat_boxes(acc, cr1.boxes)
+        end_y = table_end + cr1.mt + cr1.h + cr1.mb
+    end
+    return InlineRes { boxes: acc, height: end_y - y, used_w: cxp - x }
+end
+
+;; Komórka bez treści (same białe znaki / brak dzieci) — dla `empty-cells`.
+fn cell_is_empty(cx: LayoutCtx, id: int) -> bool is
+    let n: dom::DomNode = cx.dom.nodes[id]
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let c: dom::DomNode = cx.dom.nodes[n.children[i]]
+        i += 1
+        if c.removed is continue end
+        if c.tag == "text" is
+            if string_trim(c.text) != "" is return false end
+        else is
+            return false
+        end
+    end
+    return true
 end
 
 
@@ -2690,6 +3393,28 @@ fn split_columns(cx: LayoutCtx, id: int, st: style::ComputedStyle, flow: InlineR
     let mut out: [LayoutBox] = []
     let mut push: int = 0
     let mut after_mark: int = -1
+    ;; orphans/widows: akapit = tekstowe boxy jednego przodka blokowego
+    let mut pk: [int] = []      ;; id bloku
+    let mut pn: [int] = []      ;; liczba wierszy
+    let mut ps: [int] = []      ;; ile już przetworzono
+    let mut pm: [int] = []      ;; od którego wiersza przenieść do następnej kolumny (-1 = brak)
+    let mut qq: int = 0
+    while qq < array_len(flow.boxes) is
+        let tb2: LayoutBox = flow.boxes[qq]
+        qq += 1
+        if tb2.kind == "text" && tb2.h > 0 && tb2.node_id > 0 is
+            let blk0: int = block_ancestor(cx, tb2.node_id)
+            let pi: int = int_pos(pk, blk0)
+            if pi < 0 is
+                pk = array_push(pk, blk0)
+                pn = array_push(pn, 1)
+                ps = array_push(ps, 0)
+                pm = array_push(pm, -1)
+            else is
+                pn[pi] = pn[pi] + 1
+            end
+        end
+    end
     let mut i: int = 0
     while i < array_len(flow.boxes) is
         let b: LayoutBox = flow.boxes[i]
@@ -2697,6 +3422,41 @@ fn split_columns(cx: LayoutCtx, id: int, st: style::ComputedStyle, flow: InlineR
         let mut rel: int = b.y - y0 + push
         let mut col: int = if rel <= 0 then 0 else rel / th
         if col > n - 1 is col = n - 1 end
+        ;; orphans / widows: akapit przecinający granicę kolumny nie zostawia mniej niż N wierszy po żadnej stronie
+        if b.kind == "text" && b.h > 0 && b.node_id > 0 && col < n - 1 is
+            let blk: int = block_ancestor(cx, b.node_id)
+            let pj: int = int_pos(pk, blk)
+            if pj >= 0 is
+                let li: int = ps[pj]
+                ps[pj] = li + 1
+                if li == 0 is
+                    let ow: [int] = orphans_widows_of(cx, blk)
+                    let into0: int = rel - col * th
+                    let fit: int = (th - into0) / b.h
+                    let total_lines: int = pn[pj]
+                    if total_lines > fit is
+                        let remaining: int = total_lines - fit
+                        let mut mv: int = fit
+                        if mv < ow[0] is
+                            mv = 0
+                        elsif remaining < ow[1] is
+                            mv = total_lines - ow[1]
+                            if mv < ow[0] is mv = 0 end
+                        end
+                        pm[pj] = mv
+                    end
+                end
+                if pm[pj] >= 0 && li == pm[pj] is
+                    let delta_ow: int = (col + 1) * th - rel
+                    if delta_ow > 0 is
+                        push += delta_ow
+                        rel += delta_ow
+                        col += 1
+                    end
+                    pm[pj] = -1
+                end
+            end
+        end
         ;; wymuszony podział (break-before: column) i break-inside: avoid przesuwają treść do następnej kolumny
         if b.kind == "box" && b.node_id > 0 && b.node_id != id && col < n - 1 is
             let into: int = rel - col * th
@@ -2778,8 +3538,204 @@ fn split_columns(cx: LayoutCtx, id: int, st: style::ComputedStyle, flow: InlineR
     return InlineRes { boxes: out, height: if total < th then total else th, used_w: n * colw + (n - 1) * gap }
 end
 
+;; 0.4: orphans / widows — najbliższy przodek blokowy węzła tekstowego i wartości (domyślnie 2).
+fn block_ancestor(cx: LayoutCtx, node: int) -> int is
+    let mut cur: int = node
+    let mut guard: int = 0
+    while cur > 0 && guard < 64 is
+        let d: string = cx.styles[cur].display
+        if d != "inline" && d != "contents" is return cur end
+        cur = cx.dom.nodes[cur].parent
+        guard += 1
+    end
+    return cur
+end
+
+fn orphans_widows_of(cx: LayoutCtx, blk: int) -> [int] is
+    if blk < 0 is return [2, 2] end
+    let xp: string = cx.styles[blk].xp
+    let o: int = if props::xget(xp, "orphans") == "" then 2 else str_to_int(props::xget(xp, "orphans"))
+    let w: int = if props::xget(xp, "widows") == "" then 2 else str_to_int(props::xget(xp, "widows"))
+    return [if o < 1 then 1 else o, if w < 1 then 1 else w]
+end
+
+fn int_pos(xs: [int], v: int) -> int is
+    let mut i: int = 0
+    while i < array_len(xs) is
+        if xs[i] == v is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; 0.4: scrollbar-gutter — [lewy, prawy] zarezerwowany pas na pasek przewijania (paski są nakładkowe, więc tylko `stable`).
+pub fn scrollbar_gutter_px(st: style::ComputedStyle) -> [int] is
+    let v: string = string_lower(props::xget(st.xp, "scrollbar-gutter"))
+    if v == "" || v == "auto" is return [0, 0] end
+    if props::xget(st.xp, "scrollbar-width") == "none" is return [0, 0] end
+    if st.overflow_y == "visible" is return [0, 0] end
+    if !trim_token(v, "stable") is return [0, 0] end
+    let w: int = if props::xget(st.xp, "scrollbar-width") == "thin" then 6 else 8
+    if trim_token(v, "both-edges") is return [w, w] end
+    return [0, w]
+end
+
+;; 0.4: margin-trim — zerowanie marginesów dzieci przy krawędziach kontenera blokowego.
+fn trim_token(v: string, tok: string) -> bool is
+    let t: [string] = cssval::split_top(v)
+    let mut i: int = 0
+    while i < array_len(t) is
+        if t[i] == tok is return true end
+        i += 1
+    end
+    return false
+end
+
+fn apply_margin_trim(cx: LayoutCtx, id: int) -> LayoutCtx is
+    let v: string = string_lower(props::xget(cx.styles[id].xp, "margin-trim"))
+    if v == "" || v == "none" is return cx end
+    let tb: bool = trim_token(v, "block") || trim_token(v, "block-start")
+    let te: bool = trim_token(v, "block") || trim_token(v, "block-end")
+    let il: bool = trim_token(v, "inline") || trim_token(v, "inline-start")
+    let ir: bool = trim_token(v, "inline") || trim_token(v, "inline-end")
+    let kids: [int] = cx.dom.nodes[id].children
+    let mut live: [int] = []
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let k: int = kids[i]
+        i += 1
+        let n: dom::DomNode = cx.dom.nodes[k]
+        if n.removed || n.tag == "text" is continue end
+        let kst: style::ComputedStyle = cx.styles[k]
+        if kst.display == "none" || kst.display == "inline" || is_out_of_flow(kst) is continue end
+        live = array_push(live, k)
+    end
+    if array_len(live) == 0 is return cx end
+    let mut cx2: LayoutCtx = cx
+    if tb is cx2.styles[live[0]].mar_top = 0 end
+    if te is cx2.styles[live[array_len(live) - 1]].mar_bottom = 0 end
+    if il || ir is
+        let mut j: int = 0
+        while j < array_len(live) is
+            if il is cx2.styles[live[j]].mar_left = 0 end
+            if ir is cx2.styles[live[j]].mar_right = 0 end
+            j += 1
+        end
+    end
+    return cx2
+end
+
+;; 0.4: column-span: all — element blokowy w kontenerze wielokolumnowym rozciągnięty na wszystkie kolumny.
+fn is_col_spanner(cx: LayoutCtx, kid: int) -> bool is
+    let n: dom::DomNode = cx.dom.nodes[kid]
+    if n.removed || n.tag == "text" || n.pseudo != "" is return false end
+    let st: style::ComputedStyle = cx.styles[kid]
+    if st.display == "none" || st.display == "inline" || is_out_of_flow(st) is return false end
+    return string_lower(props::xget(st.xp, "column-span")) == "all"
+end
+
+fn has_col_spanner(cx: LayoutCtx, id: int) -> bool is
+    let kids: [int] = cx.dom.nodes[id].children
+    let mut i: int = 0
+    while i < array_len(kids) is
+        if is_col_spanner(cx, kids[i]) is return true end
+        i += 1
+    end
+    return false
+end
+
+fn layout_col_segment(cx: LayoutCtx, id: int, st: style::ComputedStyle, seg: [int], x0: int, y: int, plan: [int], fixed_h: int) -> InlineRes is
+    let mut cx2: LayoutCtx = cx
+    cx2.dom.nodes[id].children = seg
+    let r0: InlineRes = layout_flow(cx2, id, x0, y, plan[1], fixed_h, [])
+    return split_columns(cx2, id, st, r0, x0, y, plan, fixed_h)
+end
+
+fn layout_spanned(cx: LayoutCtx, id: int, st: style::ComputedStyle, x0: int, y0: int, cw: int, plan: [int], fixed_h: int) -> InlineRes is
+    let kids: [int] = cx.dom.nodes[id].children
+    let mut acc: [LayoutBox] = []
+    let mut y: int = y0
+    let mut seg: [int] = []
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let k: int = kids[i]
+        i += 1
+        if is_col_spanner(cx, k) is
+            if array_len(seg) > 0 is
+                let r: InlineRes = layout_col_segment(cx, id, st, seg, x0, y, plan, -1)
+                acc = concat_boxes(acc, r.boxes)
+                y = y + r.height
+                seg = []
+            end
+            let sr: BlockRes = layout_block(cx, k, x0, y, cw, -1, -1, false)
+            acc = concat_boxes(acc, sr.boxes)
+            y = y + sr.mt + sr.h + sr.mb
+        else is
+            seg = array_push(seg, k)
+        end
+    end
+    if array_len(seg) > 0 is
+        let r2: InlineRes = layout_col_segment(cx, id, st, seg, x0, y, plan, if y == y0 then fixed_h else -1)
+        acc = concat_boxes(acc, r2.boxes)
+        y = y + r2.height
+    end
+    return InlineRes { boxes: acc, height: y - y0, used_w: cw }
+end
+
 fn has_clip_dummy(b: LayoutBox) -> bool is
     return b.has_clip
+end
+
+;; 0.4: overflow-clip-margin (tylko przy overflow: clip) — prostokąt przycięcia [x, y, w, h]; (px,py,pw,ph) = pole paddingu.
+;; Składnia: [content-box | padding-box | border-box] || <długość>
+pub fn clip_margin_rect(st: style::ComputedStyle, px: int, py: int, pw: int, ph: int) -> [int] is
+    if st.overflow_x != "clip" && st.overflow_y != "clip" is return [px, py, pw, ph] end
+    let v: string = string_lower(props::xget(st.xp, "overflow-clip-margin"))
+    if v == "" is return [px, py, pw, ph] end
+    let t: [string] = cssval::split_top(v)
+    let mut x: int = px
+    let mut y: int = py
+    let mut w: int = pw
+    let mut h: int = ph
+    let mut m: int = 0
+    let mut i: int = 0
+    while i < array_len(t) is
+        let tk: string = t[i]
+        i += 1
+        if tk == "content-box" is
+            x = px + st.pad_left
+            y = py + st.pad_top
+            w = pw - st.pad_left - st.pad_right
+            h = ph - st.pad_top - st.pad_bottom
+        elsif tk == "border-box" is
+            x = px - st.bl
+            y = py - st.bt
+            w = pw + st.bl + st.br
+            h = ph + st.bt + st.bb
+        elsif tk != "padding-box" is
+            m = gfx::len_px(tk, 0, st.font_size)
+        end
+    end
+    if m < 0 is m = 0 end
+    return [x - m, y - m, w + 2 * m, h + 2 * m]
+end
+
+;; 0.4: contain-intrinsic-width / -inline-size / -size (pierwsza wartość) — rozmiar elementu z `contain: size`
+fn intrinsic_w(cx: LayoutCtx, st: style::ComputedStyle) -> int is
+    let mut v: string = props::xget(st.xp, "contain-intrinsic-width")
+    if v == "" is v = props::xget(st.xp, "contain-intrinsic-inline-size") end
+    if v == "" is
+        let sz: [string] = cssval::split_top(props::xget(st.xp, "contain-intrinsic-size"))
+        if array_len(sz) >= 1 is v = sz[0] end
+    end
+    if string_starts_with(string_lower(v), "auto ") is v = string_trim(string_slice(v, 5, string_len(v))) end
+    return xlen_px(cx, st, v, 0)
+end
+
+;; `contain: size | strict` — zawartość nie wpływa na rozmiar elementu
+fn size_contained(st: style::ComputedStyle) -> bool is
+    let c: string = string_lower(props::xget(st.xp, "contain"))
+    return trim_token(c, "size") || trim_token(c, "strict")
 end
 
 fn intrinsic_h(cx: LayoutCtx, st: style::ComputedStyle) -> int is
@@ -2814,7 +3770,291 @@ fn clamp_lines(kids: [LayoutBox], limit: int, lh: int) -> [LayoutBox] is
     return out
 end
 
+;; 0.4: <text> w SVG jako zwykłe boksy tekstowe (NanoSVG nie rysuje tekstu). (ox,oy,cw,ch) = pole zawartości <svg> w px.
+fn svg_text_boxes(cx: LayoutCtx, root: int, ox: int, oy: int, cw: int, ch: int) -> [LayoutBox] is
+    let mut res: [LayoutBox] = []
+    let els: [int] = svg::text_elements(cx.dom, cx.styles, root)
+    if array_len(els) == 0 || cw < 1 || ch < 1 is return res end
+    let n: dom::DomNode = cx.dom.nodes[root]
+    let mut vb: [int] = svg::view_box(n)
+    if array_len(vb) != 4 is
+        let nat: [int] = svg::natural_size(n)
+        vb = [0, 0, nat[0] * 1000, nat[1] * 1000]
+    end
+    let k1: int = cw * 1000000 / vb[2]
+    let k2: int = ch * 1000000 / vb[3]
+    let k: int = if k1 < k2 then k1 else k2
+    let offx: int = (cw - vb[2] * k / 1000000) / 2
+    let offy: int = (ch - vb[3] * k / 1000000) / 2
+    let mut ti: int = 0
+    while ti < array_len(els) is
+        let tid: int = els[ti]
+        ti += 1
+        let runs: [string] = svg::text_runs(cx.dom, tid)
+        let mut ri: int = 0
+        while ri < array_len(runs) is
+            let f: [string] = string_split(runs[ri], "\u0001")
+            ri += 1
+            if array_len(f) < 4 is continue end
+            let rid: int = str_to_int(f[2])
+            let txt: string = string_trim(f[3])
+            if txt == "" is continue end
+            let st0: style::ComputedStyle = cx.styles[rid]
+            let fill: string = string_lower(string_trim(props::xget(st0.xp, "fill")))
+            if fill == "none" is continue end
+            let mut bs: style::ComputedStyle = st0
+            let fpx: int = (st0.font_size * k + 500) / 1000
+            bs.font_size = if fpx < 1 then 1 else fpx
+            bs.letter_spacing = st0.letter_spacing * k / 1000
+            if fill != "" && !string_starts_with(fill, "url(") is
+                if fill == "currentcolor" is
+                    bs.color = st0.color
+                else is
+                    let c: cssval::Color = cssval::parse_color(fill)
+                    bs.color = style::Color { r: c.r, g: c.g, b: c.b, a: c.a }
+                end
+            else is
+                bs.color = style::Color { r: 0, g: 0, b: 0, a: 255 }
+            end
+            let fo: string = props::xget(st0.xp, "fill-opacity")
+            if fo != "" is bs.color.a = bs.color.a * gfx::parse_x1000(fo) / 1000 end
+            let w: int = text_w(cx, txt, bs)
+            let px: int = ox + offx + ((str_to_int(f[0]) - vb[0]) * k) / 1000000
+            let py: int = oy + offy + ((str_to_int(f[1]) - vb[1]) * k) / 1000000
+            let mut dom_b: string = props::xget(st0.xp, "alignment-baseline")
+            if dom_b == "" || dom_b == "auto" || dom_b == "baseline" is dom_b = props::xget(st0.xp, "dominant-baseline") end
+            let org: [int] = svg::text_origin(px, py, w, bs.font_size, props::xget(st0.xp, "text-anchor"), dom_b, props::xget(st0.xp, "baseline-shift"))
+            let mut b: LayoutBox = no_clip_box(rid, org[0], org[1], w, bs.font_size * 12 / 10, bs, "text")
+            b.text = txt
+            res = array_push(res, b)
+        end
+    end
+    return apply_clip(res, 0, ox, oy, cw, ch)
+end
+
+;; 0.4: list-style-image: url(...) → ścieżka obrazka ("" gdy none / brak).
+pub fn list_image_url(st: style::ComputedStyle) -> string is
+    let v: string = string_trim(props::xget(st.xp, "list-style-image"))
+    if !string_starts_with(string_lower(v), "url(") || !string_ends_with(v, ")") is return "" end
+    let mut inner: string = string_trim(string_slice(v, 4, string_len(v) - 1))
+    if string_len(inner) >= 2 && (string_starts_with(inner, "\"") || string_starts_with(inner, "'")) is
+        inner = string_slice(inner, 1, string_len(inner) - 1)
+    end
+    return inner
+end
+
+;; 0.4: zoom — współczynnik w procentach (100 = brak). Akceptuje liczbę (1.5), procent (150%) i `normal`.
+pub fn zoom_pct(st: style::ComputedStyle) -> int is
+    let v: string = string_lower(string_trim(props::xget(st.xp, "zoom")))
+    if v == "" || v == "normal" || v == "1" || v == "100%" is return 100 end
+    let mut pct: int = 100
+    if string_ends_with(v, "%") is
+        pct = str_to_int(string_slice(v, 0, string_len(v) - 1))
+    else is
+        let dot: int = string_find(v, ".")
+        if dot < 0 is
+            pct = str_to_int(v) * 100
+        else is
+            let frac0: string = string_slice(v, dot + 1, string_len(v)) + "00"
+            pct = str_to_int(string_slice(v, 0, dot)) * 100 + str_to_int(string_slice(frac0, 0, 2))
+        end
+    end
+    if pct <= 0 is return 100 end
+    if pct > 1000 is return 1000 end
+    return pct
+end
+
+fn zs(v: int, z: int) -> int is
+    return (v * z + (if v >= 0 then 50 else -50)) / 100
+end
+
+;; Skaluje pudełka (współrzędne od punktu (0,0)) i pola stylu używane przy rysowaniu.
+fn scale_boxes(boxes: [LayoutBox], z: int) -> [LayoutBox] is
+    let mut out: [LayoutBox] = boxes
+    let mut i: int = 0
+    while i < array_len(out) is
+        let b: LayoutBox = out[i]
+        out[i].x = zs(b.x, z)
+        out[i].y = zs(b.y, z)
+        out[i].w = zs(b.w, z)
+        out[i].h = zs(b.h, z)
+        if b.has_clip is
+            out[i].cx = zs(b.cx, z)
+            out[i].cy = zs(b.cy, z)
+            out[i].cw = zs(b.cw, z)
+            out[i].ch = zs(b.ch, z)
+        end
+        out[i].content_h = zs(b.content_h, z)
+        out[i].content_w = zs(b.content_w, z)
+        out[i].scroll_y = zs(b.scroll_y, z)
+        out[i].scroll_x = zs(b.scroll_x, z)
+        out[i].stk_y = zs(b.stk_y, z)
+        out[i].stk_max = zs(b.stk_max, z)
+        out[i].st.font_size = zs(b.st.font_size, z)
+        if b.st.line_height > 0 is out[i].st.line_height = zs(b.st.line_height, z) end
+        out[i].st.bl = zs(b.st.bl, z)
+        out[i].st.br = zs(b.st.br, z)
+        out[i].st.bt = zs(b.st.bt, z)
+        out[i].st.bb = zs(b.st.bb, z)
+        out[i].st.pad_top = zs(b.st.pad_top, z)
+        out[i].st.pad_right = zs(b.st.pad_right, z)
+        out[i].st.pad_bottom = zs(b.st.pad_bottom, z)
+        out[i].st.pad_left = zs(b.st.pad_left, z)
+        out[i].st.rad_tl = zs(b.st.rad_tl, z)
+        out[i].st.rad_tr = zs(b.st.rad_tr, z)
+        out[i].st.rad_br = zs(b.st.rad_br, z)
+        out[i].st.rad_bl = zs(b.st.rad_bl, z)
+        out[i].st.sh_x = zs(b.st.sh_x, z)
+        out[i].st.sh_y = zs(b.st.sh_y, z)
+        out[i].st.sh_blur = zs(b.st.sh_blur, z)
+        out[i].st.sh_spread = zs(b.st.sh_spread, z)
+        out[i].st.outline_w = zs(b.st.outline_w, z)
+        out[i].st.letter_spacing = zs(b.st.letter_spacing, z)
+        out[i].st.word_spacing = zs(b.st.word_spacing, z)
+        out[i].st.text_indent = zs(b.st.text_indent, z)
+        out[i].st.ts_x = zs(b.st.ts_x, z)
+        out[i].st.ts_y = zs(b.st.ts_y, z)
+        i += 1
+    end
+    return out
+end
+
+;; =====================================================================
+;; 0.4: pisma pionowe (writing-mode: vertical-rl | vertical-lr | sideways-rl | sideways-lr)
+;; Element jest składany poziomo z szerokością = jego wysokość (rozmiar liniowy), potem warstwa jest obracana o ±90° wokół lewego
+;; górnego rogu; rodzic dostaje wymiary zamienione miejscami. Znaki łacińskie są obrócone (jak text-orientation: mixed/sideways);
+;; text-orientation: upright i zwijanie do kolejnych kolumn poza zadaną wysokością nie są obsługiwane.
+;; =====================================================================
+;; 0.4: text-orientation: upright w pionowym trybie — znaki stoją jeden pod drugim (bez obrotu warstwy, jedna kolumna).
+;; text-combine-upright: all | digits [2..4] zostawia dane znaki w jednym wierszu (poziomo w kolumnie).
+pub fn upright_mode(xp: string) -> bool is
+    return wm_kind(xp) != "" && string_lower(string_trim(props::xget(xp, "text-orientation"))) == "upright"
+end
+
+;; Maks. długość ciągu cyfr/znaków łączonych: -1 = łącz całość (all), 0 = nie łącz, n = serie cyfr do n znaków.
+pub fn combine_limit(xp: string) -> int is
+    let v: string = string_lower(string_trim(props::xget(xp, "text-combine-upright")))
+    if v == "all" is return -1 end
+    if string_starts_with(v, "digits") is
+        let rest: string = string_trim(string_slice(v, 6, string_len(v)))
+        if rest != "" && props::is_int(rest) is
+            let n: int = str_to_int(rest)
+            if n >= 2 && n <= 4 is return n end
+        end
+        return 2
+    end
+    return 0
+end
+
+pub fn stack_chars(text: string, limit: int) -> string is
+    if limit == -1 is return text end
+    let n: int = string_len(text)
+    let mut out: string = ""
+    let mut pos: int = 0
+    let mut first: bool = true
+    while pos < n is
+        let c: string = string_at(text, pos)
+        if limit > 0 && c >= "0" && c <= "9" is
+            let mut e: int = pos
+            while e < n && string_at(text, e) >= "0" && string_at(text, e) <= "9" is e += 1 end
+            if e - pos <= limit is
+                out = out + (if first then "" else "\n") + string_slice(text, pos, e)
+                first = false
+                pos = e
+                continue
+            end
+            ;; za długa seria cyfr — każda cyfra osobno
+            let mut q: int = pos
+            while q < e is
+                out = out + (if first then "" else "\n") + string_slice(text, q, q + 1)
+                first = false
+                q += 1
+            end
+            pos = e
+            continue
+        end
+        let nx: int = ffi_shim::silver_utf8_next(text, pos)
+        let step: int = if nx <= pos then pos + 1 else nx
+        let e2: int = if step > n then n else step
+        out = out + (if first then "" else "\n") + string_slice(text, pos, e2)
+        first = false
+        pos = step
+    end
+    return out
+end
+
+pub fn wm_kind(xp: string) -> string is
+    let v: string = string_lower(string_trim(props::xget(xp, "writing-mode")))
+    if v == "vertical-rl" || v == "sideways-rl" is return "rl" end
+    if v == "vertical-lr" is return "lr" end
+    if v == "sideways-lr" is return "slr" end
+    return ""
+end
+
+;; "rl" | "lr" | "slr" dla korzenia pionowego pisma (rodzic nie ma tego samego trybu); "" w pozostałych przypadkach.
+pub fn vert_kind(cx: LayoutCtx, id: int) -> string is
+    if id <= 0 is return "" end
+    let st: style::ComputedStyle = cx.styles[id]
+    if props::xhas(st.xp, "x-vert-inner") is return "" end
+    let k: string = wm_kind(st.xp)
+    if k == "" || upright_mode(st.xp) is return "" end
+    let par: int = cx.dom.nodes[id].parent
+    if par >= 0 && par < array_len(cx.styles) && string_lower(props::xget(cx.styles[par].xp, "writing-mode")) == string_lower(props::xget(st.xp, "writing-mode")) is return "" end
+    return k
+end
+
+;; Macierz 2D obrotu warstwy pionowej (a,b,c,d,e,f ×1000) dla ramki o wymiarach poziomego układu w × h.
+pub fn vert_matrix(kind: string, w: int, h: int) -> [int] is
+    if kind == "slr" is return [0, -1000, 1000, 0, 0, w * 1000] end
+    return [0, 1000, -1000, 0, h * 1000, 0]
+end
+
+fn mirror_block_axis(boxes: [LayoutBox], size: int) -> [LayoutBox] is
+    let mut out: [LayoutBox] = boxes
+    let mut i: int = 1
+    while i < array_len(out) is
+        out[i].y = size - out[i].y - out[i].h
+        if out[i].has_clip is out[i].cy = size - out[i].cy - out[i].ch end
+        i += 1
+    end
+    return out
+end
+
+fn layout_vertical(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_h: int, force_w: int, fit: bool, kind: string) -> BlockRes is
+    let st: style::ComputedStyle = cx.styles[id]
+    let own_v: int = pad_border_v(st)
+    let mut inline_size: int = style::size_of(st.height, st.height_pct, st.height_mode, avail_h)
+    if inline_size >= 0 is
+        if !st.border_box is inline_size += own_v end
+    else is
+        inline_size = if cx.vh > 0 then cx.vh else 480
+    end
+    let mut styles2: [style::ComputedStyle] = cx.styles
+    styles2[id].xp = props::xset(st.xp, "x-vert-inner", "1")
+    styles2[id].height_mode = "auto"
+    styles2[id].min_height = 0
+    let cx2: LayoutCtx = LayoutCtx { dom: cx.dom, styles: styles2, win: cx.win, vw: cx.vw, vh: cx.vh, scrolls: cx.scrolls, floats: [] }
+    let r: BlockRes = layout_block(cx2, id, 0, 0, inline_size + m_or_zero(st.mar_left) + m_or_zero(st.mar_right), -1, inline_size, false)
+    let mut bx: [LayoutBox] = r.boxes
+    if kind == "lr" is bx = mirror_block_axis(bx, r.h) end
+    return BlockRes { boxes: shift_boxes(bx, x, y), w: r.h, h: r.w, mt: r.mt, mb: r.mb, ml: r.ml, mr: r.mr }
+end
+
 pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_h: int, force_w: int, fit: bool) -> BlockRes is
+    let vk: string = vert_kind(cx, id)
+    if vk != "" is return layout_vertical(cx, id, x, y, avail_w, avail_h, force_w, fit, vk) end
+    let z: int = zoom_pct(cx.styles[id])
+    if z == 100 is return layout_block_inner(cx, id, x, y, avail_w, avail_h, force_w, fit) end
+    ;; wnętrze liczone w jednostkach „bez zoomu”, potem skalowane i przesunięte na miejsce
+    let aw: int = avail_w * 100 / z
+    let ah: int = if avail_h >= 0 then avail_h * 100 / z else avail_h
+    let fw: int = if force_w >= 0 then force_w * 100 / z else force_w
+    let r: BlockRes = layout_block_inner(cx, id, 0, 0, aw, ah, fw, fit)
+    let sb: [LayoutBox] = shift_boxes(scale_boxes(r.boxes, z), x, y)
+    return BlockRes { boxes: sb, w: zs(r.w, z), h: zs(r.h, z), mt: zs(r.mt, z), mb: zs(r.mb, z), ml: zs(r.ml, z), mr: zs(r.mr, z) }
+end
+
+fn layout_block_inner(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_h: int, force_w: int, fit: bool) -> BlockRes is
     let n: dom::DomNode = cx.dom.nodes[id]
     let st: style::ComputedStyle = cx.styles[id]
     let own_h: int = pad_border_h(st)
@@ -2824,8 +4064,19 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
     let mt0: int = m_or_zero(st.mar_top)
     let mb0: int = m_or_zero(st.mar_bottom)
     let replaced: bool = is_replaced(n.tag)
-    let w_spec: int = style::size_of(st.width, st.width_pct, st.width_mode, avail_w)
+    let mut w_spec: int = style::size_of(st.width, st.width_pct, st.width_mode, avail_w)
     let mut h_spec: int = style::size_of(st.height, st.height_pct, st.height_mode, avail_h)
+    ;; 0.4: resize — rozmiar ustawiony przez użytkownika (ramka border-box) nadpisuje width/height
+    let rz_w: int = scroll_offset(cx, resize_key_w(id))
+    let rz_h: int = scroll_offset(cx, resize_key_h(id))
+    if rz_w > 0 is
+        w_spec = rz_w - own_h
+        if st.border_box is w_spec = rz_w end
+    end
+    if rz_h > 0 is
+        h_spec = rz_h - own_v
+        if st.border_box is h_spec = rz_h end
+    end
 
     ;; zwijanie marginesów rodzic <-> pierwsze/ostatnie dziecko
     let ctm: int = if st.pad_top == 0 && st.bt == 0 && array_len(n.children) > 0 then collapsed_child_margin(cx, id, false, 0) else 0
@@ -2842,12 +4093,13 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
         border_w = if st.border_box then w_spec else w_spec + own_h
     elsif replaced is
         let mut cw: int = nat.right
-        if n.tag == "img" && h_spec >= 0 && nat.bottom > 0 is
+        if (n.tag == "img" || n.tag == "svg") && h_spec >= 0 && nat.bottom > 0 is
             cw = (if st.border_box then h_spec - own_v else h_spec) * nat.right / nat.bottom
         end
         border_w = cw + own_h
     elsif fit || st.display == "table" is
-        let mc: int = max_content(cx, id, 0)
+        let mut mc: int = max_content(cx, id, 0)
+        if size_contained(st) is mc = intrinsic_w(cx, st) + own_h end
         let room: int = avail_w - mlz - mrz
         border_w = if mc < room then mc else room
         if border_w < own_h is border_w = own_h end
@@ -2878,8 +4130,9 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
         end
     end
 
-    let cw: int = border_w - own_h
-    let cx0: int = x + ml + st.bl + st.pad_left
+    let gut: [int] = scrollbar_gutter_px(st)
+    let cw: int = border_w - own_h - gut[0] - gut[1]
+    let cx0: int = x + ml + st.bl + st.pad_left + gut[0]
     let cy0: int = y + mt + st.bt + st.pad_top
     ;; aspect-ratio: wysokość z szerokości, gdy wysokość jest auto
     if st.aspect_ratio > 0 && h_spec < 0 && !replaced is
@@ -2895,11 +4148,11 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
     let mut kids: [LayoutBox] = []
     let mut content_h: int = 0
     let cv_hidden: bool = props::xget(st.xp, "content-visibility") == "hidden"
-    if cv_hidden is
+    if cv_hidden || size_contained(st) is
         content_h = intrinsic_h(cx, st)
     elsif replaced is
         content_h = nat.bottom
-        if n.tag == "img" && nat.right > 0 && w_spec >= 0 && h_spec < 0 is
+        if (n.tag == "img" || n.tag == "svg") && nat.right > 0 && w_spec >= 0 && h_spec < 0 is
             content_h = cw * nat.bottom / nat.right
         end
     elsif st.display == "flex" || st.display == "inline-flex" is
@@ -2916,13 +4169,17 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
         content_h = r.height
     else is
         let plan: [int] = column_plan(cx, st, cw)
-        if plan[0] > 1 is
-            let r0: InlineRes = layout_flow(cx, id, cx0, cy0 - ctm, plan[1], inner_h_spec, [])
+        if plan[0] > 1 && has_col_spanner(cx, id) is
+            let r: InlineRes = layout_spanned(cx, id, st, cx0, cy0 - ctm, cw, plan, inner_h_spec)
+            kids = r.boxes
+            content_h = r.height - ctm - cmb
+        elsif plan[0] > 1 is
+            let r0: InlineRes = layout_flow(apply_margin_trim(cx, id), id, cx0, cy0 - ctm, plan[1], inner_h_spec, [])
             let r: InlineRes = split_columns(cx, id, st, r0, cx0, cy0 - ctm, plan, inner_h_spec)
             kids = r.boxes
             content_h = r.height - ctm - cmb
         else is
-            let r: InlineRes = layout_flow(cx, id, cx0, cy0 - ctm, cw, inner_h_spec, [])
+            let r: InlineRes = layout_flow(apply_margin_trim(cx, id), id, cx0, cy0 - ctm, cw, inner_h_spec, [])
             kids = r.boxes
             content_h = r.height - ctm - cmb
         end
@@ -2961,10 +4218,19 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
         let mut sy: int = scroll_offset(cx, id)
         if sy > max_scroll is sy = max_scroll end
         if sy < 0 is sy = 0 end
-        kids = shift_boxes(kids, 0, 0 - sy)
-        kids = apply_clip(kids, 0, px, py, pw, ph)
+        ;; 0.4: przewijanie poziome — szerokość treści z prawej krawędzi dzieci
+        let extent_w: int = max_right_edge(kids, px + pw) - px + st.pad_right
+        let max_scroll_x: int = if extent_w > pw then extent_w - pw else 0
+        let mut sx: int = scroll_offset(cx, scroll_key_x(id))
+        if sx > max_scroll_x is sx = max_scroll_x end
+        if sx < 0 is sx = 0 end
+        kids = shift_boxes(kids, 0 - sx, 0 - sy)
+        let cr: [int] = clip_margin_rect(st, px, py, pw, ph)
+        kids = apply_clip(kids, 0, cr[0], cr[1], cr[2], cr[3])
         self_box.content_h = extent
         self_box.scroll_y = sy
+        self_box.content_w = if extent_w > pw then extent_w else pw
+        self_box.scroll_x = sx
     end
     let mut out: [LayoutBox] = [self_box]
     out = concat_boxes(out, kids)
@@ -2972,7 +4238,29 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
     ;; znacznik listy
     if st.display == "list-item" is
         let marker: string = li_marker(cx, id)
-        if marker != "" is
+        let lsi: string = list_image_url(st)
+        if lsi != "" is
+            ;; 0.4: list-style-image — obrazek zamiast znacznika tekstowego
+            let lhm: int = line_h_of(st)
+            let mut iw: int = lhm
+            let mut ih: int = lhm
+            if cx.win >= 0 is
+                let nw: int = ffi_shim::silver_image_width(cx.win, lsi)
+                let nh: int = ffi_shim::silver_image_height(cx.win, lsi)
+                if nw > 0 && nh > 0 is
+                    iw = nw
+                    ih = nh
+                    if ih > lhm && lhm > 0 is
+                        iw = nw * lhm / nh
+                        ih = lhm
+                    end
+                end
+            end
+            let imx: int = if st.list_pos == "inside" then cx0 else cx0 - iw - 8
+            let mut mbi: LayoutBox = no_clip_box(id, imx, cy0 + (lhm - ih) / 2, iw, ih, st, "marker")
+            mbi.img_src = lsi
+            out = array_push(out, mbi)
+        elsif marker != "" is
             let mw: int = text_w(cx, marker, st)
             let mx: int = if st.list_pos == "inside" then cx0 else cx0 - mw - 8
             let mut mbx: LayoutBox = no_clip_box(id, mx, cy0, mw, line_h_of(st), st, "marker")
@@ -2982,6 +4270,10 @@ pub fn layout_block(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_
     end
     if n.tag == "img" is
         out[0].img_src = n.attr_src
+    end
+    if n.tag == "svg" is
+        out[0].svg = svg::markup(cx.dom, cx.styles, id, cw, content_h)
+        out = concat_boxes(out, svg_text_boxes(cx, id, cx0, cy0, cw, content_h))
     end
 
     ;; position: relative
@@ -3024,6 +4316,270 @@ fn positioned_ancestor(cx: LayoutCtx, id: int) -> int is
     return -1
 end
 
+;; =====================================================================
+;; 0.4: CSS Anchor Positioning (anchor-name, position-anchor, anchor(), anchor-size(), position-area,
+;; position-try-fallbacks, position-visibility, anchor-scope)
+;; =====================================================================
+struct AbsPlace is
+    pub x:    int
+    pub y:    int
+    pub res:  BlockRes
+    pub fits: bool
+    pub found: bool
+    pub rw:   int      ;; 0.4: wymiary obszaru (position-area / blok zawierający) — dla position-try-order
+    pub rh:   int
+end
+
+fn name_in_list(list: string, name: string) -> bool is
+    let toks: [string] = cssval::split_commas(string_lower(list))
+    let want: string = string_lower(name)
+    let mut i: int = 0
+    while i < array_len(toks) is
+        if string_trim(toks[i]) == want is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Prostokąt kotwicy [x, y, w, h] o danej nazwie dla elementu `id` ([] gdy brak). Kotwica nie może być elementem ani jego potomkiem;
+;; `anchor-scope` ogranicza widoczność nazwy do poddrzewa; wybierana jest najbliższa poprzedzająca w kolejności dokumentu.
+pub fn anchor_rect_for(cx: LayoutCtx, boxes: [LayoutBox], id: int, name: string) -> [int] is
+    if name == "" is return [] end
+    let n: int = array_len(cx.dom.nodes)
+    let mut before: int = -1
+    let mut after: int = -1
+    let mut i: int = 1
+    while i < n is
+        if cx.dom.nodes[i].removed || cx.dom.nodes[i].tag == "text" || i == id || is_in_subtree(cx, i, id) is
+            i += 1
+            continue
+        end
+        let names: string = props::xget(cx.styles[i].xp, "anchor-name")
+        if names != "" && name_in_list(names, name) is
+            let mut ok: bool = true
+            let mut p: int = i
+            let mut guard: int = 0
+            while p >= 0 && guard < 200 is
+                let sc: string = string_lower(props::xget(cx.styles[p].xp, "anchor-scope"))
+                if sc != "" && sc != "none" && (sc == "all" || name_in_list(sc, name)) is
+                    if !is_in_subtree(cx, id, p) is ok = false end
+                    break
+                end
+                p = cx.dom.nodes[p].parent
+                guard += 1
+            end
+            if ok is
+                if i < id is before = i
+                elsif after < 0 is after = i end
+            end
+        end
+        i += 1
+    end
+    let pick: int = if before >= 0 then before else after
+    if pick < 0 is return [] end
+    let r: style::BoxSides = box_rect_of(boxes, pick)
+    if r.right <= 0 && r.bottom <= 0 is return [] end
+    return [r.left, r.top, r.right, r.bottom]
+end
+
+;; Reszta wyrażenia po wywołaniu anchor(...) — "+ 8px" / "- 4px" (także wewnątrz calc()) → przesunięcie w px.
+fn anchor_offset(raw: string, fs: int) -> int is
+    let mut v: string = string_trim(raw)
+    let low: string = string_lower(v)
+    if string_starts_with(low, "calc(") && string_ends_with(v, ")") is v = string_trim(string_slice(v, 5, string_len(v) - 1)) end
+    let p: int = string_find(string_lower(v), "anchor")
+    if p < 0 is return 0 end
+    let mut i: int = p
+    let mut depth: int = 0
+    let n: int = string_len(v)
+    while i < n is
+        let c: string = string_at(v, i)
+        if c == "(" is depth += 1 end
+        if c == ")" is
+            depth -= 1
+            if depth == 0 is
+                i += 1
+                break
+            end
+        end
+        i += 1
+    end
+    let rest: string = string_trim(string_slice(v, i, n))
+    if rest == "" is return 0 end
+    let sign: int = if string_starts_with(rest, "-") then -1 else 1
+    if !string_starts_with(rest, "+") && !string_starts_with(rest, "-") is return 0 end
+    return sign * gfx::len_px(string_trim(string_slice(rest, 1, string_len(rest))), 0, fs)
+end
+
+;; Wstawka `target` (top/right/bottom/left) po ewentualnym odwróceniu; zwraca auto_v(), gdy brak.
+fn anchored_inset(cx: LayoutCtx, boxes: [LayoutBox], id: int, st: style::ComputedStyle, target: string,
+                  flip_b: bool, flip_i: bool, def_name: string, cbx: int, cby: int, cbw: int, cbh: int, def_rect: [int]) -> int is
+    let src: string = anchor::flip_prop(target, flip_b, flip_i)
+    let raw: string = props::xget(st.xp, "-ax-" + src)
+    if raw == "" is
+        if src == "top" is return st.top end
+        if src == "right" is return st.right end
+        if src == "bottom" is return st.bottom end
+        return st.left
+    end
+    let args: string = anchor::fn_args(raw, "anchor")
+    if args == "" is return auto_v() end
+    let sp: [string] = anchor::split_args(args)
+    let nm: string = if sp[0] != "" then sp[0] else def_name
+    let rect: [int] = if sp[0] != "" then anchor_rect_for(cx, boxes, id, nm) else def_rect
+    if array_len(rect) != 4 is
+        if sp[2] == "" is return auto_v() end
+        return gfx::len_px(sp[2], if target == "left" || target == "right" then cbw else cbh, st.font_size)
+    end
+    let horizontal: bool = target == "left" || target == "right"
+    let word: string = anchor::flip_word(sp[1], flip_b, flip_i)
+    let coord: int = anchor::side_coord(word, rect, horizontal)
+    if coord == -1000000 is return auto_v() end
+    let c2: int = coord + anchor_offset(raw, st.font_size)
+    if target == "left" is return c2 - cbx end
+    if target == "right" is return cbx + cbw - c2 end
+    if target == "top" is return c2 - cby end
+    return cby + cbh - c2
+end
+
+fn anchor_size_of(cx: LayoutCtx, boxes: [LayoutBox], id: int, st: style::ComputedStyle, prop: string, def_name: string, def_rect: [int]) -> int is
+    let raw: string = props::xget(st.xp, "-ax-" + prop)
+    if raw == "" is return -1 end
+    let args: string = anchor::fn_args(raw, "anchor-size")
+    if args == "" is return -1 end
+    let sp: [string] = anchor::split_args(args)
+    let rect: [int] = if sp[0] != "" then anchor_rect_for(cx, boxes, id, sp[0]) else def_rect
+    if array_len(rect) != 4 is
+        if sp[2] == "" is return -1 end
+        return gfx::len_px(sp[2], 0, st.font_size)
+    end
+    let word: string = if sp[1] == "" then prop else sp[1]
+    let v: int = anchor::size_val(word, rect)
+    if v < 0 is return -1 end
+    return v + anchor_offset(raw, st.font_size)
+end
+
+pub fn uses_anchor(st: style::ComputedStyle) -> bool is
+    let area: string = string_lower(string_trim(props::xget(st.xp, "position-area")))
+    if area != "" && area != "none" is return true end
+    return props::xhas(st.xp, "-ax-top") || props::xhas(st.xp, "-ax-right") || props::xhas(st.xp, "-ax-bottom") || props::xhas(st.xp, "-ax-left") || props::xhas(st.xp, "-ax-width") || props::xhas(st.xp, "-ax-height")
+end
+
+fn anchored_place(cx: LayoutCtx, id: int, st: style::ComputedStyle, boxes: [LayoutBox], bx: int, by: int, bw: int, bh: int,
+                  flip_b: bool, flip_i: bool) -> AbsPlace is
+    let pa: string = string_trim(props::xget(st.xp, "position-anchor"))
+    let def_name: string = if pa == "" || string_lower(pa) == "auto" || string_lower(pa) == "none" then "" else pa
+    let def_rect: [int] = anchor_rect_for(cx, boxes, id, def_name)
+    let area0: string = string_lower(string_trim(props::xget(st.xp, "position-area")))
+    let mut cbx: int = bx
+    let mut cby: int = by
+    let mut cbw: int = bw
+    let mut cbh: int = bh
+    let mut ha: int = -1
+    let mut va: int = -1
+    if area0 != "" && area0 != "none" && array_len(def_rect) == 4 is
+        let reg: [int] = anchor::area_region(anchor::flip_area(area0, flip_b, flip_i), def_rect, [bx, by, bw, bh])
+        cbx = reg[0]
+        cby = reg[1]
+        cbw = reg[2] - reg[0]
+        cbh = reg[3] - reg[1]
+        if cbw < 0 is
+            cbw = 0
+        end
+        if cbh < 0 is
+            cbh = 0
+        end
+        ha = reg[4]
+        va = reg[5]
+    end
+    let l: int = anchored_inset(cx, boxes, id, st, "left", flip_b, flip_i, def_name, cbx, cby, cbw, cbh, def_rect)
+    let r: int = anchored_inset(cx, boxes, id, st, "right", flip_b, flip_i, def_name, cbx, cby, cbw, cbh, def_rect)
+    let t: int = anchored_inset(cx, boxes, id, st, "top", flip_b, flip_i, def_name, cbx, cby, cbw, cbh, def_rect)
+    let b: int = anchored_inset(cx, boxes, id, st, "bottom", flip_b, flip_i, def_name, cbx, cby, cbw, cbh, def_rect)
+    let mlz: int = m_or_zero(st.mar_left)
+    let mrz: int = m_or_zero(st.mar_right)
+    let own_h: int = pad_border_h(st)
+    let w_spec: int = style::size_of(st.width, st.width_pct, st.width_mode, cbw)
+    let aw: int = anchor_size_of(cx, boxes, id, st, "width", def_name, def_rect)
+    let ah: int = anchor_size_of(cx, boxes, id, st, "height", def_name, def_rect)
+    let mut force: int = -1
+    if aw >= 0 is
+        force = aw
+    elsif w_spec < 0 && l != auto_v() && r != auto_v() is
+        force = cbw - l - r - mlz - mrz
+        if force < own_h is force = own_h end
+    end
+    let mut res: BlockRes = layout_block(cx, id, 0, 0, cbw, cbh, force, true)
+    if ah >= 0 is
+        res.h = ah
+        if array_len(res.boxes) > 0 is res.boxes[0].h = ah end
+    end
+    let have_rect: bool = array_len(def_rect) == 4
+    let mut x: int = cbx + mlz
+    if l != auto_v() is
+        x = cbx + l + mlz
+    elsif r != auto_v() is
+        x = cbx + cbw - r - res.w - mrz
+    elsif ha == 2 is
+        x = cbx + cbw - res.w
+    elsif ha == 1 && have_rect is
+        x = def_rect[0] + def_rect[2] / 2 - res.w / 2
+        if x + res.w > cbx + cbw is x = cbx + cbw - res.w end
+        if x < cbx is x = cbx end
+    end
+    let mut y: int = cby + res.mt
+    if t != auto_v() is
+        y = cby + t + res.mt
+    elsif b != auto_v() is
+        y = cby + cbh - b - res.h - res.mb
+    elsif va == 2 is
+        y = cby + cbh - res.h
+    elsif va == 1 && have_rect is
+        y = def_rect[1] + def_rect[3] / 2 - res.h / 2
+        if y + res.h > cby + cbh is y = cby + cbh - res.h end
+        if y < cby is y = cby end
+    end
+    let fits: bool = x >= bx && y >= by && x + res.w <= bx + bw && y + res.h <= by + bh
+    return AbsPlace { x: x, y: y, res: res, fits: fits, found: have_rect, rw: cbw, rh: cbh }
+end
+
+fn place_abs_anchored(cx: LayoutCtx, id: int, boxes: [LayoutBox], bx: int, by: int, bw: int, bh: int, fixed: bool) -> [LayoutBox] is
+    let st: style::ComputedStyle = cx.styles[id]
+    let spec: [string] = anchor::try_spec(st.xp)
+    let tries: [[int]] = anchor::try_list(spec[1])
+    let mut cands: [AbsPlace] = []
+    let mut metrics: [int] = []
+    let mut k: int = 0
+    while k < array_len(tries) is
+        let cand: AbsPlace = anchored_place(cx, id, st, boxes, bx, by, bw, bh, tries[k][0] == 1, tries[k][1] == 1)
+        cands = array_push(cands, cand)
+        metrics = array_push(metrics, anchor::order_metric(spec[0], cand.rw, cand.rh))
+        k += 1
+    end
+    let order: [int] = anchor::sort_by_metric(metrics)
+    let mut chosen: AbsPlace = cands[order[0]]
+    k = 0
+    while k < array_len(order) is
+        if cands[order[k]].fits is
+            chosen = cands[order[k]]
+            break
+        end
+        k += 1
+    end
+    let pv: string = string_lower(string_trim(props::xget(st.xp, "position-visibility")))
+    if string_find(pv, "no-overflow") >= 0 && !chosen.fits is return boxes end
+    if string_find(pv, "anchors-visible") >= 0 && !chosen.found is return boxes end
+    let mut placed: [LayoutBox] = shift_boxes(chosen.res.boxes, chosen.x - chosen.res.ml, chosen.y - chosen.res.mt)
+    if fixed is
+        let mut i: int = 0
+        while i < array_len(placed) is
+            placed[i].fixed = true
+            i += 1
+        end
+    end
+    return concat_boxes(boxes, placed)
+end
+
 fn place_abs(cx: LayoutCtx, id: int, boxes: [LayoutBox], doc_h: int) -> [LayoutBox] is
     let st: style::ComputedStyle = cx.styles[id]
     let fixed: bool = st.position == "fixed"
@@ -3031,7 +4587,10 @@ fn place_abs(cx: LayoutCtx, id: int, boxes: [LayoutBox], doc_h: int) -> [LayoutB
     let mut bx: int = 0
     let mut by: int = 0
     let mut bw: int = cx.vw
-    let mut bh: int = if fixed then cx.vh else (if doc_h > cx.vh then doc_h else cx.vh)
+    let mut bh: int = cx.vh
+    if !fixed && doc_h > cx.vh is
+        bh = doc_h
+    end
     if anc >= 0 is
         let r: style::BoxSides = box_rect_of(boxes, anc)
         let a: style::ComputedStyle = cx.styles[anc]
@@ -3040,6 +4599,7 @@ fn place_abs(cx: LayoutCtx, id: int, boxes: [LayoutBox], doc_h: int) -> [LayoutB
         bw = r.right - a.bl - a.br
         bh = r.bottom - a.bt - a.bb
     end
+    if uses_anchor(st) is return place_abs_anchored(cx, id, boxes, bx, by, bw, bh, fixed) end
     let own_h: int = pad_border_h(st)
     let mlz: int = m_or_zero(st.mar_left)
     let mrz: int = m_or_zero(st.mar_right)
@@ -3279,8 +4839,327 @@ fn transform_box(b0: LayoutBox, ox: int, oy: int, sx: int, sy: int, tx: int, ty:
     return b
 end
 
+fn has_mask_layers(st: style::ComputedStyle) -> bool is
+    if gfx::image_kind(props::xget(st.xp, "mask-border-source")) != 0 is return true end
+    let l: string = string_lower(props::xget(st.xp, "mask-image"))
+    if l == "" || l == "none" is return false end
+    let n: int = gfx::list_len(l)
+    let mut i: int = 0
+    while i < n is
+        if gfx::image_kind(gfx::list_at(l, i)) != 0 is return true end
+        i += 1
+    end
+    return false
+end
+
+;; 0.4: specyfikacja efektów warstwy: filtry na pikselach (blur/saturate/hue-rotate/drop-shadow), maska, mix-blend-mode.
+pub fn fx_spec_of(st: style::ComputedStyle) -> string is
+    let mut spec: string = gfx::filter_fx_spec(props::xget(st.xp, "filter"), cssval::Color { r: st.color.r, g: st.color.g, b: st.color.b, a: st.color.a }, st.font_size)
+    if has_mask_layers(st) is
+        if spec != "" is spec = spec + ";" end
+        spec = spec + "mask"
+    end
+    let bm: string = string_lower(props::xget(st.xp, "mix-blend-mode"))
+    if bm != "" && bm != "normal" is
+        if spec != "" is spec = spec + ";" end
+        spec = spec + "blend:" + bm
+    end
+    return spec
+end
+
+;; 0.4: `clip: rect(t, r, b, l)` — dotyczy elementów pozycjonowanych absolutnie/fixed
+pub fn clip_active(st: style::ComputedStyle) -> bool is
+    let v: string = string_lower(string_trim(props::xget(st.xp, "clip")))
+    return string_starts_with(v, "rect(") && is_out_of_flow(st)
+end
+
+;; prostokąt przycięcia [x, y, w, h] względem pudełka b (auto = krawędź pudełka); [] gdy brak
+pub fn css_clip_rect(st: style::ComputedStyle, b: LayoutBox) -> [int] is
+    let v: string = string_trim(props::xget(st.xp, "clip"))
+    let open: int = string_find(v, "(")
+    if open < 0 || !string_ends_with(v, ")") is return [] end
+    let args: [string] = cssval::split_top(string_replace(string_slice(v, open + 1, string_len(v) - 1), ",", " "))
+    if array_len(args) != 4 is return [] end
+    let t: int = if string_lower(args[0]) == "auto" then 0 else gfx::len_px(args[0], 0, st.font_size)
+    let r: int = if string_lower(args[1]) == "auto" then b.w else gfx::len_px(args[1], 0, st.font_size)
+    let bt: int = if string_lower(args[2]) == "auto" then b.h else gfx::len_px(args[2], 0, st.font_size)
+    let l: int = if string_lower(args[3]) == "auto" then 0 else gfx::len_px(args[3], 0, st.font_size)
+    return [b.x + l, b.y + t, if r > l then r - l else 0, if bt > t then bt - t else 0]
+end
+
+;; image-resolution: "<liczba>x|dppx|dpi|dpcm|from-image" (x1000 dppx; 1000 = 1x); 0 gdy domyślne
+pub fn image_resolution_x1000(st: style::ComputedStyle) -> int is
+    let v: string = string_lower(string_trim(props::xget(st.xp, "image-resolution")))
+    if v == "" || v == "from-image" || v == "snap" is return 0 end
+    let t: [string] = cssval::split_top(v)
+    let mut i: int = 0
+    while i < array_len(t) is
+        let tk: string = t[i]
+        i += 1
+        if is_numeric_char(tk) is
+            let nl: int = gfx::num_len_pub(tk)
+            let n: int = gfx::parse_x1000(string_slice(tk, 0, nl))
+            let u: string = string_slice(tk, nl, string_len(tk))
+            if n <= 0 is return 0 end
+            if u == "dpi" is return n / 96 end
+            if u == "dpcm" is return n * 254 / 9600 end
+            return n
+        end
+    end
+    return 0
+end
+
+;; ====================== 0.4: ruch po ścieżce (offset-*) ======================
+pub fn offset_active(st: style::ComputedStyle) -> bool is
+    let v: string = string_lower(string_trim(props::xget(st.xp, "offset-path")))
+    return v != "" && v != "none"
+end
+
+;; Pole zawierające (padding-box rodzica) [x, y, w, h] dla elementu o indeksie `idx` w `boxes`
+fn motion_cb(cx: LayoutCtx, boxes: [LayoutBox], idx: int) -> [int] is
+    let nid: int = boxes[idx].node_id
+    let mut cur: int = cx.dom.nodes[nid].parent
+    let mut guard: int = 0
+    while cur > 0 && guard < 100 is
+        let mut i: int = 0
+        while i < array_len(boxes) is
+            let b: LayoutBox = boxes[i]
+            i += 1
+            if b.node_id == cur && b.kind == "box" is
+                return [b.x + b.st.bl, b.y + b.st.bt, b.w - b.st.bl - b.st.br, b.h - b.st.bt - b.st.bb]
+            end
+        end
+        cur = cx.dom.nodes[cur].parent
+        guard += 1
+    end
+    return [0, 0, cx.vw, cx.vh]
+end
+
+;; Parametry ruchu: [a, b, c, d (x1000), dx, dy (x1000 px), anchor_x, anchor_y (px)]; [] gdy brak ścieżki
+pub fn motion_params(cx: LayoutCtx, boxes: [LayoutBox], idx: int, st: style::ComputedStyle) -> [int] is
+    if !offset_active(st) is return [] end
+    let b: LayoutBox = boxes[idx]
+    let cb: [int] = motion_cb(cx, boxes, idx)
+    let path: string = string_trim(props::xget(st.xp, "offset-path"))
+    let pl: string = string_lower(path)
+    let mut pts: [int] = []
+    let mut ray: bool = false
+    let mut ray_ang: int = 0
+    if string_starts_with(pl, "path(") && string_ends_with(path, ")") is
+        let mut inner: string = string_trim(string_slice(path, 5, string_len(path) - 1))
+        if string_len(inner) >= 2 && (string_starts_with(inner, "\"") || string_starts_with(inner, "'")) is
+            inner = string_slice(inner, 1, string_len(inner) - 1)
+        end
+        pts = svg::flatten_path(inner)
+    elsif string_starts_with(pl, "ray(") is
+        ray = true
+        let args: [string] = cssval::split_top(string_slice(pl, 4, string_len(pl) - 1))
+        let mut ai: int = 0
+        while ai < array_len(args) is
+            let ang: int = gfx::parse_x1000(string_replace(args[ai], "deg", ""))
+            if is_numeric_char(args[ai]) is ray_ang = ang end
+            ai += 1
+        end
+    else is
+        pts = svg::shape_polyline(path, cb[2], cb[3], st.font_size)
+    end
+    if !ray && array_len(pts) < 4 is return [] end
+    ;; odległość wzdłuż ścieżki
+    let total: int = if ray then 0 else svg::poly_length(pts)
+    let dv: string = string_lower(string_trim(props::xget(st.xp, "offset-distance")))
+    let mut dist: int = 0
+    if dv != "" is
+        if string_ends_with(dv, "%") is
+            dist = total * gfx::parse_x1000(string_slice(dv, 0, string_len(dv) - 1)) / 100000
+        else is
+            dist = gfx::len_px(dv, 0, st.font_size) * 1000
+        end
+    end
+    let mut pos: [int] = [0, 0, 1000, 0]
+    if ray is
+        ;; promień z punktu odniesienia (środek pola) pod kątem (0° = w górę)
+        let rdeci: int = ray_ang / 100
+        let ux: int = style::sin_m(rdeci)
+        let uy: int = 0 - style::cos_m(rdeci)
+        let o: [int] = ray_origin(props::xget(st.xp, "offset-position"), b, cb, st.font_size)
+        pos = [o[0] + dist * ux / 1000, o[1] + dist * uy / 1000, ux, uy]
+    else is
+        let closed: bool = pts[0] == pts[array_len(pts) - 2] && pts[1] == pts[array_len(pts) - 1]
+        pos = svg::poly_sample(pts, dist, closed)
+    end
+    ;; obrót (offset-rotate): auto | reverse | <kąt> | auto <kąt>
+    let rot: string = string_lower(string_trim(props::xget(st.xp, "offset-rotate")))
+    let rt: [string] = cssval::split_top(if rot == "" then "auto" else rot)
+    let mut use_dir: bool = false
+    let mut extra_deci: int = 0
+    let mut ri: int = 0
+    while ri < array_len(rt) is
+        if rt[ri] == "auto" is use_dir = true
+        elsif rt[ri] == "reverse" is
+            use_dir = true
+            extra_deci = extra_deci + 1800
+        else is
+            extra_deci = extra_deci + gfx::parse_x1000(string_replace(rt[ri], "deg", "")) / 100
+        end
+        ri += 1
+    end
+    let mut m: [int] = style::mat_id()
+    if use_dir is m = [pos[2], pos[3], 0 - pos[3], pos[2], 0, 0] end
+    if extra_deci != 0 is m = style::mat_mul(m, style::mat_rotate(extra_deci)) end
+    ;; punkt zakotwiczenia w pudełku elementu
+    let av: [string] = cssval::split_top(string_lower(string_trim(props::xget(st.xp, "offset-anchor"))))
+    let mut ax: int = b.x + b.w / 2
+    let mut ay: int = b.y + b.h / 2
+    if array_len(av) >= 1 && av[0] != "auto" is
+        let xs: string = if av[0] == "left" then "0%" elsif av[0] == "right" then "100%" elsif av[0] == "center" then "50%" else av[0]
+        ax = b.x + gfx::len_px(xs, b.w, st.font_size)
+        if array_len(av) >= 2 is
+            let ys: string = if av[1] == "top" then "0%" elsif av[1] == "bottom" then "100%" elsif av[1] == "center" then "50%" else av[1]
+            ay = b.y + gfx::len_px(ys, b.h, st.font_size)
+        end
+    end
+    let px: int = cb[0] * 1000 + pos[0]
+    let py: int = cb[1] * 1000 + pos[1]
+    return [m[0], m[1], m[2], m[3], px - ax * 1000, py - ay * 1000, ax, ay]
+end
+
+;; 0.4: offset-position — początek promienia ray() w polu zawierającym ([x, y] ×1000, względem pola).
+;; normal → środek pola; auto → lewy górny róg pudełka elementu (pozycja statyczna); <pozycja> → x y (słowa kluczowe i %).
+pub fn ray_origin(op0: string, b: LayoutBox, cb: [int], fs: int) -> [int] is
+    let op: string = string_lower(string_trim(op0))
+    if op == "" || op == "normal" is return [cb[2] * 500, cb[3] * 500] end
+    if op == "auto" is return [(b.x - cb[0]) * 1000, (b.y - cb[1]) * 1000] end
+    let t: [string] = cssval::split_top(op)
+    let mut sx: string = t[0]
+    let mut sy: string = if array_len(t) >= 2 then t[1] else "center"
+    if t[0] == "top" || t[0] == "bottom" is
+        sx = sy
+        sy = t[0]
+        if array_len(t) < 2 is sx = "center" end
+    end
+    return [shape::len_px(sx, cb[2], fs) * 1000, shape::len_px(sy, cb[3], fs) * 1000]
+end
+
+fn is_numeric_char(t: string) -> bool is
+    if t == "" is return false end
+    let c: string = string_at(t, 0)
+    return (c >= "0" && c <= "9") || c == "-" || c == "+" || c == "."
+end
+
+;; Składa ruch z istniejącą macierzą grupy `grp` (pivot, e/f): wynik [a,b,c,d,e,f,pivotx,pivoty] o pivocie w punkcie zakotwiczenia
+fn compose_motion(grp: [int], mo: [int]) -> [int] is
+    let ao: [int] = [grp[0], grp[1], grp[2], grp[3]]
+    let ax: int = mo[6]
+    let ay: int = mo[7]
+    ;; M_old względem pivotu zakotwiczenia: t' = (I − A)(pivot_old − anchor) + t_old
+    let vx: int = (grp[6] - ax) * 1000
+    let vy: int = (grp[7] - ay) * 1000
+    let tx: int = vx - (ao[0] * vx + ao[2] * vy) / 1000 + grp[4]
+    let ty: int = vy - (ao[1] * vx + ao[3] * vy) / 1000 + grp[5]
+    ;; R · A_old oraz R · t' + d
+    let a: int = (mo[0] * ao[0] + mo[2] * ao[1]) / 1000
+    let b: int = (mo[1] * ao[0] + mo[3] * ao[1]) / 1000
+    let c: int = (mo[0] * ao[2] + mo[2] * ao[3]) / 1000
+    let d: int = (mo[1] * ao[2] + mo[3] * ao[3]) / 1000
+    let e: int = (mo[0] * tx + mo[2] * ty) / 1000 + mo[4]
+    let f: int = (mo[1] * tx + mo[3] * ty) / 1000 + mo[5]
+    return [a, b, c, d, e, f, ax, ay]
+end
+
 fn has_effects(st: style::ComputedStyle) -> bool is
-    return st.opacity < 100 || st.has_filter || st.clip_path != "" || st.has_transform
+    return st.opacity < 100 || st.has_filter || st.clip_path != "" || st.has_transform || fx_spec_of(st) != "" || clip_active(st) || offset_active(st)
+end
+
+;; ---------- 0.4: transformacje 3D (perspective, rotateX/Y, translateZ, matrix3d, backface-visibility) ----------
+;; Macierz perspektywy rodzica: T(o) · P(d) · T(−o), o = perspective-origin w ramce rodzica. [] gdy rodzic nie ma `perspective`.
+pub fn parent_perspective(cx: LayoutCtx, boxes: [LayoutBox], id: int) -> [int] is
+    let par: int = cx.dom.nodes[id].parent
+    if par < 0 is return [] end
+    let pst: style::ComputedStyle = cx.styles[par]
+    let pv: string = string_lower(string_trim(props::xget(pst.xp, "perspective")))
+    if pv == "" || pv == "none" is return [] end
+    let d: int = gfx::len_px(pv, 0, pst.font_size)
+    if d <= 0 is return [] end
+    let r: style::BoxSides = box_rect_of(boxes, par)
+    let po: string = string_trim(props::xget(pst.xp, "perspective-origin"))
+    let toks: [string] = cssval::split_top(if po == "" then "50% 50%" else po)
+    let t0: string = toks[0]
+    let t1: string = if array_len(toks) >= 2 then toks[1] else "50%"
+    let mut sx: string = t0
+    let mut sy: string = t1
+    if t0 == "top" || t0 == "bottom" is
+        sx = t1
+        sy = t0
+    end
+    let ox: int = r.left + shape::len_px(sx, r.right, pst.font_size)
+    let oy: int = r.top + shape::len_px(sy, r.bottom, pst.font_size)
+    return style::m4_mul(style::m4_mul(style::m4_translate(ox, oy, 0), style::m4_perspective(d)), style::m4_translate(0 - ox, 0 - oy, 0))
+end
+
+;; Pełna macierz elementu w współrzędnych dokumentu jako napis ("" gdy brak transformacji 3D).
+fn box_of_node(boxes: [LayoutBox], id: int) -> LayoutBox is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is return boxes[i] end
+        i += 1
+    end
+    return boxes[0]
+end
+
+;; Macierz 4×4 elementu w współrzędnych dokumentu ([] gdy element nie ma transformacji 3D).
+;; Rodzic z `transform-style: preserve-3d` i własną macierzą 3D składa się z elementem (sceny zagnieżdżone);
+;; inaczej działa tylko perspektywa rodzica. Bez sortowania głębi — kolejność rysowania jak w dokumencie.
+pub fn m3d_matrix(cx: LayoutCtx, boxes: [LayoutBox], id: int, depth: int) -> [int] is
+    let st: style::ComputedStyle = cx.styles[id]
+    let local: [int] = style::m4_parse(props::xget(st.xp, "x-m3d"))
+    if array_len(local) != 16 || depth > 16 is return [] end
+    let b: LayoutBox = box_of_node(boxes, id)
+    let ob: [int] = origin_box(b, st)
+    let ox: int = ob[0] + ob[2] * st.origin_x / 10000
+    let oy: int = ob[1] + ob[3] * st.origin_y / 10000
+    let mut m: [int] = style::m4_mul(style::m4_mul(style::m4_translate(ox, oy, 0), local), style::m4_translate(0 - ox, 0 - oy, 0))
+    let tp: [int] = parent_perspective(cx, boxes, id)
+    if array_len(tp) == 16 is m = style::m4_mul(tp, m) end
+    let par: int = cx.dom.nodes[id].parent
+    if par > 0 && string_lower(string_trim(props::xget(cx.styles[par].xp, "transform-style"))) == "preserve-3d" is
+        let pm: [int] = m3d_matrix(cx, boxes, par, depth + 1)
+        if array_len(pm) == 16 is m = style::m4_mul(pm, m) end
+    end
+    return m
+end
+
+;; Pełna macierz elementu jako napis ("" gdy brak transformacji 3D); sufiks |1 = backface-visibility: hidden.
+pub fn m3d_string(cx: LayoutCtx, boxes: [LayoutBox], b: LayoutBox, st: style::ComputedStyle) -> string is
+    let m: [int] = m3d_matrix(cx, boxes, b.node_id, 0)
+    if array_len(m) != 16 is return "" end
+    let hide: bool = string_lower(string_trim(props::xget(st.xp, "backface-visibility"))) == "hidden"
+    return style::m4_str(m) + (if hide then "|1" else "|0")
+end
+
+;; ---------- 0.4: overflow-anchor (kotwiczenie przewijania) ----------
+;; Po zmianie układu: węzeł-kotwica = najwyżej położony widoczny element (górna krawędź ≥ przewinięciu i w oknie), bez `overflow-anchor: none`.
+;; Zwraca przesunięcie przewijania (nowa pozycja kotwicy − stara); 0, gdy brak kotwicy, przewinięcie = 0 albo wyłączone na korzeniu.
+pub fn scroll_anchor_delta(old_boxes: [LayoutBox], new_boxes: [LayoutBox], scroll_y: int, viewport_h: int) -> int is
+    if scroll_y <= 0 || array_len(old_boxes) == 0 is return 0 end
+    if string_lower(props::xget(old_boxes[0].st.xp, "overflow-anchor")) == "none" is return 0 end
+    let mut best: int = -1
+    let mut i: int = 1
+    while i < array_len(old_boxes) is
+        let b: LayoutBox = old_boxes[i]
+        i += 1
+        if b.kind != "box" || b.node_id <= 0 || b.h <= 0 || b.fixed is continue end
+        if b.y < scroll_y || b.y >= scroll_y + viewport_h is continue end
+        if string_lower(props::xget(b.st.xp, "overflow-anchor")) == "none" is continue end
+        if best < 0 || b.y < old_boxes[best].y is best = i - 1 end
+    end
+    if best < 0 is return 0 end
+    let ob: LayoutBox = old_boxes[best]
+    let mut k: int = 0
+    while k < array_len(new_boxes) is
+        if new_boxes[k].node_id == ob.node_id && new_boxes[k].kind == "box" is return new_boxes[k].y - ob.y end
+        k += 1
+    end
+    return 0
 end
 
 pub fn apply_effects(cx: LayoutCtx, boxes0: [LayoutBox]) -> [LayoutBox] is
@@ -3335,10 +5214,17 @@ pub fn apply_effects(cx: LayoutCtx, boxes0: [LayoutBox]) -> [LayoutBox] is
                 end
             end
         end
-        if st.has_transform && array_len(st.tr_m) == 6 is
+        let m3s: string = if st.has_transform then m3d_string(cx, out, b, st) else ""
+        let vkd: string = if st.has_transform then vert_kind(cx, id) else ""
+        if st.has_transform && (array_len(st.tr_m) == 6 || m3s != "" || vkd != "") is
             ;; obrót / pochylenie: poddrzewo rysowane jako warstwa przekształcana przez natywną warstwę
-            let px: int = b.x + b.w * st.origin_x / 10000
-            let py: int = b.y + b.h * st.origin_y / 10000
+            let ob: [int] = origin_box(b, st)
+            let mut px: int = ob[0] + ob[2] * st.origin_x / 10000
+            let mut py: int = ob[1] + ob[3] * st.origin_y / 10000
+            if vkd != "" is
+                px = b.x
+                py = b.y
+            end
             let mut x0: int = b.x
             let mut y0: int = b.y
             let mut x1: int = b.x + b.w
@@ -3364,18 +5250,27 @@ pub fn apply_effects(cx: LayoutCtx, boxes0: [LayoutBox]) -> [LayoutBox] is
                 end
                 k += 1
             end
-            let grp: [int] = [st.tr_m[0], st.tr_m[1], st.tr_m[2], st.tr_m[3], st.tr_m[4], st.tr_m[5], px, py, x0 - 2, y0 - 2, x1 - x0 + 4, y1 - y0 + 4]
+            let fxs0: string = fx_spec_of(st)
+            let pad0: int = 2 + gfx::filter_pad(fxs0)
+            let mut tm6: [int] = if array_len(st.tr_m) == 6 && m3s == "" then st.tr_m else [1000, 0, 0, 1000, 0, 0]
+            if vkd != "" is tm6 = vert_matrix(vkd, b.w, b.h) end
+            let grp: [int] = [tm6[0], tm6[1], tm6[2], tm6[3], tm6[4], tm6[5], px, py, x0 - pad0, y0 - pad0, x1 - x0 + 2 * pad0, y1 - y0 + 2 * pad0]
             out[i - 1].xf_id = id
             out[i - 1].xf = grp
+            out[i - 1].fx = fxs0
+            out[i - 1].m3d = m3s
             k = 0
             while k < array_len(sub) is
                 out[sub[k]].xf_id = id
                 out[sub[k]].xf = grp
+                out[sub[k]].fx = fxs0
+                out[sub[k]].m3d = m3s
                 k += 1
             end
         elsif st.has_transform is
-            let ox: int = b.x + b.w * st.origin_x / 10000
-            let oy: int = b.y + b.h * st.origin_y / 10000
+            let ob: [int] = origin_box(b, st)
+            let ox: int = ob[0] + ob[2] * st.origin_x / 10000
+            let oy: int = ob[1] + ob[3] * st.origin_y / 10000
             let tx: int = st.tr_tx + b.w * st.tr_tx_pct / 10000
             let ty: int = st.tr_ty + b.h * st.tr_ty_pct / 10000
             out[i - 1] = transform_box(out[i - 1], ox, oy, st.tr_sx, st.tr_sy, tx, ty)
@@ -3385,8 +5280,98 @@ pub fn apply_effects(cx: LayoutCtx, boxes0: [LayoutBox]) -> [LayoutBox] is
                 k += 1
             end
         end
+        ;; 0.4: ruch po ścieżce (offset-path): grupa z macierzą obrotu i przesunięciem; składana z istniejącą grupą (transform/filter)
+        if offset_active(st) is
+            let mo: [int] = motion_params(cx, out, i - 1, st)
+            if array_len(mo) == 8 is
+                let mut grp3: [int] = []
+                if out[i - 1].xf_id == id && array_len(out[i - 1].xf) == 12 is
+                    let g0: [int] = out[i - 1].xf
+                    let comp: [int] = compose_motion(g0, mo)
+                    grp3 = [comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6], comp[7], g0[8], g0[9], g0[10], g0[11]]
+                else is
+                    let gb3: [int] = group_bounds(out, i - 1, sub)
+                    grp3 = [mo[0], mo[1], mo[2], mo[3], mo[4], mo[5], mo[6], mo[7], gb3[0] - 2, gb3[1] - 2, gb3[2] - gb3[0] + 4, gb3[3] - gb3[1] + 4]
+                end
+                out[i - 1].xf_id = id
+                out[i - 1].xf = grp3
+                let mut km: int = 0
+                while km < array_len(sub) is
+                    if out[sub[km]].xf_id == 0 || out[sub[km]].xf_id == id is
+                        out[sub[km]].xf_id = id
+                        out[sub[km]].xf = grp3
+                    end
+                    km += 1
+                end
+            end
+        end
+        ;; 0.4: clip: rect(…) — przycięcie elementu i potomków
+        if clip_active(st) is
+            let cr: [int] = css_clip_rect(st, out[i - 1])
+            if array_len(cr) == 4 is
+                out[i - 1] = apply_clip([out[i - 1]], 0, cr[0], cr[1], cr[2], cr[3])[0]
+                let mut kc: int = 0
+                while kc < array_len(sub) is
+                    out[sub[kc]] = apply_clip([out[sub[kc]]], 0, cr[0], cr[1], cr[2], cr[3])[0]
+                    kc += 1
+                end
+            end
+        end
+        ;; 0.4: efekty pikselowe (filter blur/saturate/hue-rotate/drop-shadow, mask, mix-blend-mode) — grupa o macierzy tożsamościowej
+        let fxs: string = fx_spec_of(st)
+        if fxs != "" && !(st.has_transform && array_len(st.tr_m) == 6) is
+            let gb: [int] = group_bounds(out, i - 1, sub)
+            let pad: int = 2 + gfx::filter_pad(fxs)
+            let gid: int = id
+            let grp2: [int] = [1000, 0, 0, 1000, 0, 0, gb[0], gb[1], gb[0] - pad, gb[1] - pad, gb[2] - gb[0] + 2 * pad, gb[3] - gb[1] + 2 * pad]
+            if out[i - 1].xf_id == 0 is
+                out[i - 1].xf_id = gid
+                out[i - 1].xf = grp2
+                out[i - 1].fx = fxs
+            end
+            let mut k2: int = 0
+            while k2 < array_len(sub) is
+                if out[sub[k2]].xf_id == 0 is
+                    out[sub[k2]].xf_id = gid
+                    out[sub[k2]].xf = grp2
+                    out[sub[k2]].fx = fxs
+                end
+                k2 += 1
+            end
+        end
     end
     return out
+end
+
+;; Prostokąt otaczający element `idx` i jego poddrzewo `sub` (z uwzględnieniem przycięcia) → [x0, y0, x1, y1].
+fn group_bounds(out: [LayoutBox], idx: int, sub: [int]) -> [int] is
+    let b: LayoutBox = out[idx]
+    let mut x0: int = b.x
+    let mut y0: int = b.y
+    let mut x1: int = b.x + b.w
+    let mut y1: int = b.y + b.h
+    let mut k: int = 0
+    while k < array_len(sub) is
+        let sb: LayoutBox = out[sub[k]]
+        let mut rx0: int = sb.x
+        let mut ry0: int = sb.y
+        let mut rx1: int = sb.x + sb.w
+        let mut ry1: int = sb.y + sb.h
+        if sb.has_clip is
+            if sb.cx > rx0 is rx0 = sb.cx end
+            if sb.cy > ry0 is ry0 = sb.cy end
+            if sb.cx + sb.cw < rx1 is rx1 = sb.cx + sb.cw end
+            if sb.cy + sb.ch < ry1 is ry1 = sb.cy + sb.ch end
+        end
+        if rx1 > rx0 && ry1 > ry0 is
+            if rx0 < x0 is x0 = rx0 end
+            if ry0 < y0 is y0 = ry0 end
+            if rx1 > x1 is x1 = rx1 end
+            if ry1 > y1 is y1 = ry1 end
+        end
+        k += 1
+    end
+    return [x0, y0, x1, y1]
 end
 
 ;; position: sticky — oznacza boxy poddrzewa danymi do przesunięcia przy rysowaniu.
@@ -3533,9 +5518,12 @@ struct GenState is
     pub co:         [int]      ;; właściciel zakresu: id węzła, po którego poddrzewie instancja znika
     pub has_before: bool
     pub has_after:  bool
+    pub has_fl:     bool       ;; 0.4: arkusz ma reguły ::first-letter
+    pub qv:         string     ;; 0.4: bieżąca wartość `quotes` ("" = auto)
+    pub qd:         int        ;; 0.4: głębokość zagnieżdżenia cudzysłowów
 end
 
-fn unquote(v: string) -> string is
+pub fn unquote(v: string) -> string is
     let t: string = string_trim(v)
     if string_len(t) >= 2 && (string_starts_with(t, "\"") || string_starts_with(t, "'")) is
         return string_slice(t, 1, string_len(t) - 1)
@@ -3686,10 +5674,46 @@ fn gen_pop(gs0: GenState, owner: int) -> GenState is
     return gs
 end
 
+;; 0.4: `quotes` — pary cudzysłowów wg głębokości. qv: "" / "auto" → “ ” ‘ ’; "none" → brak.
+pub fn quote_glyph(qv: string, depth: int, open: bool) -> string is
+    let v: string = string_trim(qv)
+    if v == "none" is return "" end
+    let mut items: [string] = []
+    if v != "" && v != "auto" is
+        let toks: [string] = cssval::split_top(v)
+        let mut i: int = 0
+        while i < array_len(toks) is
+            let raw_q: string = unquote(toks[i])
+            items = array_push(items, if string_find(raw_q, "\\") >= 0 then css_unescape(raw_q) else raw_q)
+            i += 1
+        end
+    end
+    if array_len(items) < 2 is items = ["“", "”", "‘", "’"] end
+    let pairs: int = array_len(items) / 2
+    let lvl0: int = if open then depth else depth - 1
+    let lvl: int = if lvl0 < 0 then 0 elsif lvl0 >= pairs then pairs - 1 else lvl0
+    return items[lvl * 2 + (if open then 0 else 1)]
+end
+
+fn count_token(expr: string, tok: string) -> int is
+    let mut n: int = 0
+    let mut from: int = 0
+    while from < string_len(expr) is
+        let q: int = string_find(string_slice(expr, from, string_len(expr)), tok)
+        if q < 0 is break end
+        let at: int = from + q
+        let before_ok: bool = at == 0 || string_at(expr, at - 1) == " "
+        if before_ok is n += 1 end
+        from = at + string_len(tok)
+    end
+    return n
+end
+
 ;; Wartość `content` → tekst. host = element, do którego należy pseudo-element.
 fn eval_content(gs: GenState, host: int, expr: string) -> string is
     let n: int = string_len(expr)
     let mut out: string = ""
+    let mut qd: int = gs.qd
     let mut i: int = 0
     while i < n is
         let c: string = string_at(expr, i)
@@ -3735,14 +5759,18 @@ fn eval_content(gs: GenState, host: int, expr: string) -> string is
                 out = out + counter_format(if top >= 0 then gs.cv[top] else 0, kind)
                 i = i + close + 1
             elsif string_starts_with(rest, "open-quote") is
-                out = out + "“"
+                out = out + quote_glyph(gs.qv, qd, true)
+                qd += 1
                 i += 10
             elsif string_starts_with(rest, "close-quote") is
-                out = out + "”"
+                out = out + quote_glyph(gs.qv, qd, false)
+                if qd > 0 is qd -= 1 end
                 i += 11
             elsif string_starts_with(rest, "no-open-quote") is
+                qd += 1
                 i += 13
             elsif string_starts_with(rest, "no-close-quote") is
+                if qd > 0 is qd -= 1 end
                 i += 14
             elsif string_starts_with(rest, "url(") && close > 0 is
                 i = i + close + 1
@@ -3790,6 +5818,8 @@ fn make_pseudo(gs0: GenState, sheet: css::Stylesheet, ix: css::InteractionState,
     gs.d = d2
     gs = apply_counter_decls(gs, decls, host)
     let txt: string = eval_content(gs, host, expr)
+    let qnet: int = count_token(expr, "open-quote") + count_token(expr, "no-open-quote") - count_token(expr, "close-quote") - count_token(expr, "no-close-quote")
+    gs.qd = if gs.qd + qnet < 0 then 0 else gs.qd + qnet
     if txt != "" is
         let mut d3: dom::Dom = dom::new_node(gs.d, pid, "text")
         let tid: int = array_len(d3.nodes) - 1
@@ -3815,14 +5845,22 @@ fn gen_walk(gs0: GenState, sheet: css::Stylesheet, ix: css::InteractionState, id
     if node.tag == "text" || node.removed || node.pseudo != "" is return gs end
     let decls: [css::CssDecl] = css::matching_decls_ctx(sheet, gs.d, id, ix)
     gs = apply_counter_decls(gs, decls, node.parent)
+    let saved_qv: string = gs.qv
+    let mut qi: int = 0
+    while qi < array_len(decls) is
+        if decls[qi].prop == "quotes" is gs.qv = string_trim(decls[qi].val) end
+        qi += 1
+    end
     let orig: [int] = node.children
     if gs.has_before is gs = make_pseudo(gs, sheet, ix, id, "before") end
+    if gs.has_fl is gs = make_first_letter(gs, sheet, ix, id) end
     let mut i: int = 0
     while i < array_len(orig) is
         gs = gen_walk(gs, sheet, ix, orig[i], depth + 1)
         i += 1
     end
     if gs.has_after is gs = make_pseudo(gs, sheet, ix, id, "after") end
+    gs.qv = saved_qv
     return gen_pop(gs, id)
 end
 
@@ -3849,8 +5887,8 @@ end
 ;; Dodaje do DOM węzły ::before/::after (jako <span> z polem pseudo) według arkusza.
 pub fn gen_pseudo(d: dom::Dom, sheet: css::Stylesheet, ix: css::InteractionState) -> dom::Dom is
     let fl: [bool] = sheet_pelem_flags(sheet)
-    if !fl[0] && !fl[1] && !fl[2] is return d end
-    let gs: GenState = GenState { d: d, cn: [], cv: [], co: [], has_before: fl[0], has_after: fl[1] }
+    if !fl[0] && !fl[1] && !fl[2] && !sheet_has_pelem(sheet, "first-letter") is return d end
+    let gs: GenState = GenState { d: d, cn: [], cv: [], co: [], has_before: fl[0], has_after: fl[1], has_fl: sheet_has_pelem(sheet, "first-letter"), qv: "", qd: 0 }
     let out: GenState = gen_walk(gs, sheet, ix, 0, 0)
     return out.d
 end
@@ -3884,6 +5922,286 @@ fn is_contents_el(d: dom::Dom, styles: [style::ComputedStyle], id: int) -> bool 
 end
 
 ;; Elementy zastępowane i `br` z `display: contents` zachowują się jak `display: none` (CSS Display 3).
+;; 0.4: transform-box — odniesienie dla transform-origin: [x, y, w, h]. HTML nie ma obwiedni geometrii,
+;; więc fill/stroke/view-box = border-box; content-box = obszar treści.
+pub fn origin_box(b: LayoutBox, st: style::ComputedStyle) -> [int] is
+    let tbx: string = string_lower(props::xget(st.xp, "transform-box"))
+    if tbx == "content-box" is
+        return [b.x + st.bl + st.pad_left, b.y + st.bt + st.pad_top, b.w - st.bl - st.br - st.pad_left - st.pad_right, b.h - st.bt - st.bb - st.pad_top - st.pad_bottom]
+    end
+    return [b.x, b.y, b.w, b.h]
+end
+
+;; ---------- 0.4: ::first-letter ----------
+fn sheet_has_pelem(sheet: css::Stylesheet, name: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(sheet.rules) is
+        if sheet.rules[i].pelem == name is return true end
+        i += 1
+    end
+    return false
+end
+
+fn is_ws_ch(c: string) -> bool is
+    return c == " " || c == "\n" || c == "\t" || c == "\r"
+end
+
+;; Prefiks „pierwszej litery": opcjonalna interpunkcja otwierająca + jeden znak. Zwraca [liczba bajtów prefiksu, bajtów białych znaków przed].
+pub fn first_letter_span(t: string) -> [int] is
+    let n: int = string_len(t)
+    let mut pos: int = 0
+    while pos < n && is_ws_ch(string_slice(t, pos, pos + 1)) is pos += 1 end
+    let ws: int = pos
+    if pos >= n is return [0, ws] end
+    let mut guard: int = 0
+    while pos < n && guard < 4 is
+        let nx: int = ffi_shim::silver_utf8_next(t, pos)
+        let step: int = if nx <= pos then pos + 1 else nx
+        let c: string = string_slice(t, pos, if step > n then n else step)
+        if !hp_is_opening(c) is break end
+        pos = step
+        guard += 1
+    end
+    if pos >= n is return [0, ws] end
+    let nx2: int = ffi_shim::silver_utf8_next(t, pos)
+    let end_pos: int = if nx2 <= pos then pos + 1 else nx2
+    return [(if end_pos > n then n else end_pos) - ws, ws]
+end
+
+fn make_first_letter(gs0: GenState, sheet: css::Stylesheet, ix: css::InteractionState, host: int) -> GenState is
+    let mut gs: GenState = gs0
+    let hn: dom::DomNode = gs.d.nodes[host]
+    ;; pierwsze dziecko z treścią musi być tekstem (zagnieżdżone inline pomijamy)
+    let mut tid: int = -1
+    let mut k: int = 0
+    while k < array_len(hn.children) is
+        let cid: int = hn.children[k]
+        k += 1
+        let cn: dom::DomNode = gs.d.nodes[cid]
+        if cn.removed || cn.pseudo != "" is continue end
+        if cn.tag != "text" is break end
+        if first_letter_span(cn.text)[0] > 0 is
+            tid = cid
+        end
+        break
+    end
+    if tid < 0 is return gs end
+    let t: string = gs.d.nodes[tid].text
+    let sp: [int] = first_letter_span(t)
+    let mut d2: dom::Dom = dom::new_node(gs.d, host, "span")
+    let pid: int = array_len(d2.nodes) - 1
+    d2.nodes[pid].pseudo = "first-letter"
+    let decls: [css::CssDecl] = css::matching_decls_ctx(sheet, d2, pid, ix)
+    let mut kids: [int] = []
+    let mut j: int = 0
+    while j < array_len(d2.nodes[host].children) is
+        let c: int = d2.nodes[host].children[j]
+        j += 1
+        if c == pid is continue end
+        if c == tid && array_len(decls) > 0 is kids = array_push(kids, pid) end
+        kids = array_push(kids, c)
+    end
+    d2.nodes[host].children = kids
+    if array_len(decls) == 0 is
+        d2.nodes[pid].removed = true
+        gs.d = d2
+        return gs
+    end
+    d2 = dom::new_node(d2, pid, "text")
+    let lid: int = array_len(d2.nodes) - 1
+    d2.nodes[lid].text = string_slice(t, sp[1], sp[1] + sp[0])
+    d2.nodes[tid].text = string_slice(t, sp[1] + sp[0], string_len(t))
+    gs.d = d2
+    return gs
+end
+
+;; ---------- 0.4: initial-letter ----------
+;; `initial-letter: <rozmiar> [<zagłębienie> | drop | raise]` → pływająca (float: left) litera o wysokości wersalika obejmującej
+;; `rozmiar` wierszy, wcięta o `zagłębienie` wierszy. Dotyczy ::first-letter i zwykłych elementów inline.
+;; Rozmiar pisma i interlinia elementu z initial-letter przechodzą na potomków (ich style policzono przed korektą).
+fn propagate_font(d: dom::Dom, styles0: [style::ComputedStyle], id: int, fs: int, lhp: int) -> [style::ComputedStyle] is
+    let mut styles: [style::ComputedStyle] = styles0
+    let mut stack: [int] = [id]
+    let mut guard: int = 0
+    while array_len(stack) > 0 && guard < 5000 is
+        guard += 1
+        let cur: int = stack[array_len(stack) - 1]
+        let mut ns: [int] = []
+        let mut k: int = 0
+        while k < array_len(stack) - 1 is
+            ns = array_push(ns, stack[k])
+            k += 1
+        end
+        stack = ns
+        let kids: [int] = d.nodes[cur].children
+        let mut c: int = 0
+        while c < array_len(kids) is
+            let kid: int = kids[c]
+            c += 1
+            if kid < 0 || kid >= array_len(styles) is continue end
+            styles[kid].font_size = fs
+            styles[kid].line_height = lhp
+            stack = array_push(stack, kid)
+        end
+    end
+    return styles
+end
+
+fn apply_initial_letter(d: dom::Dom, styles0: [style::ComputedStyle], st0: style::ComputedStyle, id: int, win: int) -> style::ComputedStyle is
+    let mut st: style::ComputedStyle = st0
+    let v: string = string_lower(string_trim(props::xget(st.xp, "initial-letter")))
+    if v == "" || v == "normal" || v == "none" is return st end
+    let node: dom::DomNode = d.nodes[id]
+    if node.parent < 0 || node.tag == "text" is return st end
+    if node.pseudo != "first-letter" && (st.display != "inline" || st.float_side != "none") is return st end
+    let toks: [string] = cssval::split_top(v)
+    if !props::is_num(toks[0]) is return st end
+    let size: f64 = conv::str_to_float(toks[0])
+    if size < 1.0 is return st end
+    let size_i: int = conv::float_to_int(size + 0.999)
+    let mut sink: int = conv::float_to_int(size)
+    if array_len(toks) >= 2 is
+        if toks[1] == "raise" is
+            sink = 1
+        elsif props::is_int(toks[1]) is
+            sink = str_to_int(toks[1])
+        end
+    end
+    if sink < 1 is sink = 1 end
+    let pst: style::ComputedStyle = styles0[node.parent]
+    let lh: int = line_h_of(pst)
+    let pcap: int = pst.font_size * font_ratio(win, pst, 1) / 1000
+    let cap_h: int = conv::float_to_int((size - 1.0) * conv::int_to_float(lh)) + pcap
+    let rat: int = font_ratio(win, st, 1)
+    let fs: int = cap_h * 1000 / rat
+    st.font_size = if fs < 1 then 1 else fs
+    st.float_side = "left"
+    st.display = "block"
+    let ybase: int = (sink - 1) * lh + lh * 8 / 10
+    let lhh: int = 2 * (ybase - st.font_size * 345 / 1000)
+    st.line_height = if lhh < 1 then 1 else lhh
+    st.height = sink * lh
+    st.height_mode = "px"
+    if st.mar_right == 0 is
+        st.mar_right = if st.font_size / 12 < 3 then 3 else st.font_size / 12
+    end
+    if sink < size_i is
+        st.mar_top = 0 - (size_i - sink) * lh
+    end
+    return st
+end
+
+;; ---------- 0.4: wartości użyte dla czcionki ----------
+;; Wartości domyślne proporcji kroju (promile rozmiaru), gdy shim nie może ich zmierzyć (np. testy bez okna).
+fn default_ratio(kind: int) -> int is
+    if kind == 0 is return 520 end
+    if kind == 1 is return 720 end
+    if kind == 2 is return 600 end
+    return 1000
+end
+
+fn font_ratio(win: int, st: style::ComputedStyle, kind: int) -> int is
+    if win >= 0 is
+        let r: int = ffi_shim::silver_font_ratio(win, st.font_size, style_flags(st), kind)
+        if r > 0 is return r end
+    end
+    return default_ratio(kind)
+end
+
+;; font-size-adjust: `<liczba>` | ex-height N | cap-height N | ch-width N | ic-width N | ic-height N | from-font | none.
+;; Zwraca [rodzaj, wartość×1000] albo [] (brak korekty; from-font = ten sam krój, więc bez zmiany).
+fn size_adjust_spec(v: string) -> [int] is
+    let low: string = string_lower(string_trim(v))
+    if low == "" || low == "none" || low == "from-font" is return [] end
+    let parts: [string] = string_split(low, " ")
+    let mut kind: int = 0
+    let mut numtok: string = parts[0]
+    if array_len(parts) >= 2 is
+        numtok = parts[1]
+        if parts[0] == "cap-height" is kind = 1 end
+        if parts[0] == "ch-width" is kind = 2 end
+        if parts[0] == "ic-width" || parts[0] == "ic-height" is kind = 3 end
+    end
+    if !props::is_num(numtok) is return [] end
+    let val: int = conv::float_to_int(conv::str_to_float(numtok) * 1000.0)
+    if val <= 0 is return [] end
+    return [kind, val]
+end
+
+pub fn used_font_fixups(d: dom::Dom, styles0: [style::ComputedStyle], win: int) -> [style::ComputedStyle] is
+    let mut styles: [style::ComputedStyle] = styles0
+    let mut i: int = 0
+    while i < array_len(styles) && i < array_len(d.nodes) is
+        let xp: string = styles[i].xp
+        if xp != "" && !d.nodes[i].removed is
+            ;; font-variation-settings: oś wght → pogrubienie, ital/slnt → kursywa (osie wdth obsługuje typo::stretch_pct)
+            let vs: string = props::xget(xp, "font-variation-settings")
+            if vs != "" is
+                let wg: int = typo::axis(vs, "wght", -1)
+                if wg >= 0 is
+                    styles[i].bold = wg >= 600
+                    styles[i].font_weight = wg
+                end
+                let it: int = typo::axis(vs, "ital", -1)
+                let sl: int = typo::axis(vs, "slnt", 0)
+                if it >= 0 is styles[i].italic = it > 0 end
+                if sl != 0 is styles[i].italic = true end
+            end
+            ;; font-variant-position / "sups" / "subs": pomniejszone pismo; przesunięcie tylko na początku zasięgu (nie dubluje się w potomkach)
+            let mut pos: string = string_lower(props::xget(xp, "font-variant-position"))
+            if typo::feat(xp, "sups") > 0 is pos = "super" end
+            if typo::feat(xp, "subs") > 0 is pos = "sub" end
+            if pos == "sub" || pos == "super" is
+                styles[i].font_size = if styles[i].font_size * 7 / 10 < 6 then 6 else styles[i].font_size * 7 / 10
+                let par: int = d.nodes[i].parent
+                let par_pos: string = if par >= 0 && par < array_len(styles0) then string_lower(props::xget(styles0[par].xp, "font-variant-position")) else ""
+                if par_pos != pos && styles[i].valign == "baseline" && styles[i].valign_px == 0 && d.nodes[i].tag != "text" is styles[i].valign = pos end
+            end
+            ;; initial-letter (po ewentualnej korekcie rozmiaru)
+            if props::xhas(xp, "initial-letter") is
+                let before_fs: int = styles[i].font_size
+                styles[i] = apply_initial_letter(d, styles0, styles[i], i, win)
+                if styles[i].font_size != before_fs || styles[i].float_side == "left" is
+                    styles = propagate_font(d, styles, i, styles[i].font_size, styles[i].line_height)
+                end
+            end
+            ;; ruby-position / ruby-align: ustawienia elementu <ruby> i jego adnotacji <rt>
+            if d.nodes[i].tag == "ruby" is
+                let rp: string = string_lower(props::xget(xp, "ruby-position"))
+                if string_starts_with(rp, "under") is styles[i].flex_dir = "column" end
+                let ra: string = string_lower(props::xget(xp, "ruby-align"))
+                if ra == "start" is styles[i].align = "flex-start" end
+            end
+            if d.nodes[i].tag == "rt" && d.nodes[i].parent >= 0 is
+                let prx: string = styles0[d.nodes[i].parent].xp
+                let ra2: string = string_lower(props::xget(prx, "ruby-align"))
+                if ra2 == "start" is
+                    styles[i].text_align = "left"
+                elsif ra2 == "space-between" is
+                    styles[i].align_self = "stretch"
+                    styles[i].xp = props::xset(styles[i].xp, "text-align-last", "justify")
+                    styles[i].text_align = "justify"
+                end
+            end
+            if wm_kind(xp) != "" is
+                let wpar: int = d.nodes[i].parent
+                let same_as_parent: bool = wpar >= 0 && wpar < array_len(styles0) && string_lower(props::xget(styles0[wpar].xp, "writing-mode")) == string_lower(props::xget(xp, "writing-mode"))
+                if !same_as_parent && !upright_mode(xp) is styles[i].has_transform = true end
+                if upright_mode(xp) is styles[i].white_space = "pre-wrap" end
+            end
+            ;; font-size-adjust
+            let spec: [int] = size_adjust_spec(props::xget(xp, "font-size-adjust"))
+            if array_len(spec) == 2 is
+                let r: int = font_ratio(win, styles[i], spec[0])
+                let ns: int = styles[i].font_size * spec[1] / r
+                styles[i].font_size = if ns < 1 then 1 else ns
+            end
+        end
+        i += 1
+    end
+    return styles
+end
+
 pub fn contents_fix_styles(d: dom::Dom, styles0: [style::ComputedStyle]) -> [style::ComputedStyle] is
     let mut styles: [style::ComputedStyle] = styles0
     let mut i: int = 1
@@ -4016,7 +6334,7 @@ fn layout_core(d0: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport_h
                ix: css::InteractionState, scrolls: [int], act: anim::AnimCtx) -> LayoutResult is
     if array_len(d0.nodes) == 0 is return LayoutResult { boxes: [], height: 0 } end
     let d1: dom::Dom = gen_pseudo(d0, sheet, ix)
-    let styles1: [style::ComputedStyle] = contents_fix_styles(d1, compute_styles_a(d1, sheet, ix, act))
+    let styles1: [style::ComputedStyle] = used_font_fixups(d1, contents_fix_styles(d1, compute_styles_a(d1, sheet, ix, act)), win_handle)
     let d: dom::Dom = hoist_contents(d1, styles1)
     let styles: [style::ComputedStyle] = styles1
     let cx: LayoutCtx = LayoutCtx { dom: d, styles: styles, win: win_handle, vw: viewport_w, vh: viewport_h, scrolls: scrolls, floats: [] }
@@ -4094,4 +6412,888 @@ pub fn scroll_into_y(boxes: [LayoutBox], id: int) -> int is
     end
     let y: int = target - root_pad
     return if y < 0 then 0 else y
+end
+
+
+;; ---------- 0.4: scroll-snap-* (oś pionowa), overscroll-behavior-y ----------
+;; Tryb przyciągania w osi Y: "mandatory" | "proximity" | "" (brak). Składnia: none | [x|y|block|inline|both] [mandatory|proximity]?
+pub fn snap_mode_y(st: style::ComputedStyle) -> string is
+    let v: string = string_lower(props::xget(st.xp, "scroll-snap-type"))
+    if v == "" || v == "none" is return "" end
+    let t: [string] = cssval::split_top(v)
+    let axis: string = t[0]
+    if axis != "y" && axis != "block" && axis != "both" is return "" end
+    if array_len(t) >= 2 && t[1] == "mandatory" is return "mandatory" end
+    return "proximity"
+end
+
+;; Pozycja przewinięcia (px), przy której element przyciąga się wg `scroll-snap-align`; -1 gdy brak punktu.
+pub fn snap_point_y(b: LayoutBox, vp_h: int, pad_top: int, pad_bottom: int) -> int is
+    let al: string = string_lower(props::xget(b.st.xp, "scroll-snap-align"))
+    if al == "" || al == "none" is return -1 end
+    let t: [string] = cssval::split_top(al)
+    let blk: string = t[0]
+    let mt: int = len_px_of(props::xget(b.st.xp, "scroll-margin-top"), b.st)
+    let mb: int = len_px_of(props::xget(b.st.xp, "scroll-margin-bottom"), b.st)
+    let mut p: int = -1
+    if blk == "start" is p = b.y - mt - pad_top
+    elsif blk == "end" is p = b.y + b.h + mb + pad_bottom - vp_h
+    elsif blk == "center" is p = b.y + b.h / 2 - vp_h / 2
+    end
+    if p < 0 && blk != "none" is
+        return 0
+    end
+    return p
+end
+
+fn nearest_snap(points: [int], stops: [int], from: int, want: int, mode: string, vp_h: int) -> int is
+    ;; kandydaci tylko „przed” ruchem (w jego kierunku) — dzięki temu pojedynczy tik kółka zawsze posuwa do następnego punktu
+    let mut best: int = -1
+    let mut i: int = 0
+    while i < array_len(points) is
+        let p: int = points[i]
+        i += 1
+        let ahead: bool = (want > from && p > from) || (want < from && p < from) || want == from
+        if !ahead is continue end
+        if best < 0 is
+            best = p
+        else is
+            let d_new: int = if p > want then p - want else want - p
+            let d_old: int = if best > want then best - want else want - best
+            if d_new < d_old is best = p end
+        end
+    end
+    if best < 0 is return want end
+    if mode == "proximity" is
+        let dist: int = if best > want then best - want else want - best
+        if dist > vp_h / 4 is return want end
+    end
+    ;; scroll-snap-stop: always — nie wolno „przeskoczyć” punktu leżącego między startem a celem
+    let mut k: int = 0
+    while k < array_len(stops) is
+        let sp: int = stops[k]
+        k += 1
+        let between: bool = (best > from && sp > from && sp < best) || (best < from && sp < from && sp > best)
+        if between is
+            let dn: int = if sp > from then sp - from else from - sp
+            let db: int = if best > from then best - from else from - best
+            if dn < db is best = sp end
+        end
+    end
+    return best
+end
+
+pub fn snap_stop_of(b: LayoutBox) -> bool is
+    return string_lower(props::xget(b.st.xp, "scroll-snap-stop")) == "always"
+end
+
+;; Przyciąganie przewijania strony: korzeń (node_id 0) nadaje tryb, elementy z `scroll-snap-align` są punktami. Zwraca nową pozycję.
+pub fn snap_page_y(boxes: [LayoutBox], d: dom::Dom, from: int, want: int, vp_h: int, max_pos: int) -> int is
+    let mut mode: string = ""
+    let mut pad_top: int = 0
+    let mut pad_bottom: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        let b: LayoutBox = boxes[i]
+        i += 1
+        let root_like: bool = b.kind == "box" && (b.node_id == 0 || d.nodes[b.node_id].tag == "html" || d.nodes[b.node_id].tag == "body")
+        if root_like && snap_mode_y(b.st) != "" is
+            mode = snap_mode_y(b.st)
+            pad_top = len_px_of(props::xget(b.st.xp, "scroll-padding-top"), b.st)
+            pad_bottom = len_px_of(props::xget(b.st.xp, "scroll-padding-bottom"), b.st)
+            break
+        end
+    end
+    if mode == "" is return want end
+    let mut pts: [int] = []
+    let mut stops: [int] = []
+    i = 0
+    while i < array_len(boxes) is
+        let b2: LayoutBox = boxes[i]
+        i += 1
+        if b2.kind != "box" || b2.node_id == 0 || d.nodes[b2.node_id].tag == "html" is continue end
+        let p: int = snap_point_y(b2, vp_h, pad_top, pad_bottom)
+        if p >= 0 is
+            let pc: int = if p > max_pos then max_pos else p
+            pts = array_push(pts, pc)
+            if snap_stop_of(b2) is stops = array_push(stops, pc) end
+        end
+    end
+    return nearest_snap(pts, stops, from, want, mode, vp_h)
+end
+
+fn is_desc_of(d: dom::Dom, node: int, anc: int) -> bool is
+    let mut cur: int = d.nodes[node].parent
+    let mut guard: int = 0
+    while cur >= 0 && guard < 200 is
+        if cur == anc is return true end
+        cur = d.nodes[cur].parent
+        guard += 1
+    end
+    return false
+end
+
+;; Przyciąganie wewnątrz przewijanego kontenera `cont`. `cur` = przewinięcie, z jakim policzono `boxes` (i od którego startuje ruch); `want` = żądana pozycja. Zwraca nową pozycję.
+pub fn snap_container_y(boxes: [LayoutBox], d: dom::Dom, cont: int, cur: int, want: int, max_pos: int) -> int is
+    let mut cb: LayoutBox = boxes[0]
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == cont && boxes[i].kind == "box" is
+            cb = boxes[i]
+            found = true
+            break
+        end
+        i += 1
+    end
+    if !found is return want end
+    let mode: string = snap_mode_y(cb.st)
+    if mode == "" is return want end
+    let vp_h: int = cb.h - cb.st.bt - cb.st.bb
+    let pad_top: int = len_px_of(props::xget(cb.st.xp, "scroll-padding-top"), cb.st)
+    let pad_bottom: int = len_px_of(props::xget(cb.st.xp, "scroll-padding-bottom"), cb.st)
+    let mut pts: [int] = []
+    let mut stops: [int] = []
+    i = 0
+    while i < array_len(boxes) is
+        let b: LayoutBox = boxes[i]
+        i += 1
+        if b.kind != "box" || b.node_id == cont || b.node_id <= 0 is continue end
+        if !is_desc_of(d, b.node_id, cont) is continue end
+        let mut rb: LayoutBox = b
+        rb.y = b.y - (cb.y + cb.st.bt) + cur
+        let p: int = snap_point_y(rb, vp_h, pad_top, pad_bottom)
+        if p >= 0 is
+            let pc: int = if p > max_pos then max_pos else p
+            pts = array_push(pts, pc)
+            if snap_stop_of(b) is stops = array_push(stops, pc) end
+        end
+    end
+    return nearest_snap(pts, stops, cur, want, mode, vp_h)
+end
+
+;; overscroll-behavior w osi Y: czy przewijanie NIE ma się łańcuchowo przenosić na rodzica (contain | none).
+pub fn overscroll_y_contained(st: style::ComputedStyle) -> bool is
+    let mut v: string = string_lower(props::xget(st.xp, "overscroll-behavior-y"))
+    if v == "" is v = string_lower(props::xget(st.xp, "overscroll-behavior-block")) end
+    if v == "" is
+        let t: [string] = cssval::split_top(string_lower(props::xget(st.xp, "overscroll-behavior")))
+        if array_len(t) >= 2 is v = t[1] elsif array_len(t) == 1 is v = t[0] end
+    end
+    return v == "contain" || v == "none"
+end
+
+pub fn overscroll_of_node(boxes: [LayoutBox], id: int) -> bool is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is return overscroll_y_contained(boxes[i].st) end
+        i += 1
+    end
+    return false
+end
+
+
+;; ---------- 0.4: oś pozioma — scroll-snap (x/inline/both), overscroll-behavior-x, scroll-margin/padding left/right ----------
+pub fn snap_mode_x(st: style::ComputedStyle) -> string is
+    let v: string = string_lower(props::xget(st.xp, "scroll-snap-type"))
+    if v == "" || v == "none" is return "" end
+    let t: [string] = cssval::split_top(v)
+    let axis: string = t[0]
+    if axis != "x" && axis != "inline" && axis != "both" is return "" end
+    if array_len(t) >= 2 && t[1] == "mandatory" is return "mandatory" end
+    return "proximity"
+end
+
+;; Pozycja przewinięcia poziomego, przy której element przyciąga się wg `scroll-snap-align` (druga wartość = oś inline); -1 gdy brak.
+pub fn snap_point_x(b: LayoutBox, vp_w: int, pad_left: int, pad_right: int) -> int is
+    let al: string = string_lower(props::xget(b.st.xp, "scroll-snap-align"))
+    if al == "" || al == "none" is return -1 end
+    let t: [string] = cssval::split_top(al)
+    let inl: string = if array_len(t) >= 2 then t[1] else t[0]
+    let ml: int = len_px_of(props::xget(b.st.xp, "scroll-margin-left"), b.st)
+    let mr: int = len_px_of(props::xget(b.st.xp, "scroll-margin-right"), b.st)
+    let mut p: int = -1
+    if inl == "start" is p = b.x - ml - pad_left
+    elsif inl == "end" is p = b.x + b.w + mr + pad_right - vp_w
+    elsif inl == "center" is p = b.x + b.w / 2 - vp_w / 2
+    end
+    if p < 0 && inl != "none" is return 0 end
+    return p
+end
+
+pub fn snap_container_x(boxes: [LayoutBox], d: dom::Dom, cont: int, cur: int, want: int, max_pos: int) -> int is
+    let mut cb: LayoutBox = boxes[0]
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == cont && boxes[i].kind == "box" is
+            cb = boxes[i]
+            found = true
+            break
+        end
+        i += 1
+    end
+    if !found is return want end
+    let mode: string = snap_mode_x(cb.st)
+    if mode == "" is return want end
+    let vp_w: int = cb.w - cb.st.bl - cb.st.br
+    let pad_l: int = len_px_of(props::xget(cb.st.xp, "scroll-padding-left"), cb.st)
+    let pad_r: int = len_px_of(props::xget(cb.st.xp, "scroll-padding-right"), cb.st)
+    let mut pts: [int] = []
+    let mut stops: [int] = []
+    i = 0
+    while i < array_len(boxes) is
+        let b: LayoutBox = boxes[i]
+        i += 1
+        if b.kind != "box" || b.node_id == cont || b.node_id <= 0 is continue end
+        if !is_desc_of(d, b.node_id, cont) is continue end
+        let mut rb: LayoutBox = b
+        rb.x = b.x - (cb.x + cb.st.bl) + cur
+        let p: int = snap_point_x(rb, vp_w, pad_l, pad_r)
+        if p >= 0 is
+            let pc: int = if p > max_pos then max_pos else p
+            pts = array_push(pts, pc)
+            if snap_stop_of(b) is stops = array_push(stops, pc) end
+        end
+    end
+    return nearest_snap(pts, stops, cur, want, mode, vp_w)
+end
+
+pub fn overscroll_x_contained(st: style::ComputedStyle) -> bool is
+    let mut v: string = string_lower(props::xget(st.xp, "overscroll-behavior-x"))
+    if v == "" is v = string_lower(props::xget(st.xp, "overscroll-behavior-inline")) end
+    if v == "" is
+        let t: [string] = cssval::split_top(string_lower(props::xget(st.xp, "overscroll-behavior")))
+        if array_len(t) >= 1 is v = t[0] end
+    end
+    return v == "contain" || v == "none"
+end
+
+pub fn overscroll_x_of_node(boxes: [LayoutBox], id: int) -> bool is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is return overscroll_x_contained(boxes[i].st) end
+        i += 1
+    end
+    return false
+end
+
+;; Docelowe przewinięcie poziome kontenera `cont`, by element `id` był widoczny pod scroll-margin-left + scroll-padding-left; -1 gdy brak.
+pub fn scroll_into_x(boxes: [LayoutBox], d: dom::Dom, cont: int, id: int) -> int is
+    let mut cb: LayoutBox = boxes[0]
+    let mut tb: LayoutBox = boxes[0]
+    let mut fc: bool = false
+    let mut ft: bool = false
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        let b: LayoutBox = boxes[i]
+        i += 1
+        if b.kind != "box" is continue end
+        if b.node_id == cont && !fc is
+            cb = b
+            fc = true
+        end
+        if b.node_id == id && !ft is
+            tb = b
+            ft = true
+        end
+    end
+    if !fc || !ft is return -1 end
+    let pad_l: int = len_px_of(props::xget(cb.st.xp, "scroll-padding-left"), cb.st)
+    let ml: int = len_px_of(props::xget(tb.st.xp, "scroll-margin-left"), tb.st)
+    let y: int = tb.x - ml - pad_l - (cb.x + cb.st.bl) + cb.scroll_x
+    return if y < 0 then 0 else y
+end
+
+
+;; ====================================================================
+;;  0.4: zaznaczanie tekstu dokumentu (user-select) — czyste funkcje
+;;  „Strumień” = kolejne znaki wszystkich zaznaczalnych boxów tekstowych w kolejności dokumentu.
+;;  Zaznaczenie to przedział [lo, hi) offsetów w strumieniu, odporny na przeładowanie układu.
+;; ====================================================================
+pub fn sel_items(boxes: [LayoutBox]) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        let b: LayoutBox = boxes[i]
+        if b.kind == "text" && b.text != "" && b.st.user_select != "none" && b.st.visible && !b.fixed is out = array_push(out, i) end
+        i += 1
+    end
+    return out
+end
+
+fn sel_nch(boxes: [LayoutBox], idx: int) -> int is
+    return ffi_shim::silver_utf8_len(boxes[idx].text)
+end
+
+pub fn sel_total(boxes: [LayoutBox], items: [int]) -> int is
+    let mut t: int = 0
+    let mut i: int = 0
+    while i < array_len(items) is
+        t += sel_nch(boxes, items[i])
+        i += 1
+    end
+    return t
+end
+
+;; Szerokość pierwszych `nchars` znaków tekstu boxa (win < 0 → oszacowanie jak w układzie).
+pub fn sel_prefix_w(win: int, b: LayoutBox, nchars: int) -> int is
+    if nchars <= 0 is return 0 end
+    let off: int = ffi_shim::silver_utf8_offset(b.text, nchars)
+    let pre: string = string_slice(b.text, 0, off)
+    let mut w: int = 0
+    if win < 0 is
+        w = if b.st.bold then nchars * b.st.font_size * 62 / 100 else nchars * b.st.font_size * 58 / 100
+    else is
+        w = ffi_shim::silver_measure_text_ex(win, pre, b.st.font_size, style_flags(b.st))
+    end
+    return w + b.st.letter_spacing * nchars
+end
+
+;; Liczba znaków boxa, przy której kursor stoi najbliżej poziomej pozycji `dx` (względem lewej krawędzi boxa).
+pub fn sel_char_in_box(win: int, b: LayoutBox, dx: int) -> int is
+    let n: int = ffi_shim::silver_utf8_len(b.text)
+    if dx <= 0 is return 0 end
+    if sel_prefix_w(win, b, n) <= dx is return n end
+    let mut lo: int = 0
+    let mut hi: int = n
+    while lo < hi is
+        let mid: int = (lo + hi + 1) / 2
+        if sel_prefix_w(win, b, mid) <= dx is lo = mid else is hi = mid - 1 end
+    end
+    if lo < n is
+        let w1: int = sel_prefix_w(win, b, lo)
+        let w2: int = sel_prefix_w(win, b, lo + 1)
+        if dx - w1 > w2 - dx is return lo + 1 end
+    end
+    return lo
+end
+
+;; Offset w strumieniu pod punktem (x,y) w układzie dokumentu; -1 gdy brak zaznaczalnego tekstu.
+pub fn sel_offset_at(boxes: [LayoutBox], items: [int], win: int, px: int, py: int) -> int is
+    if array_len(items) == 0 is return -1 end
+    let mut best: int = -1
+    let mut best_d: int = 1000000000
+    let mut base: int = 0
+    let mut best_base: int = 0
+    let mut i: int = 0
+    while i < array_len(items) is
+        let b: LayoutBox = boxes[items[i]]
+        let vd: int = if py < b.y then b.y - py elsif py >= b.y + b.h then py - (b.y + b.h) + 1 else 0
+        let hd: int = if px < b.x then b.x - px elsif px > b.x + b.w then px - (b.x + b.w) else 0
+        let d: int = vd * 4096 + hd
+        if d < best_d is
+            best_d = d
+            best = i
+            best_base = base
+        end
+        base += sel_nch(boxes, items[i])
+        i += 1
+    end
+    let bb: LayoutBox = boxes[items[best]]
+    return best_base + sel_char_in_box(win, bb, px - bb.x)
+end
+
+;; Tekst zaznaczenia [lo, hi): wiersze (zmiana y) oddzielone znakiem nowej linii.
+pub fn sel_text(boxes: [LayoutBox], items: [int], lo: int, hi: int) -> string is
+    if hi <= lo is return "" end
+    let mut out: string = ""
+    let mut base: int = 0
+    let mut last_y: int = -1000000
+    let mut i: int = 0
+    while i < array_len(items) is
+        let b: LayoutBox = boxes[items[i]]
+        let n: int = sel_nch(boxes, items[i])
+        let s: int = if lo > base then lo else base
+        let e: int = if hi < base + n then hi else base + n
+        if e > s is
+            let piece: string = string_slice(b.text, ffi_shim::silver_utf8_offset(b.text, s - base), ffi_shim::silver_utf8_offset(b.text, e - base))
+            if out != "" && b.y != last_y is out = out + "\n" end
+            out = out + piece
+            last_y = b.y
+        end
+        base += n
+        i += 1
+    end
+    return out
+end
+
+;; Prostokąty podświetlenia: płaska lista [x, y, w, h, …] (współrzędne dokumentu).
+pub fn sel_rects(boxes: [LayoutBox], items: [int], win: int, lo: int, hi: int) -> [int] is
+    let mut out: [int] = []
+    if hi <= lo is return out end
+    let mut base: int = 0
+    let mut i: int = 0
+    while i < array_len(items) is
+        let b: LayoutBox = boxes[items[i]]
+        let n: int = sel_nch(boxes, items[i])
+        let s: int = if lo > base then lo else base
+        let e: int = if hi < base + n then hi else base + n
+        if e > s is
+            let x0: int = b.x + sel_prefix_w(win, b, s - base)
+            let x1: int = b.x + sel_prefix_w(win, b, e - base)
+            out = array_push(out, x0)
+            out = array_push(out, b.y)
+            out = array_push(out, if x1 > x0 then x1 - x0 else 1)
+            out = array_push(out, b.h)
+        end
+        base += n
+        i += 1
+    end
+    return out
+end
+
+fn sel_is_word_ch(c: string) -> bool is
+    return c != " " && c != "\t" && c != "\n" && string_find(".,;:!?()[]{}\"'«»„”“", c) < 0
+end
+
+;; Granice słowa wokół offsetu `off` → [lo, hi]; [off, off] gdy poza tekstem.
+pub fn sel_word_at(boxes: [LayoutBox], items: [int], off: int) -> [int] is
+    let mut base: int = 0
+    let mut i: int = 0
+    while i < array_len(items) is
+        let b: LayoutBox = boxes[items[i]]
+        let n: int = sel_nch(boxes, items[i])
+        if off >= base && off <= base + n is
+            let local: int = if off - base >= n then n - 1 else off - base
+            if local < 0 is return [off, off] end
+            let ch_at: string = string_slice(b.text, ffi_shim::silver_utf8_offset(b.text, local), ffi_shim::silver_utf8_offset(b.text, local + 1))
+            let want_word: bool = sel_is_word_ch(ch_at)
+            let mut a: int = local
+            while a > 0 is
+                let c: string = string_slice(b.text, ffi_shim::silver_utf8_offset(b.text, a - 1), ffi_shim::silver_utf8_offset(b.text, a))
+                if sel_is_word_ch(c) != want_word is break end
+                a -= 1
+            end
+            let mut z: int = local + 1
+            while z < n is
+                let c2: string = string_slice(b.text, ffi_shim::silver_utf8_offset(b.text, z), ffi_shim::silver_utf8_offset(b.text, z + 1))
+                if sel_is_word_ch(c2) != want_word is break end
+                z += 1
+            end
+            return [base + a, base + z]
+        end
+        base += n
+        i += 1
+    end
+    return [off, off]
+end
+
+;; Cały wiersz (wszystkie boxy o tym samym y co box pod offsetem) → [lo, hi].
+pub fn sel_line_at(boxes: [LayoutBox], items: [int], off: int) -> [int] is
+    let mut base: int = 0
+    let mut target_y: int = -1000000
+    let mut i: int = 0
+    while i < array_len(items) is
+        let n: int = sel_nch(boxes, items[i])
+        if off >= base && off <= base + n is
+            target_y = boxes[items[i]].y
+            break
+        end
+        base += n
+        i += 1
+    end
+    if target_y == -1000000 is return [off, off] end
+    let mut lo: int = -1
+    let mut hi: int = 0
+    base = 0
+    i = 0
+    while i < array_len(items) is
+        let n2: int = sel_nch(boxes, items[i])
+        if boxes[items[i]].y == target_y is
+            if lo < 0 is lo = base end
+            hi = base + n2
+        end
+        base += n2
+        i += 1
+    end
+    return [if lo < 0 then off else lo, hi]
+end
+
+;; user-select: all — gdy box pod offsetem ma `all`, zaznaczany jest cały tekst jego przodka blokowego; inaczej [off, off].
+pub fn sel_all_scope(boxes: [LayoutBox], items: [int], d: dom::Dom, off: int) -> [int] is
+    let mut base: int = 0
+    let mut hit_node: int = -1
+    let mut i: int = 0
+    while i < array_len(items) is
+        let n: int = sel_nch(boxes, items[i])
+        if off >= base && off <= base + n is
+            if boxes[items[i]].st.user_select != "all" is return [off, off] end
+            hit_node = boxes[items[i]].node_id
+            break
+        end
+        base += n
+        i += 1
+    end
+    if hit_node < 0 is return [off, off] end
+    ;; najbliższy przodek, którego box nie jest inline
+    let mut blk: int = hit_node
+    let mut guard: int = 0
+    while blk > 0 && guard < 64 is
+        let mut disp: string = "inline"
+        let mut k: int = 0
+        while k < array_len(boxes) is
+            if boxes[k].node_id == blk && boxes[k].kind == "box" is
+                disp = boxes[k].st.display
+                break
+            end
+            k += 1
+        end
+        if disp != "inline" is break end
+        blk = d.nodes[blk].parent
+        guard += 1
+    end
+    let mut lo: int = -1
+    let mut hi: int = 0
+    base = 0
+    i = 0
+    while i < array_len(items) is
+        let n2: int = sel_nch(boxes, items[i])
+        let nid: int = boxes[items[i]].node_id
+        if nid == blk || is_desc_of(d, nid, blk) is
+            if lo < 0 is lo = base end
+            hi = base + n2
+        end
+        base += n2
+        i += 1
+    end
+    return [if lo < 0 then off else lo, hi]
+end
+
+
+;; ====================================================================
+;;  0.4: text-emphasis-* — znaczniki nad/pod znakami (kropki, kółka, trójkąty, własny napis)
+;; ====================================================================
+fn emph_kind(v: string) -> string is
+    let t: [string] = cssval::split_top(v)
+    let mut i: int = 0
+    while i < array_len(t) is
+        if t[i] == "dot" || t[i] == "circle" || t[i] == "double-circle" || t[i] == "triangle" || t[i] == "sesame" is return t[i] end
+        i += 1
+    end
+    return ""
+end
+
+;; Znak znacznika z text-emphasis-style ("" gdy none). filled domyślnie; shape domyślnie dot.
+pub fn emphasis_glyph(st: style::ComputedStyle) -> string is
+    let raw: string = string_trim(props::xget(st.xp, "text-emphasis-style"))
+    let v: string = string_lower(raw)
+    if v == "" || v == "none" is return "" end
+    if string_starts_with(raw, "\"") || string_starts_with(raw, "'") is
+        let inner: string = string_slice(raw, 1, string_len(raw) - 1)
+        if inner == "" is return "" end
+        let n: int = ffi_shim::silver_utf8_next(inner, 0)
+        return string_slice(inner, 0, n)
+    end
+    let open: bool = trim_token(v, "open")
+    let mut kind: string = emph_kind(v)
+    if kind == "" is kind = "dot" end
+    if kind == "dot" is
+        if open is return "◦" end
+        return "•"
+    end
+    if kind == "circle" is
+        if open is return "○" end
+        return "●"
+    end
+    if kind == "double-circle" is
+        if open is return "◎" end
+        return "◉"
+    end
+    if kind == "triangle" is
+        if open is return "△" end
+        return "▲"
+    end
+    if open is return "﹆" end
+    return "﹅"
+end
+
+;; Czy pod tym znakiem rysować znacznik (text-emphasis-skip: spaces | punctuation | symbols | narrow; domyślnie spaces punctuation)
+fn emph_skip_char(c: string, skip: string) -> bool is
+    if c == " " || c == "\t" || c == "\n" is return !trim_token(skip, "none") && (skip == "" || trim_token(skip, "spaces") || !(trim_token(skip, "punctuation") || trim_token(skip, "symbols") || trim_token(skip, "narrow"))) end
+    if string_find(".,;:!?…()[]{}\"'«»„“”‘’-–—/\\", c) >= 0 is return (skip == "" || trim_token(skip, "punctuation")) && !trim_token(skip, "none") end
+    return false
+end
+
+;; Pozycje znaczników: płaska lista [x_środka, y_góry, …] w układzie dokumentu. over = nad tekstem, under = pod.
+pub fn emphasis_marks(b: LayoutBox, win: int) -> [int] is
+    let mut out: [int] = []
+    let g: string = emphasis_glyph(b.st)
+    if g == "" || b.text == "" is return out end
+    let skip: string = string_lower(props::xget(b.st.xp, "text-emphasis-skip"))
+    let pos: string = string_lower(props::xget(b.st.xp, "text-emphasis-position"))
+    let under: bool = trim_token(pos, "under")
+    let mh: int = b.st.font_size / 2 * 12 / 10
+    let y: int = if under then b.y + b.h else b.y - mh
+    let n: int = ffi_shim::silver_utf8_len(b.text)
+    let mut i: int = 0
+    while i < n is
+        let o0: int = ffi_shim::silver_utf8_offset(b.text, i)
+        let o1: int = ffi_shim::silver_utf8_offset(b.text, i + 1)
+        let ch: string = string_slice(b.text, o0, o1)
+        if !emph_skip_char(ch, skip) is
+            let x0: int = sel_prefix_w(win, b, i)
+            let x1: int = sel_prefix_w(win, b, i + 1)
+            out = array_push(out, b.x + (x0 + x1) / 2)
+            out = array_push(out, y)
+        end
+        i += 1
+    end
+    return out
+end
+
+
+;; ====================================================================
+;;  0.4: osie czasu animacji sterowane przewijaniem (animation-timeline, animation-range, scroll-timeline-*, view-timeline-*)
+;; ====================================================================
+;; animation-timeline → [rodzaj, źródło, oś, nazwa]; rodzaj: none | scroll | view | named
+pub fn parse_timeline(v0: string) -> [string] is
+    let v: string = string_lower(string_trim(v0))
+    if v == "" || v == "auto" || v == "none" is return ["none", "", "", ""] end
+    if string_starts_with(v, "--") is return ["named", "", "", v] end
+    let open: int = string_find(v, "(")
+    let close: int = string_find(v, ")")
+    if open < 0 || close < open is return ["none", "", "", ""] end
+    let fname: string = string_slice(v, 0, open)
+    let args: [string] = cssval::split_top(string_slice(v, open + 1, close))
+    let mut src: string = "nearest"
+    let mut axis: string = "block"
+    let mut i: int = 0
+    while i < array_len(args) is
+        let a: string = args[i]
+        i += 1
+        if a == "root" || a == "nearest" || a == "self" is src = a
+        elsif a == "block" || a == "inline" || a == "x" || a == "y" is axis = a
+        end
+    end
+    if fname == "scroll" is return ["scroll", src, axis, ""] end
+    if fname == "view" is return ["view", "nearest", axis, ""] end
+    return ["none", "", "", ""]
+end
+
+;; animation-range lub para longhandów animation-range-start / -end
+fn range_value(st: style::ComputedStyle) -> string is
+    let rs: string = string_trim(props::xget(st.xp, "animation-range-start"))
+    let re: string = string_trim(props::xget(st.xp, "animation-range-end"))
+    if rs != "" || re != "" is
+        let a: string = if rs == "" then "normal" else rs
+        let b: string = if re == "" then "normal" else re
+        return a + " " + b
+    end
+    return props::xget(st.xp, "animation-range")
+end
+
+fn is_range_name(t: string) -> bool is
+    return t == "cover" || t == "contain" || t == "entry" || t == "exit" || t == "entry-crossing" || t == "exit-crossing"
+end
+
+fn is_offset_tok(t: string) -> bool is
+    if t == "" is return false end
+    let c: string = string_at(t, 0)
+    return (c >= "0" && c <= "9") || c == "-" || c == "+" || c == "."
+end
+
+;; animation-range ("<start> [<end>]") → [nazwa_start, offset_start, nazwa_koniec, offset_koniec]; puste nazwy = cały zakres osi
+pub fn parse_range(v0: string) -> [string] is
+    let v: string = string_lower(string_trim(v0))
+    if v == "" || v == "normal" is return ["", "0%", "", "100%"] end
+    let t: [string] = cssval::split_top(v)
+    let mut names: [string] = []
+    let mut offs: [string] = []
+    let mut i: int = 0
+    while i < array_len(t) is
+        let tk: string = t[i]
+        i += 1
+        if tk == "normal" is
+            names = array_push(names, "")
+            offs = array_push(offs, "")
+        elsif is_range_name(tk) is
+            names = array_push(names, tk)
+            offs = array_push(offs, "")
+        elsif is_offset_tok(tk) is
+            if array_len(names) > 0 && offs[array_len(offs) - 1] == "" && names[array_len(names) - 1] != "" is
+                offs[array_len(offs) - 1] = tk
+            else is
+                names = array_push(names, "")
+                offs = array_push(offs, tk)
+            end
+        end
+    end
+    if array_len(names) == 0 is return ["", "0%", "", "100%"] end
+    if array_len(names) == 1 is
+        if names[0] != "" && offs[0] == "" is return [names[0], "0%", names[0], "100%"] end
+        return [names[0], if offs[0] == "" then "0%" else offs[0], "", "100%"]
+    end
+    let so: string = if offs[0] == "" then "0%" else offs[0]
+    let eo: string = if offs[1] == "" then "100%" else offs[1]
+    return [names[0], so, names[1], eo]
+end
+
+;; granice nazwanego zakresu widoku [start, koniec] w px wzdłuż „cover” (długość D = S + H)
+pub fn view_range_bounds(name: string, port: int, subj: int) -> [int] is
+    let d: int = port + subj
+    if name == "entry" || name == "entry-crossing" is return [0, subj] end
+    if name == "exit" || name == "exit-crossing" is return [port, d] end
+    if name == "contain" is
+        if subj <= port is return [subj, port] end
+        return [port, subj]
+    end
+    return [0, d]
+end
+
+;; pozycja (px wzdłuż cover) z nazwy i przesunięcia: procent względem długości zakresu nazwanego, długość w px
+pub fn range_point_px(name: string, off: string, port: int, subj: int, em: int) -> int is
+    let b: [int] = view_range_bounds(name, port, subj)
+    let len: int = b[1] - b[0]
+    if string_ends_with(off, "%") is
+        return b[0] + (gfx::parse_x1000(string_slice(off, 0, string_len(off) - 1)) * len + 50000) / 100000
+    end
+    return b[0] + gfx::len_px(off, 0, em)
+end
+
+;; odwzorowanie położenia na osi na czas animacji (ms): clamp((cur − start)/(end − start), 0, 1) · dur
+pub fn range_to_elapsed(cur: int, rs: int, re: int, dur: int) -> int is
+    if re <= rs is
+        if cur >= re is return dur end
+        return 0
+    end
+    if cur <= rs is return 0 end
+    if cur >= re is return dur end
+    return (cur - rs) * dur / (re - rs)
+end
+
+;; Najbliższy przodek będący kontenerem przewijanym (node_id) albo -1 (= okno/strona).
+fn nearest_scroller(boxes: [LayoutBox], d: dom::Dom, nid: int, include_self: bool) -> int is
+    let mut cur: int = if include_self then nid else d.nodes[nid].parent
+    let mut guard: int = 0
+    while cur > 0 && guard < 100 is
+        let mut i: int = 0
+        while i < array_len(boxes) is
+            let b: LayoutBox = boxes[i]
+            i += 1
+            if b.node_id == cur && b.kind == "box" && style::is_scroll_container(b.st) && (b.content_h > b.h - b.st.bt - b.st.bb || b.content_w > b.w - b.st.bl - b.st.br) is return cur end
+        end
+        cur = d.nodes[cur].parent
+        guard += 1
+    end
+    return -1
+end
+
+fn box_of_node(boxes: [LayoutBox], nid: int) -> LayoutBox is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == nid && boxes[i].kind == "box" is return boxes[i] end
+        i += 1
+    end
+    return boxes[0]
+end
+
+;; nazwany element osi czasu (scroll-timeline-name / view-timeline-name); -1 gdy brak
+fn find_named_timeline(boxes: [LayoutBox], name: string, key: string) -> int is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        let b: LayoutBox = boxes[i]
+        i += 1
+        if b.kind == "box" && b.node_id > 0 && string_lower(props::xget(b.st.xp, key)) == name is return b.node_id end
+    end
+    return -1
+end
+
+fn axis_is_vertical(axis: string) -> bool is
+    return axis == "block" || axis == "y" || axis == ""
+end
+
+;; Zakres animacji w ms dla elementu `nid` o stylu `st` na osi czasu sterowanej przewijaniem; -1 gdy brak osi (czas zegarowy).
+;; scroll_y/page_max/vp_w/vp_h opisują stronę; dla kontenerów korzystamy z pól box.scroll_*.
+pub fn timeline_elapsed(boxes: [LayoutBox], d: dom::Dom, nid: int, st: style::ComputedStyle, scroll_y: int, page_max: int, vp_w: int, vp_h: int) -> int is
+    let tl: [string] = parse_timeline(props::xget(st.xp, "animation-timeline"))
+    if tl[0] == "none" is return -1 end
+    let dur: int = st.anim_ms
+    if dur <= 0 is return -1 end
+    let mut kind: string = tl[0]
+    let mut src: string = tl[1]
+    let mut axis: string = tl[2]
+    let mut scroller_node: int = -2
+    let mut subject: int = nid
+    if kind == "named" is
+        ;; oś nazwana: scroll-timeline-name na kontenerze albo view-timeline-name na obiekcie
+        let sn: int = find_named_timeline(boxes, tl[3], "scroll-timeline-name")
+        let vn: int = find_named_timeline(boxes, tl[3], "view-timeline-name")
+        if vn >= 0 is
+            kind = "view"
+            subject = vn
+            let vb: LayoutBox = box_of_node(boxes, vn)
+            axis = string_lower(props::xget(vb.st.xp, "view-timeline-axis"))
+            if axis == "" is axis = "block" end
+        elsif sn >= 0 is
+            kind = "scroll"
+            scroller_node = sn
+            let sb: LayoutBox = box_of_node(boxes, sn)
+            axis = string_lower(props::xget(sb.st.xp, "scroll-timeline-axis"))
+            if axis == "" is axis = "block" end
+        else is
+            return -1
+        end
+    end
+    let vert: bool = axis_is_vertical(axis)
+    if kind == "scroll" is
+        let mut node: int = scroller_node
+        if node == -2 is
+            if src == "root" is node = -1
+            elsif src == "self" is node = nearest_scroller(boxes, d, nid, true)
+            else is node = nearest_scroller(boxes, d, nid, false)
+            end
+        end
+        let mut off: int = 0
+        let mut mx: int = 0
+        if node < 0 is
+            off = if vert then scroll_y else 0
+            mx = if vert then page_max else 0
+        else is
+            let c: LayoutBox = box_of_node(boxes, node)
+            if vert is
+                off = c.scroll_y
+                mx = c.content_h - (c.h - c.st.bt - c.st.bb)
+            else is
+                off = c.scroll_x
+                mx = c.content_w - (c.w - c.st.bl - c.st.br)
+            end
+        end
+        if mx < 1 is return 0 end
+        let r: [string] = parse_range(range_value(st))
+        let rs: int = range_point_px("", r[1], mx, 0, st.font_size)
+        let re: int = range_point_px("", r[3], mx, 0, st.font_size)
+        return range_to_elapsed(off, rs, re, dur)
+    end
+    ;; view(): obiekt względem kontenera przewijanego (najbliższego) albo okna
+    let sc: int = nearest_scroller(boxes, d, subject, false)
+    let sb2: LayoutBox = box_of_node(boxes, subject)
+    let mut port: int = 0
+    let mut subj_start: int = 0
+    let mut subj: int = 0
+    if sc < 0 is
+        port = if vert then vp_h else vp_w
+        subj_start = if vert then sb2.y - scroll_y else sb2.x
+        subj = if vert then sb2.h else sb2.w
+    else is
+        let c2: LayoutBox = box_of_node(boxes, sc)
+        port = if vert then c2.h - c2.st.bt - c2.st.bb else c2.w - c2.st.bl - c2.st.br
+        subj_start = if vert then sb2.y - (c2.y + c2.st.bt) else sb2.x - (c2.x + c2.st.bl)
+        subj = if vert then sb2.h else sb2.w
+    end
+    ;; view-timeline-inset: "<start> [<end>]" (auto = 0)
+    let insv: [string] = cssval::split_top(string_lower(props::xget(sb2.st.xp, "view-timeline-inset")))
+    let mut ins_s: int = 0
+    let mut ins_e: int = 0
+    if array_len(insv) >= 1 && insv[0] != "auto" is ins_s = gfx::len_px(insv[0], port, sb2.st.font_size) end
+    ins_e = ins_s
+    if array_len(insv) >= 2 && insv[1] != "auto" is ins_e = gfx::len_px(insv[1], port, sb2.st.font_size) end
+    let eff: int = port - ins_s - ins_e
+    if eff + subj < 1 is return 0 end
+    ;; położenie wzdłuż cover (px): 0 gdy początek obiektu dotyka końca (przyciętego) okna widoku
+    let cur: int = (port - ins_e) - subj_start
+    let r2: [string] = parse_range(range_value(st))
+    let rs2: int = range_point_px(r2[0], r2[1], eff, subj, st.font_size)
+    let re2: int = range_point_px(r2[2], r2[3], eff, subj, st.font_size)
+    return range_to_elapsed(cur, rs2, re2, dur)
 end
