@@ -1,4 +1,5 @@
 mod css
+mod props
 mod style
 use "std -> conv" from "conv"
 
@@ -101,6 +102,11 @@ end
 
 ;; Interpoluje animowalne pola stylu. `full` = także kolory i opacity (dla @keyframes);
 ;; przejścia kolorów/opacity obsługuje osobny mechanizm w app.h#.
+pub fn allow_discrete(st: style::ComputedStyle) -> bool is
+    let v: string = string_lower(props::xget(st.xp, "transition-behavior"))
+    return string_find(v, "allow-discrete") >= 0
+end
+
 pub fn lerp_style(a: style::ComputedStyle, b: style::ComputedStyle, t: int, full: bool) -> style::ComputedStyle is
     let mut s: style::ComputedStyle = b
     if a.width_mode == "px" && b.width_mode == "px" is s.width = li(a.width, b.width, t) end
@@ -134,6 +140,18 @@ pub fn lerp_style(a: style::ComputedStyle, b: style::ComputedStyle, t: int, full
     s.gap = li(a.gap, b.gap, t)
     s.row_gap = li(a.row_gap, b.row_gap, t)
     s.flex_grow = li(a.flex_grow, b.flex_grow, t)
+    ;; 0.4: transition-behavior: allow-discrete — pola dyskretne (display, visibility) zmieniają się na krańcach przejścia
+    if allow_discrete(b) is
+        if t > 0 && t < 1000 is
+            if a.display == "none" is s.display = b.display
+            elsif b.display == "none" is s.display = a.display end
+            s.visible = a.visible || b.visible
+        end
+        if t <= 0 is
+            s.display = a.display
+            s.visible = a.visible
+        end
+    end
     s.has_transform = a.has_transform || b.has_transform
     s.tr_tx = li(a.tr_tx, b.tr_tx, t)
     s.tr_ty = li(a.tr_ty, b.tr_ty, t)
@@ -187,6 +205,7 @@ pub fn geometry_differs(a: style::ComputedStyle, b: style::ComputedStyle) -> boo
     if a.tr_tx_pct != b.tr_tx_pct || a.tr_ty_pct != b.tr_ty_pct || a.tr_rot != b.tr_rot is return true end
     if a.has_filter != b.has_filter || a.f_gray != b.f_gray || a.f_bright != b.f_bright || a.f_contrast != b.f_contrast is return true end
     if a.f_invert != b.f_invert || a.f_sepia != b.f_sepia is return true end
+    if allow_discrete(b) && (a.display != b.display || a.visible != b.visible) is return true end
     if a.has_shadow != b.has_shadow || a.sh_x != b.sh_x || a.sh_y != b.sh_y || a.sh_blur != b.sh_blur || a.sh_spread != b.sh_spread is return true end
     return false
 end
@@ -201,7 +220,7 @@ pub fn trans_covers_geometry(st: style::ComputedStyle) -> bool is
     while i < array_len(names) is
         let n: string = string_trim(names[i])
         i += 1
-        if n == "all" || n == "transform" || n == "width" || n == "height" || n == "margin" || n == "padding" || n == "top" ||
+        if n == "all" || n == "transform" || (allow_discrete(st) && (n == "display" || n == "visibility")) || n == "width" || n == "height" || n == "margin" || n == "padding" || n == "top" ||
            n == "left" || n == "right" || n == "bottom" || n == "border-radius" || n == "filter" || n == "box-shadow" ||
            n == "font-size" || n == "gap" || n == "letter-spacing" || n == "min-width" || n == "min-height" ||
            string_starts_with(n, "margin-") || string_starts_with(n, "padding-") || string_starts_with(n, "border-") is
@@ -285,6 +304,73 @@ pub fn keyframe_style(sheet: css::Stylesheet, kf: int, base: style::ComputedStyl
     return lerp_style(from_st, to_st, eased, true)
 end
 
+;; ---------- 0.4: animation-composition (replace | add | accumulate) ----------
+pub fn composition_of(st: style::ComputedStyle) -> string is
+    let v: string = string_lower(string_trim(props::xget(st.xp, "animation-composition")))
+    let first: string = if string_find(v, ",") >= 0 then string_trim(string_slice(v, 0, string_find(v, ","))) else v
+    if first == "add" || first == "accumulate" is return first end
+    return "replace"
+end
+
+fn comp_i(base: int, anim: int, changed: bool) -> int is
+    if !changed is return anim end
+    return base + anim
+end
+
+fn comp_ch(a: int, b: int) -> int is
+    let v: int = a + b
+    return if v > 255 then 255 else v
+end
+
+fn comp_color(base: style::Color, anim: style::Color) -> style::Color is
+    return style::Color { r: comp_ch(base.r, anim.r), g: comp_ch(base.g, anim.g), b: comp_ch(base.b, anim.b), a: if base.a > anim.a then base.a else anim.a }
+end
+
+;; Wartość animacji składana z bazową; tylko pola, które klatka kluczowa zmieniła względem bazy. `mode`: add | accumulate.
+;; Różnica add/accumulate dotyczy skali: add = iloczyn, accumulate = suma przyrostów.
+pub fn compose_style(base: style::ComputedStyle, anim: style::ComputedStyle, mode: string) -> style::ComputedStyle is
+    let mut s: style::ComputedStyle = anim
+    if anim.width_mode == "px" && base.width_mode == "px" && anim.width != base.width is s.width = base.width + anim.width end
+    if anim.height_mode == "px" && base.height_mode == "px" && anim.height != base.height is s.height = base.height + anim.height end
+    if anim.mar_top != base.mar_top && !is_auto(anim.mar_top) && !is_auto(base.mar_top) is s.mar_top = base.mar_top + anim.mar_top end
+    if anim.mar_right != base.mar_right && !is_auto(anim.mar_right) && !is_auto(base.mar_right) is s.mar_right = base.mar_right + anim.mar_right end
+    if anim.mar_bottom != base.mar_bottom && !is_auto(anim.mar_bottom) && !is_auto(base.mar_bottom) is s.mar_bottom = base.mar_bottom + anim.mar_bottom end
+    if anim.mar_left != base.mar_left && !is_auto(anim.mar_left) && !is_auto(base.mar_left) is s.mar_left = base.mar_left + anim.mar_left end
+    s.pad_top = comp_i(base.pad_top, anim.pad_top, anim.pad_top != base.pad_top)
+    s.pad_right = comp_i(base.pad_right, anim.pad_right, anim.pad_right != base.pad_right)
+    s.pad_bottom = comp_i(base.pad_bottom, anim.pad_bottom, anim.pad_bottom != base.pad_bottom)
+    s.pad_left = comp_i(base.pad_left, anim.pad_left, anim.pad_left != base.pad_left)
+    if anim.top != base.top && !is_auto(anim.top) && !is_auto(base.top) is s.top = base.top + anim.top end
+    if anim.left != base.left && !is_auto(anim.left) && !is_auto(base.left) is s.left = base.left + anim.left end
+    if anim.right != base.right && !is_auto(anim.right) && !is_auto(base.right) is s.right = base.right + anim.right end
+    if anim.bottom != base.bottom && !is_auto(anim.bottom) && !is_auto(base.bottom) is s.bottom = base.bottom + anim.bottom end
+    s.font_size = comp_i(base.font_size, anim.font_size, anim.font_size != base.font_size)
+    s.letter_spacing = comp_i(base.letter_spacing, anim.letter_spacing, anim.letter_spacing != base.letter_spacing)
+    s.gap = comp_i(base.gap, anim.gap, anim.gap != base.gap)
+    s.row_gap = comp_i(base.row_gap, anim.row_gap, anim.row_gap != base.row_gap)
+    s.tr_tx = comp_i(base.tr_tx, anim.tr_tx, anim.tr_tx != base.tr_tx)
+    s.tr_ty = comp_i(base.tr_ty, anim.tr_ty, anim.tr_ty != base.tr_ty)
+    s.tr_tx_pct = comp_i(base.tr_tx_pct, anim.tr_tx_pct, anim.tr_tx_pct != base.tr_tx_pct)
+    s.tr_ty_pct = comp_i(base.tr_ty_pct, anim.tr_ty_pct, anim.tr_ty_pct != base.tr_ty_pct)
+    s.tr_rot = comp_i(base.tr_rot, anim.tr_rot, anim.tr_rot != base.tr_rot)
+    if anim.tr_sx != base.tr_sx is
+        s.tr_sx = if mode == "add" then base.tr_sx * anim.tr_sx / 1000 else base.tr_sx + anim.tr_sx - 1000
+    end
+    if anim.tr_sy != base.tr_sy is
+        s.tr_sy = if mode == "add" then base.tr_sy * anim.tr_sy / 1000 else base.tr_sy + anim.tr_sy - 1000
+    end
+    if anim.opacity != base.opacity is
+        let o: int = base.opacity + anim.opacity
+        s.opacity = if o > 100 then 100 else o
+    end
+    if anim.color.r != base.color.r || anim.color.g != base.color.g || anim.color.b != base.color.b is s.color = comp_color(base.color, anim.color) end
+    if anim.has_bg && base.has_bg && (anim.background.r != base.background.r || anim.background.g != base.background.g || anim.background.b != base.background.b) is
+        s.background = comp_color(base.background, anim.background)
+    end
+    s.has_transform = anim.has_transform || base.has_transform
+    return s
+end
+
 fn find_start(ctx: AnimCtx, id: int) -> int is
     let mut i: int = 0
     while i + 1 < array_len(ctx.starts) is
@@ -321,7 +407,11 @@ pub fn animate_style(sheet: css::Stylesheet, st0: style::ComputedStyle, parent: 
             let kf: int = css::find_keyframes(sheet, st.anim_name)
             if kf >= 0 is
                 let p: int = anim_progress(st, ctx.now - start)
-                if p >= 0 is st = keyframe_style(sheet, kf, st, parent, p) end
+                if p >= 0 is
+                    let mode: string = composition_of(st)
+                    let kst: style::ComputedStyle = keyframe_style(sheet, kf, st, parent, p)
+                    st = if mode == "replace" then kst else compose_style(st, kst, mode)
+                end
             end
         end
     end
@@ -333,4 +423,17 @@ pub fn anim_running(st: style::ComputedStyle, elapsed: int) -> bool is
     if st.anim_name == "" || st.anim_ms <= 0 || st.anim_paused is return false end
     if st.anim_iter < 0 is return true end
     return elapsed - st.anim_delay < st.anim_ms * st.anim_iter / 1000
+end
+
+;; ---------- 0.4: animation-play-state: paused ----------
+;; Start „efektywny” animacji: dla wstrzymanej (pause_at > 0) czas stoi w miejscu — start przesuwa się razem z zegarem.
+pub fn effective_start(start: int, pause_at: int, now: int) -> int is
+    if pause_at > 0 && now > pause_at is return start + (now - pause_at) end
+    return start
+end
+
+;; Nowy start po wznowieniu (uwzględnia czas spędzony na pauzie).
+pub fn resume_start(start: int, pause_at: int, now: int) -> int is
+    if pause_at > 0 && now > pause_at is return start + (now - pause_at) end
+    return start
 end
