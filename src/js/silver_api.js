@@ -107,7 +107,7 @@
     return invoke('__window', a);
   }
   var silver = {
-    version: '0.3.0',
+    version: '0.4.0',
     invoke: invoke,
     listen: listen,
     once: once,
@@ -842,7 +842,7 @@
   g.innerHeight = 0;
   g.devicePixelRatio = 1;
   g.location = { href: 'silver://app', origin: 'silver://app', pathname: '/', search: '', hash: '', protocol: 'silver:' };
-  g.navigator = { userAgent: 'Silver/0.3.0', platform: 'silver', language: 'pl-PL', onLine: true };
+  g.navigator = { userAgent: 'Silver/0.4.0', platform: 'silver', language: 'pl-PL', onLine: true };
   g.matchMedia = function (q) {
     var dark = /prefers-color-scheme\s*:\s*dark/.test(q) ? winInfo.dark : /prefers-color-scheme\s*:\s*light/.test(q) ? !winInfo.dark : false;
     return { matches: !!dark, media: q, addEventListener: function () { }, removeEventListener: function () { }, addListener: function () { }, removeListener: function () { } };
@@ -1029,7 +1029,8 @@
   def('clientHeight', function () { var t = lrect(this.__r); return t ? Math.max(0, t[4] - t[7] - t[8]) : 0; });
   def('clientLeft', function () { var t = lrect(this.__r); return t ? t[5] : 0; });
   def('clientTop', function () { var t = lrect(this.__r); return t ? t[7] : 0; });
-  def('scrollWidth', function () { return this.clientWidth; });
+  def('scrollWidth', function () { var t = lrect(this.__r); return t ? Math.max(t[10] || 0, Math.max(0, t[3] - t[5] - t[6])) : 0; });
+  def('scrollLeft', function () { var t = lrect(this.__r); return t ? (t[11] || 0) : 0; }, function (v) { v = v | 0; if (v < 0) v = 0; queueOp({ o: 'scrollx', n: this.__r.i, v: v }); });
   def('scrollHeight', function () { var t = lrect(this.__r); return t ? Math.max(t[9] || 0, t[4] - t[7] - t[8]) : 0; });
 
   // ---------- getComputedStyle ----------
@@ -1684,7 +1685,7 @@
     });
   };
   silver.registerSourceMap = function (name, json) { g.__silver_register_map(name, typeof json === 'string' ? json : JSON.stringify(json), '0'); };
-  silver.version = '0.3.0';
-  g.navigator.userAgent = 'Silver/0.3.0';
+  silver.version = '0.4.0';
+  g.navigator.userAgent = 'Silver/0.4.0';
 
 })(globalThis);
