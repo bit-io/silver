@@ -1,0 +1,330 @@
+mod ffi_shim
+mod cssval
+mod props
+
+;; 0.4: typografia na poziomie Unicode — cechy OpenType, które da się wykonać bez własnego shapera HarfBuzz/FreeType.
+;; Funkcje są czyste (napis → napis) i nie wołają shima, więc działają i w testach silnika.
+;; Co jest realne: wyłączanie ligatur (ZWNJ), ułamki (cyfry górne/dolne + U+2044), porządkowe (st/nd/rd/th),
+;; zero przekreślone (U+0337), pełna szerokość (U+FF01…), selektory emoji (U+FE0E/U+FE0F), bidi-override.
+;; Czego nie da się bez shapera: cyfry oldstyle/lining, styleset/swash/character-variant, JIS78/83/90, palety kolorów.
+
+fn is_digit_ch(c: string) -> bool is
+    return c >= "0" && c <= "9"
+end
+
+fn is_alpha_ch(c: string) -> bool is
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+end
+
+fn word_in(v: string, w: string) -> bool is
+    let parts: [string] = string_split(string_lower(string_trim(v)), " ")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] == w is return true end
+        i += 1
+    end
+    return false
+end
+
+;; font-feature-settings: -1 = cecha nie wymieniona, 0 = wyłączona, ≥1 = włączona (wartość)
+pub fn feat(xp: string, tag: string) -> int is
+    let v: string = props::xget(xp, "font-feature-settings")
+    if v == "" || string_lower(v) == "normal" is return -1 end
+    let items: [string] = cssval::split_commas(v)
+    let mut res: int = -1
+    let mut i: int = 0
+    while i < array_len(items) is
+        let it: string = string_trim(items[i])
+        i += 1
+        if string_len(it) < 6 is continue end
+        let q: string = string_at(it, 0)
+        if q != "\"" && q != "'" is continue end
+        let close: int = string_find(string_slice(it, 1, string_len(it)), q)
+        if close < 0 is continue end
+        let name: string = string_slice(it, 1, 1 + close)
+        if name != tag is continue end
+        let rest: string = string_lower(string_trim(string_slice(it, close + 2, string_len(it))))
+        if rest == "" || rest == "on" is
+            res = 1
+        else is
+            if rest == "off" is
+                res = 0
+            else is
+                res = if props::is_int(rest) then str_to_int(rest) else 1
+            end
+        end
+    end
+    return res
+end
+
+;; Wartość font-variant-* zawiera słowo kluczowe.
+fn fv(xp: string, prop: string, kw: string) -> bool is
+    return word_in(props::xget(xp, prop), kw)
+end
+
+;; cecha OpenType włączona? font-feature-settings wygrywa z font-variant-*; `kw`/`tag` opisują ten sam efekt.
+pub fn wants(xp: string, prop: string, kw: string, tag: string) -> bool is
+    let f: int = feat(xp, tag)
+    if f >= 0 is return f > 0 end
+    return fv(xp, prop, kw)
+end
+
+;; ligatury wyłączone: font-variant-ligatures: none | no-common-ligatures albo "liga" 0 / "clig" 0
+pub fn ligatures_off(xp: string) -> bool is
+    let l: int = feat(xp, "liga")
+    let c: int = feat(xp, "clig")
+    if l == 0 || c == 0 is return true end
+    if l > 0 || c > 0 is return false end
+    return fv(xp, "font-variant-ligatures", "none") || fv(xp, "font-variant-ligatures", "no-common-ligatures")
+end
+
+pub fn tabular(xp: string) -> bool is
+    if feat(xp, "tnum") > 0 is return true end
+    if feat(xp, "pnum") > 0 is return false end
+    return fv(xp, "font-variant-numeric", "tabular-nums")
+end
+
+;; 0 = brak, 1 = ukośne, 2 = stos (bez składu piętrowego — oba dają cyfry górne/dolne + ułamkową kreskę)
+pub fn fraction_mode(xp: string) -> int is
+    if feat(xp, "frac") > 0 is return 1 end
+    if fv(xp, "font-variant-numeric", "diagonal-fractions") is return 1 end
+    if fv(xp, "font-variant-numeric", "stacked-fractions") || feat(xp, "afrc") > 0 is return 2 end
+    return 0
+end
+
+pub fn full_width(xp: string) -> bool is
+    return wants(xp, "font-variant-east-asian", "full-width", "fwid")
+end
+
+fn emoji_mode(xp: string) -> int is
+    let v: string = string_lower(props::xget(xp, "font-variant-emoji"))
+    if v == "text" is return 1 end
+    if v == "emoji" is return 2 end
+    return 0
+end
+
+;; font-stretch → procent (50…200); `font-variation-settings: "wdth" N` ma pierwszeństwo, jeśli jest podane.
+pub fn stretch_pct(xp: string) -> int is
+    let vs: string = props::xget(xp, "font-variation-settings")
+    let w: int = axis(vs, "wdth", -1)
+    if w > 0 is return clamp_pct(w) end
+    let v: string = string_lower(string_trim(props::xget(xp, "font-stretch")))
+    if v == "" || v == "normal" is return 100 end
+    if v == "ultra-condensed" is return 50 end
+    if v == "extra-condensed" is return 62 end
+    if v == "condensed" is return 75 end
+    if v == "semi-condensed" is return 87 end
+    if v == "semi-expanded" is return 112 end
+    if v == "expanded" is return 125 end
+    if v == "extra-expanded" is return 150 end
+    if v == "ultra-expanded" is return 200 end
+    let n: int = string_len(v)
+    if n > 1 && string_at(v, n - 1) == "%" is
+        let num: string = string_slice(v, 0, n - 1)
+        let dot: int = string_find(num, ".")
+        let ip: string = if dot >= 0 then string_slice(num, 0, dot) else num
+        if props::is_int(ip) is return clamp_pct(str_to_int(ip)) end
+    end
+    return 100
+end
+
+fn clamp_pct(p: int) -> int is
+    if p < 50 is return 50 end
+    if p > 200 is return 200 end
+    return p
+end
+
+;; Oś zmiennego kroju z `font-variation-settings` ("wght" 700, "wdth" 75, …); `dflt`, gdy nie wymieniona.
+pub fn axis(vs: string, tag: string, dflt: int) -> int is
+    if vs == "" || string_lower(vs) == "normal" is return dflt end
+    let items: [string] = cssval::split_commas(vs)
+    let mut i: int = 0
+    while i < array_len(items) is
+        let it: string = string_trim(items[i])
+        i += 1
+        if string_len(it) < 6 is continue end
+        let q: string = string_at(it, 0)
+        if q != "\"" && q != "'" is continue end
+        let close: int = string_find(string_slice(it, 1, string_len(it)), q)
+        if close < 0 is continue end
+        if string_slice(it, 1, 1 + close) != tag is continue end
+        let rest: string = string_trim(string_slice(it, close + 2, string_len(it)))
+        let neg: bool = string_len(rest) > 0 && string_at(rest, 0) == "-"
+        let body: string = if neg then string_slice(rest, 1, string_len(rest)) else rest
+        let dot: int = string_find(body, ".")
+        let ip: string = if dot >= 0 then string_slice(body, 0, dot) else body
+        if props::is_int(ip) is
+            let n: int = str_to_int(ip)
+            return if neg then 0 - n else n
+        end
+    end
+    return dflt
+end
+
+;; ---------- przekształcenia ----------
+fn sup_digit(d: string) -> string is
+    if d == "0" is return "\u2070" end
+    if d == "1" is return "\u00b9" end
+    if d == "2" is return "\u00b2" end
+    if d == "3" is return "\u00b3" end
+    return char_code_to_str(0x2070 + str_to_int(d))
+end
+
+fn sub_digit(d: string) -> string is
+    return char_code_to_str(0x2080 + str_to_int(d))
+end
+
+fn map_digits(s: string, up: bool) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < string_len(s) is
+        let d: string = string_at(s, i)
+        out = out + (if up then sup_digit(d) else sub_digit(d))
+        i += 1
+    end
+    return out
+end
+
+;; 12/25 → ¹²⁄₂₅
+fn apply_fractions(text: string) -> string is
+    let n: int = string_len(text)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(text, i)
+        if is_digit_ch(c) is
+            let mut j: int = i
+            while j < n && is_digit_ch(string_at(text, j)) is j += 1 end
+            if j + 1 < n && string_at(text, j) == "/" && is_digit_ch(string_at(text, j + 1)) is
+                let mut k: int = j + 1
+                while k < n && is_digit_ch(string_at(text, k)) is k += 1 end
+                out = out + map_digits(string_slice(text, i, j), true) + "\u2044" + map_digits(string_slice(text, j + 1, k), false)
+                i = k
+            else is
+                out = out + string_slice(text, i, j)
+                i = j
+            end
+        else is
+            let nx: int = ffi_shim::silver_utf8_next(text, i)
+            let step: int = if nx <= i then i + 1 else nx
+            out = out + string_slice(text, i, if step > n then n else step)
+            i = step
+        end
+    end
+    return out
+end
+
+fn ord_letter(c: string) -> string is
+    if c == "s" is return "\u02e2" end
+    if c == "t" is return "\u1d57" end
+    if c == "n" is return "\u207f" end
+    if c == "d" is return "\u1d48" end
+    if c == "r" is return "\u02b3" end
+    if c == "h" is return "\u02b0" end
+    return c
+end
+
+;; 1st 2nd 3rd 4th (po cyfrze, przed nie-literą) → przyrostek jako litery górne
+fn apply_ordinals(text: string) -> string is
+    let n: int = string_len(text)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(text, i)
+        out = out + c
+        i += 1
+        if is_digit_ch(c) && i + 1 < n is
+            let suf: string = string_lower(string_slice(text, i, i + 2))
+            let after_ok: bool = i + 2 >= n || !is_alpha_ch(string_at(text, i + 2))
+            if after_ok && (suf == "st" || suf == "nd" || suf == "rd" || suf == "th") is
+                out = out + ord_letter(string_slice(suf, 0, 1)) + ord_letter(string_slice(suf, 1, 2))
+                i += 2
+            end
+        end
+    end
+    return out
+end
+
+fn is_emoji_cp(cp: int) -> bool is
+    return (cp >= 0x1F300 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) || (cp >= 0x1F000 && cp <= 0x1F2FF)
+end
+
+;; Główna funkcja: stosuje wszystkie cechy z `xp` do tekstu (po text-transform).
+pub fn shape(text: string, xp: string) -> string is
+    if xp == "" || text == "" is return text end
+    let lig_off: bool = ligatures_off(xp)
+    let fwid: bool = full_width(xp)
+    let fmode: int = fraction_mode(xp)
+    let zero: bool = wants(xp, "font-variant-numeric", "slashed-zero", "zero")
+    let ordn: bool = wants(xp, "font-variant-numeric", "ordinal", "ordn")
+    let emo: int = emoji_mode(xp)
+    if !lig_off && !fwid && fmode == 0 && !zero && !ordn && emo == 0 is return text end
+    let mut t: string = text
+    if fmode > 0 is t = apply_fractions(t) end
+    if ordn is t = apply_ordinals(t) end
+    let n: int = string_len(t)
+    let mut out: string = ""
+    let mut pos: int = 0
+    while pos < n is
+        let nx: int = ffi_shim::silver_utf8_next(t, pos)
+        let step: int = if nx <= pos then pos + 1 else nx
+        let end_i: int = if step > n then n else step
+        let ch: string = string_slice(t, pos, end_i)
+        pos = step
+        let cp: int = str_to_char_code(ch)
+        if fwid && cp >= 0x21 && cp <= 0x7E is
+            out = out + char_code_to_str(cp - 0x21 + 0xFF01)
+            continue
+        end
+        if fwid && cp == 0x20 is
+            out = out + "\u3000"
+            continue
+        end
+        out = out + ch
+        if zero && ch == "0" is out = out + "\u0337" end
+        if lig_off && ch == "f" && pos < n is
+            let nxt: string = string_at(t, pos)
+            if nxt == "f" || nxt == "i" || nxt == "j" || nxt == "l" || nxt == "t" is out = out + "\u200c" end
+        end
+        if emo > 0 && is_emoji_cp(cp) is
+            let following: int = if pos < n then str_to_char_code(string_slice(t, pos, ffi_shim::silver_utf8_next(t, pos))) else 0
+            if following != 0xFE0E && following != 0xFE0F is
+                out = out + (if emo == 1 then "\ufe0e" else "\ufe0f")
+            end
+        end
+    end
+    return out
+end
+
+;; unicode-bidi: bidi-override | isolate-override przy direction: rtl — każde słowo odwrócone znak po znaku
+;; (kolejność słów w wierszu odwraca już układ RTL).
+pub fn bidi_override_on(xp: string, direction: string) -> bool is
+    if direction != "rtl" is return false end
+    let v: string = string_lower(props::xget(xp, "unicode-bidi"))
+    return word_in(v, "bidi-override") || word_in(v, "isolate-override")
+end
+
+pub fn reverse_chars(s: string) -> string is
+    let n: int = string_len(s)
+    let mut out: string = ""
+    let mut pos: int = 0
+    while pos < n is
+        let nx: int = ffi_shim::silver_utf8_next(s, pos)
+        let step: int = if nx <= pos then pos + 1 else nx
+        let end_i: int = if step > n then n else step
+        out = string_slice(s, pos, end_i) + out
+        pos = step
+    end
+    return out
+end
+
+pub fn reverse_words(text: string) -> string is
+    let words: [string] = string_split(text, " ")
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(words) is
+        out = (if i == 0 then "" else out + " ") + reverse_chars(words[i])
+        i += 1
+    end
+    return out
+end
