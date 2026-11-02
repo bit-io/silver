@@ -55,6 +55,20 @@ extern static [c, "silvershim"] is
     fn silver_layer_begin(h: int, x: int, y: int, w: int, rh: int) -> bool
     fn silver_layer_end(h: int, a: int, b: int, c: int, d: int, e: int, f: int, ox: int, oy: int, alpha: int) -> bool
 
+    ;; 0.4: efekty warstw na pikselach (spec: "blur:4;sat:150;hue:30;shadow:dx,dy,s,r,g,b,a;mask;blend:multiply"),
+    ;; maski, kafelkowanie obrazków/gradientów, odczyt piksela, zapis PNG
+    fn silver_layer_end_fx(h: int, a: int, b: int, c: int, d: int, e: int, f: int, ox: int, oy: int, alpha: int, spec: string) -> bool
+    fn silver_image_alpha_band(h: int, path: string, bands: int, band: int, thresh_pm: int) -> int   ;; 0.4: pas alfa obrazu: l*2048+r (promile) lub -1
+    fn silver_image_xform(h: int, xf: int, vx: int, vy: int, vw: int, vh: int) -> bool      ;; 0.4: orientacja/kadr następnego rysowania obrazu
+    fn silver_layer_end_3d(h: int, mat: string, dy: int, alpha: int, hide_back: int) -> bool    ;; 0.4: warstwa przez macierz 4×4
+    fn silver_layer_capture_mask(h: int, mode: int, op: int) -> bool
+    fn silver_mask_clear() -> bool
+    fn silver_draw_tiled(h: int, kind: int, src: string, cx: int, cy: int, cw: int, ch: int, tx: int, ty: int, tw: int, th: int, stepx: int, stepy: int, repx: int, repy: int, alpha: int) -> bool
+    fn silver_draw_part(h: int, kind: int, src: string, nat_w: int, nat_h: int, alpha: int, piece: string) -> bool
+    fn silver_draw_svg(h: int, markup: string, x: int, y: int, w: int, hh: int, alpha: int) -> bool
+    fn silver_pixel(h: int, x: int, y: int) -> int
+    fn silver_save_png(h: int, path: string) -> bool
+
     ;; schowek, kursor, powiadomienia, motyw
     fn silver_clipboard_get() -> string
     fn silver_clipboard_set(text: string) -> bool
@@ -80,6 +94,7 @@ extern static [c, "silvershim"] is
     fn silver_draw_text_ex(h: int, x: int, y: int, text: string, r: int, g: int, b: int, a: int, size: int, style: int) -> int
     fn silver_measure_text(h: int, text: string) -> int
     fn silver_measure_text_ex(h: int, text: string, size: int, style: int) -> int
+    fn silver_font_ratio(h: int, size: int, style: int, kind: int) -> int      ;; 0.4: proporcje kroju w promilach (0 x-height, 1 cap, 2 ch, 3 ic)
     fn silver_font_height(h: int, size: int) -> int
     fn silver_font_register(h: int, key: int, path: string, bold: int, italic: int) -> int
     fn silver_text_fit(h: int, text: string, size: int, style: int, max_w: int) -> int
