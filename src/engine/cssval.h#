@@ -1,3 +1,4 @@
+mod ffi_shim
 use "std -> conv" from "conv"
 
 pub struct Color is
@@ -511,18 +512,26 @@ pub fn split_top(val: string) -> [string] is
     let mut out: [string] = []
     let mut depth: int = 0
     let mut cur: string = ""
+    let mut quote: string = ""
     let mut i: int = 0
     while i < n is
-        let c: string = string_slice(val, i, i + 1)
-        if c == "(" is depth += 1 end
-        if c == ")" is depth -= 1 end
-        if (c == " " || c == "\t" || c == "\n") && depth <= 0 is
-            if cur != "" is out = array_push(out, cur) end
-            cur = ""
-        else is
+        let nx: int = ffi_shim::silver_utf8_next(val, i)
+        let c: string = string_slice(val, i, nx)
+        if quote != "" is
+            if c == quote is quote = "" end
             cur = cur + c
+        else is
+            if c == "\"" || c == "'" is quote = c end
+            if c == "(" is depth += 1 end
+            if c == ")" is depth -= 1 end
+            if (c == " " || c == "\t" || c == "\n") && depth <= 0 && quote == "" is
+                if cur != "" is out = array_push(out, cur) end
+                cur = ""
+            else is
+                cur = cur + c
+            end
         end
-        i += 1
+        i = nx
     end
     if cur != "" is out = array_push(out, cur) end
     return out
@@ -534,19 +543,27 @@ pub fn split_commas(val: string) -> [string] is
     let mut out: [string] = []
     let mut depth: int = 0
     let mut cur: string = ""
+    let mut quote: string = ""
     let mut i: int = 0
     while i < n is
-        let c: string = string_slice(val, i, i + 1)
-        if c == "(" is depth += 1 end
-        if c == ")" is depth -= 1 end
-        if c == "," && depth <= 0 is
-            out = array_push(out, string_trim(cur))
-            cur = ""
-        else is
+        let nx: int = ffi_shim::silver_utf8_next(val, i)
+        let c: string = string_slice(val, i, nx)
+        if quote != "" is
+            if c == quote is quote = "" end
             cur = cur + c
+        else is
+            if c == "\"" || c == "'" is quote = c end
+            if c == "(" is depth += 1 end
+            if c == ")" is depth -= 1 end
+            if c == "," && depth <= 0 && quote == "" is
+                if true is out = array_push(out, string_trim(cur)) end
+                cur = ""
+            else is
+                cur = cur + c
+            end
         end
-        i += 1
+        i = nx
     end
-    if string_trim(cur) != "" is out = array_push(out, string_trim(cur)) end
+    if true is out = array_push(out, string_trim(cur)) end
     return out
 end
