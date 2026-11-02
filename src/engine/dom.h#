@@ -191,6 +191,12 @@ pub fn blank_node(id: int, parent: int, tag: string) -> DomNode is
 end
 
 ;; Dodaje węzeł na koniec tablicy i podłącza go jako ostatnie dziecko `parent`.
+;; Element SVG <text> koliduje z wewnętrznym znacznikiem węzłów tekstowych ("text") — zapisujemy go jako "svg-text".
+pub fn norm_tag(t: string) -> string is
+    if t == "text" is return "svg-text" end
+    return t
+end
+
 pub fn new_node(dom: Dom, parent: int, tag: string) -> Dom is
     let node: DomNode = blank_node(array_len(dom.nodes), parent, tag)
     let mut d: Dom = Dom {
@@ -485,7 +491,7 @@ pub fn parse(html: string) -> Dom is
             if next == "/" is
                 let e: int = find_from(html, ">", p)
                 let name_end: int = if e < 0 then n else e
-                let tag: string = string_lower(string_trim(string_slice(html, p + 2, name_end)))
+                let tag: string = norm_tag(string_lower(string_trim(string_slice(html, p + 2, name_end))))
                 let idx: int = stack_index_of(stack, dom, tag)
                 if idx > 0 is
                     stack = truncate_stack(stack, idx)
@@ -506,7 +512,7 @@ pub fn parse(html: string) -> Dom is
 
             let mut q: int = p + 1
             while q < n && is_name_char(string_at(html, q)) is q += 1 end
-            let tag: string = string_lower(string_slice(html, p + 1, q))
+            let tag: string = norm_tag(string_lower(string_slice(html, p + 1, q)))
             stack = implied_close(stack, dom, tag)
             let parent: int = stack[array_len(stack) - 1]
             let had_prev: bool = array_len(dom.nodes[parent].children) > 0
@@ -775,7 +781,7 @@ end
 
 ;; Tworzy odłączony element (parent = -1); jego id = array_len(nodes) sprzed wywołania.
 pub fn create_element(dom: Dom, tag: string) -> Dom is
-    let node: DomNode = blank_node(array_len(dom.nodes), -1, string_lower(tag))
+    let node: DomNode = blank_node(array_len(dom.nodes), -1, norm_tag(string_lower(tag)))
     let mut d: Dom = dom
     d.nodes = array_push(d.nodes, node)
     d.nodes[node.id].removed = true
