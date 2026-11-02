@@ -1,0 +1,1097 @@
+mod dom
+mod cssval
+mod props
+mod style
+mod gfx
+
+;; ====================================================================
+;;  Silver 0.4 — SVG w HTML: rozmiar elementu <svg> i serializacja poddrzewa do znacznika SVG
+;;  rysowanego przez natywny rasteryzator (NanoSVG, silver_draw_svg).
+;;
+;;  Serializer przenosi do atrybutów prezentacyjnych to, co wynika z arkusza CSS (fill, stroke*, stop-*, opacity,
+;;  display, visibility, a także geometryczne cx/cy/r/rx/ry/x/y/d), przywraca wielkość liter nazw (parser DOM zapisuje
+;;  małymi), rozwija <use>, obsługuje paint-order i vector-effect oraz przelicza ułamki obwiedni gradientów na procenty.
+;; ====================================================================
+
+pub fn is_svg_tag(tag: string) -> bool is
+    return tag == "svg"
+end
+
+fn camel_tag(t: string) -> string is
+    if t == "lineargradient" is return "linearGradient" end
+    if t == "radialgradient" is return "radialGradient" end
+    if t == "clippath" is return "clipPath" end
+    if t == "textpath" is return "textPath" end
+    if t == "foreignobject" is return "foreignObject" end
+    return t
+end
+
+fn camel_attr(a: string) -> string is
+    if a == "viewbox" is return "viewBox" end
+    if a == "preserveaspectratio" is return "preserveAspectRatio" end
+    if a == "gradientunits" is return "gradientUnits" end
+    if a == "gradienttransform" is return "gradientTransform" end
+    if a == "spreadmethod" is return "spreadMethod" end
+    if a == "patternunits" is return "patternUnits" end
+    if a == "patterntransform" is return "patternTransform" end
+    if a == "clippathunits" is return "clipPathUnits" end
+    if a == "refx" is return "refX" end
+    if a == "refy" is return "refY" end
+    if a == "markerwidth" is return "markerWidth" end
+    if a == "markerheight" is return "markerHeight" end
+    if a == "markerunits" is return "markerUnits" end
+    return a
+end
+
+fn esc_attr(v: string) -> string is
+    let mut s: string = string_replace(v, "&", "&amp;")
+    s = string_replace(s, "\"", "&quot;")
+    s = string_replace(s, "<", "&lt;")
+    return s
+end
+
+;; liczba (px) z atrybutu width/height; -1 gdy brak, procent albo nieliczbowe
+fn attr_px(v0: string) -> int is
+    let v: string = string_trim(v0)
+    if v == "" || string_ends_with(v, "%") is return -1 end
+    let nl: int = gfx_num_len(v)
+    if nl == 0 is return -1 end
+    return (gfx::parse_x1000(string_slice(v, 0, nl)) + 500) / 1000
+end
+
+fn gfx_num_len(tok: string) -> int is
+    let mut i: int = 0
+    let n: int = string_len(tok)
+    if i < n && (string_at(tok, i) == "-" || string_at(tok, i) == "+") is i += 1 end
+    while i < n && ((string_at(tok, i) >= "0" && string_at(tok, i) <= "9") || string_at(tok, i) == ".") is i += 1 end
+    return i
+end
+
+;; viewBox → [minx, miny, w, h] x1000; [] gdy brak/niepoprawny
+pub fn view_box(n: dom::DomNode) -> [int] is
+    let v: string = string_trim(string_replace(dom::get_attr(n, "viewbox"), ",", " "))
+    if v == "" is return [] end
+    let t: [string] = cssval::split_top(v)
+    if array_len(t) < 4 is return [] end
+    let w: int = gfx::parse_x1000(t[2])
+    let h: int = gfx::parse_x1000(t[3])
+    if w <= 0 || h <= 0 is return [] end
+    return [gfx::parse_x1000(t[0]), gfx::parse_x1000(t[1]), w, h]
+end
+
+;; Rozmiar naturalny <svg> [w, h] w px: atrybuty width/height, uzupełnione proporcją viewBox, domyślnie 300×150.
+pub fn natural_size(n: dom::DomNode) -> [int] is
+    let aw: int = attr_px(dom::get_attr(n, "width"))
+    let ah: int = attr_px(dom::get_attr(n, "height"))
+    let vb: [int] = view_box(n)
+    if aw > 0 && ah > 0 is return [aw, ah] end
+    if array_len(vb) == 4 is
+        if aw > 0 is return [aw, (aw * vb[3] + vb[2] / 2) / vb[2]] end
+        if ah > 0 is return [(ah * vb[2] + vb[3] / 2) / vb[3], ah] end
+        let rw: int = (vb[2] + 500) / 1000
+        let rh: int = (vb[3] + 500) / 1000
+        if rw >= 1 && rh >= 1 is
+            ;; bez wymiarów: szerokość domyślna 300 px, wysokość z proporcji
+            return [300, (300 * vb[3] + vb[2] / 2) / vb[2]]
+        end
+    end
+    return [if aw > 0 then aw else 300, if ah > 0 then ah else 150]
+end
+
+fn rgb_of(c: style::Color) -> string is
+    return "rgb(" + to_string(c.r) + "," + to_string(c.g) + "," + to_string(c.b) + ")"
+end
+
+fn resolve_current(v: string, st: style::ComputedStyle) -> string is
+    if string_find(string_lower(v), "currentcolor") < 0 is return v end
+    let mut out: string = v
+    out = string_replace(out, "currentColor", rgb_of(st.color))
+    out = string_replace(out, "currentcolor", rgb_of(st.color))
+    out = string_replace(out, "CURRENTCOLOR", rgb_of(st.color))
+    return out
+end
+
+;; wartość z `d: path("…")` → samo "…"
+fn path_data(v: string) -> string is
+    let t: string = string_trim(v)
+    let l: string = string_lower(t)
+    if string_starts_with(l, "path(") && string_ends_with(t, ")") is
+        let mut inner: string = string_trim(string_slice(t, 5, string_len(t) - 1))
+        if string_len(inner) >= 2 && (string_starts_with(inner, "\"") || string_starts_with(inner, "'")) is
+            inner = string_slice(inner, 1, string_len(inner) - 1)
+        end
+        return inner
+    end
+    return ""
+end
+
+fn add_decl(acc: string, name: string, val: string) -> string is
+    if val == "" is return acc end
+    return acc + name + ":" + val + ";"
+end
+
+;; Deklaracje prezentacyjne z kaskady CSS (xp) do atrybutu style.
+fn presentation_style(st: style::ComputedStyle, scale1000: int, vec_fix: bool) -> string is
+    let xp: string = st.xp
+    let mut s: string = ""
+    s = add_decl(s, "fill", resolve_current(props::xget(xp, "fill"), st))
+    s = add_decl(s, "fill-opacity", props::xget(xp, "fill-opacity"))
+    s = add_decl(s, "fill-rule", props::xget(xp, "fill-rule"))
+    s = add_decl(s, "stroke", resolve_current(props::xget(xp, "stroke"), st))
+    s = add_decl(s, "stroke-opacity", props::xget(xp, "stroke-opacity"))
+    s = add_decl(s, "stroke-linecap", props::xget(xp, "stroke-linecap"))
+    s = add_decl(s, "stroke-linejoin", props::xget(xp, "stroke-linejoin"))
+    s = add_decl(s, "stroke-miterlimit", props::xget(xp, "stroke-miterlimit"))
+    s = add_decl(s, "stroke-dasharray", props::xget(xp, "stroke-dasharray"))
+    s = add_decl(s, "stroke-dashoffset", props::xget(xp, "stroke-dashoffset"))
+    let sw: string = props::xget(xp, "stroke-width")
+    if sw != "" is
+        if vec_fix && scale1000 > 0 && attr_px(sw) >= 0 is
+            s = add_decl(s, "stroke-width", gfx::fmt_x1000(gfx::parse_x1000(sw) * 1000 / scale1000))
+        else is
+            s = add_decl(s, "stroke-width", sw)
+        end
+    end
+    s = add_decl(s, "stop-color", resolve_current(props::xget(xp, "stop-color"), st))
+    s = add_decl(s, "stop-opacity", props::xget(xp, "stop-opacity"))
+    if st.opacity < 100 is s = add_decl(s, "opacity", gfx::fmt_x1000(st.opacity * 10)) end
+    if !st.visible is s = add_decl(s, "visibility", "hidden") end
+    return s
+end
+
+;; geometria z CSS (cx, cy, r, rx, ry, x, y, d) jako dodatkowe atrybuty
+fn geometry_attrs(st: style::ComputedStyle) -> string is
+    let xp: string = st.xp
+    let mut s: string = ""
+    let names: [string] = ["cx", "cy", "r", "rx", "ry", "x", "y"]
+    let mut i: int = 0
+    while i < array_len(names) is
+        let v: string = props::xget(xp, names[i])
+        if v != "" && v != "auto" is
+            s = s + " " + names[i] + "=\"" + esc_attr(v) + "\""
+        end
+        i += 1
+    end
+    let d: string = path_data(props::xget(xp, "d"))
+    if d != "" is s = s + " d=\"" + esc_attr(d) + "\"" end
+    return s
+end
+
+fn attrs_of(n: dom::DomNode, tag: string, extra_style: string) -> string is
+    let mut out: string = ""
+    let names: [string] = dom::extra_attr_names(n)
+    let bbox: bool = tag == "lineargradient" || tag == "radialgradient"
+    let units: string = string_lower(dom::get_attr(n, "gradientunits"))
+    let frac: bool = bbox && (units == "" || units == "objectboundingbox")
+    let mut i: int = 0
+    let mut orig_style: string = n.attr_style
+    while i < array_len(names) is
+        let a: string = names[i]
+        i += 1
+        if a == "style" || a == "class" || a == "onclick" is continue end
+        let mut v: string = dom::get_attr(n, a)
+        if frac && (a == "x1" || a == "y1" || a == "x2" || a == "y2" || a == "cx" || a == "cy" || a == "r" || a == "fx" || a == "fy") && gfx_num_len(v) == string_len(v) && v != "" is
+            v = gfx::fmt_x1000(gfx::parse_x1000(v) * 100) + "%"
+        end
+        let an: string = if a == "href" then "xlink:href" else camel_attr(a)
+        out = out + " " + an + "=\"" + esc_attr(v) + "\""
+    end
+    if n.attr_href != "" && string_find(out, "xlink:href") < 0 is
+        out = out + " xlink:href=\"" + esc_attr(n.attr_href) + "\""
+    end
+    if n.attr_id != "" is out = out + " id=\"" + esc_attr(n.attr_id) + "\"" end
+    let st_all: string = extra_style + orig_style
+    if st_all != "" is out = out + " style=\"" + esc_attr(st_all) + "\"" end
+    return out
+end
+
+fn is_skipped(tag: string) -> bool is
+    return tag == "title" || tag == "desc" || tag == "metadata" || tag == "script" || tag == "style" || tag == "text" || tag == "tspan" ||
+           tag == "textpath" || tag == "foreignobject" || tag == "marker" || tag == "symbol" || tag == "svg-text"
+end
+
+fn find_by_attr_id(d: dom::Dom, id: string) -> int is
+    let mut i: int = 0
+    while i < array_len(d.nodes) is
+        if d.nodes[i].attr_id == id && !d.nodes[i].removed is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn num_attr_or0(n: dom::DomNode, name: string) -> string is
+    let v: string = dom::get_attr(n, name)
+    if v == "" is return "0" end
+    return v
+end
+
+fn node_markup(d: dom::Dom, styles: [style::ComputedStyle], id: int, depth: int, scale1000: int) -> string is
+    if depth > 24 is return "" end
+    let n: dom::DomNode = d.nodes[id]
+    if n.removed || n.tag == "text" is return "" end
+    if is_skipped(n.tag) is return "" end
+    let st: style::ComputedStyle = styles[id]
+    let is_defs: bool = n.tag == "defs"
+    if !is_defs && st.display == "none" is return "" end
+    let tag: string = camel_tag(n.tag)
+    ;; <use>: rozwinięcie do <g transform> + kopia wskazanego elementu
+    if n.tag == "use" is
+        let href: string = if n.attr_href != "" then n.attr_href else dom::get_attr(n, "xlink:href")
+        if !string_starts_with(href, "#") is return "" end
+        let tid: int = find_by_attr_id(d, string_slice(href, 1, string_len(href)))
+        if tid < 0 || tid == id is return "" end
+        let ux: string = num_attr_or0(n, "x")
+        let uy: string = num_attr_or0(n, "y")
+        let own: string = presentation_style(st, scale1000, false)
+        let inner: string = node_markup(d, styles, tid, depth + 1, scale1000)
+        return "<g transform=\"translate(" + ux + "," + uy + ")\" style=\"" + esc_attr(own) + "\">" + inner + "</g>"
+    end
+    let vec_fix: bool = string_lower(props::xget(st.xp, "vector-effect")) == "non-scaling-stroke"
+    let pres: string = presentation_style(st, scale1000, vec_fix)
+    let geo: string = geometry_attrs(st)
+    let mut inner: string = ""
+    let mut ci: int = 0
+    while ci < array_len(n.children) is
+        inner = inner + node_markup(d, styles, n.children[ci], depth + 1, scale1000)
+        ci += 1
+    end
+    let open_attrs: string = attrs_of(n, n.tag, pres) + geo
+    let whole: string = "<" + tag + open_attrs + ">" + inner + "</" + tag + ">"
+    ;; paint-order: stroke … → najpierw obrys (bez wypełnienia), potem wypełnienie (bez obrysu)
+    let po: [string] = cssval::split_top(string_lower(props::xget(st.xp, "paint-order")))
+    let shapes: bool = n.tag == "path" || n.tag == "rect" || n.tag == "circle" || n.tag == "ellipse" || n.tag == "line" || n.tag == "polyline" || n.tag == "polygon"
+    let marks: string = if n.tag == "path" || n.tag == "line" || n.tag == "polyline" || n.tag == "polygon" then markers_markup(d, styles, id, st, depth, scale1000) else ""
+    if shapes && array_len(po) > 0 && po[0] == "stroke" is
+        let a1: string = attrs_of(n, n.tag, pres + "fill:none;") + geo
+        let a2: string = attrs_of(n, n.tag, pres + "stroke:none;") + geo
+        return "<" + tag + a1 + "></" + tag + ">" + "<" + tag + a2 + "></" + tag + ">" + marks
+    end
+    return whole + marks
+end
+
+;; Markery elementu (path/line/polyline/polygon) jako grupy z macierzami — rysowane nad kształtem.
+fn markers_markup(d: dom::Dom, styles: [style::ComputedStyle], id: int, st: style::ComputedStyle, depth: int, scale1000: int) -> string is
+    let n: dom::DomNode = d.nodes[id]
+    let all: string = props::xget(st.xp, "marker")
+    let ms: string = marker_ref(if props::xget(st.xp, "marker-start") != "" then props::xget(st.xp, "marker-start") else all)
+    let mm: string = marker_ref(if props::xget(st.xp, "marker-mid") != "" then props::xget(st.xp, "marker-mid") else all)
+    let me: string = marker_ref(if props::xget(st.xp, "marker-end") != "" then props::xget(st.xp, "marker-end") else all)
+    if ms == "" && mm == "" && me == "" is return "" end
+    let mut v: [int] = []
+    if n.tag == "path" is
+        let cd: string = path_data(props::xget(st.xp, "d"))
+        v = path_vertices(if cd != "" then cd else dom::get_attr(n, "d"))
+    elsif n.tag == "line" is
+        v = points_vertices(num_attr_or0(n, "x1") + " " + num_attr_or0(n, "y1") + " " + num_attr_or0(n, "x2") + " " + num_attr_or0(n, "y2"), false)
+    else is
+        v = points_vertices(dom::get_attr(n, "points"), n.tag == "polygon")
+    end
+    let cnt: int = array_len(v) / 6
+    if cnt == 0 is return "" end
+    let mut swv: int = 1000
+    let swp: string = props::xget(st.xp, "stroke-width")
+    if swp != "" is swv = gfx::parse_x1000(swp) end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < cnt is
+        let b: int = i * 6
+        let mut ref: string = ""
+        let mut ux: int = v[b + 4]
+        let mut uy: int = v[b + 5]
+        let mut start: bool = false
+        if i == 0 is
+            ref = ms
+            start = true
+        elsif i == cnt - 1 is
+            ref = me
+            ux = v[b + 2]
+            uy = v[b + 3]
+        else is
+            ref = mm
+            let bis: [int] = unit2(v[b + 2] + v[b + 4], v[b + 3] + v[b + 5])
+            ux = bis[0]
+            uy = bis[1]
+        end
+        if ref != "" is
+            let mid: int = find_by_attr_id(d, ref)
+            if mid >= 0 && d.nodes[mid].tag == "marker" is
+                out = out + marker_instance(d, styles, mid, v[b], v[b + 1], ux, uy, swv, !start, depth, scale1000)
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+;; Pełny znacznik SVG dla elementu `root` o rozmiarze końcowym w×h (px).
+pub fn markup(d: dom::Dom, styles: [style::ComputedStyle], root: int, w: int, h: int) -> string is
+    let n: dom::DomNode = d.nodes[root]
+    let vb: [int] = view_box(n)
+    let nat: [int] = natural_size(n)
+    let mut scale1000: int = 1000
+    if array_len(vb) == 4 && vb[2] > 0 is scale1000 = w * 1000 * 1000 / vb[2] end
+    let mut inner: string = ""
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        inner = inner + node_markup(d, styles, n.children[i], 1, scale1000)
+        i += 1
+    end
+    ;; viewBox: własny albo z atrybutów width/height, by zawartość skalowała się do rozmiaru CSS
+    let mut vbs: string = ""
+    if array_len(vb) == 4 is
+        vbs = gfx::fmt_x1000(vb[0]) + " " + gfx::fmt_x1000(vb[1]) + " " + gfx::fmt_x1000(vb[2]) + " " + gfx::fmt_x1000(vb[3])
+    else is
+        vbs = "0 0 " + to_string(nat[0]) + " " + to_string(nat[1])
+    end
+    let par: string = dom::get_attr(n, "preserveaspectratio")
+    let par_attr: string = if par != "" then " preserveAspectRatio=\"" + esc_attr(par) + "\"" else ""
+    let sr: string = string_lower(props::xget(styles[root].xp, "shape-rendering"))
+    let sr_attr: string = if sr == "crispedges" || sr == "optimizespeed" then " data-sr=\"" + sr + "\"" else ""
+    return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + to_string(w) + "\" height=\"" + to_string(h) + "\" viewBox=\"" + vbs + "\"" + par_attr + sr_attr + ">" + inner + "</svg>"
+end
+
+
+;; ====================================================================
+;;  <text> w SVG — NanoSVG nie rysuje tekstu, więc Silver układa go jako zwykłe boksy tekstowe nad rastrem SVG.
+;; ====================================================================
+;; Pierwsza liczba z listy atrybutu x/y/dx/dy (x1000); 0 gdy brak
+fn first_num(v: string) -> int is
+    let t: [string] = cssval::split_top(string_trim(string_replace(v, ",", " ")))
+    if array_len(t) == 0 is return 0 end
+    return gfx::parse_x1000(t[0])
+end
+
+fn collect_text(d: dom::Dom, id: int, depth: int) -> string is
+    if depth > 8 is return "" end
+    let n: dom::DomNode = d.nodes[id]
+    if n.removed is return "" end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let c: dom::DomNode = d.nodes[n.children[i]]
+        if i > 0 && out != "" && !c.glue is out = out + " " end
+        if c.tag == "text" is
+            out = out + c.text
+        elsif c.tag == "tspan" || c.tag == "textpath" is
+            out = out + collect_text(d, c.id, depth + 1)
+        end
+        i += 1
+    end
+    return out
+end
+
+;; Przesunięcie linii bazowej względem y (x1000 em) dla dominant-baseline / alignment-baseline.
+pub fn baseline_offset_em(kw: string) -> int is
+    let k: string = string_lower(string_trim(kw))
+    if k == "middle" is return 350 end
+    if k == "central" is return 300 end
+    if k == "mathematical" is return 400 end
+    if k == "hanging" || k == "text-before-edge" || k == "text-top" || k == "before-edge" is return 800 end
+    if k == "text-after-edge" || k == "text-bottom" || k == "ideographic" || k == "after-edge" is return -200 end
+    return 0
+end
+
+;; Lewy górny róg pola tekstu: [left, top] z punktu kotwiczenia (x,y = linia bazowa), szerokości, rozmiaru czcionki i właściwości SVG.
+;; anchor: start|middle|end; shift: baseline-shift (sub | super | długość | %)
+pub fn text_origin(x: int, y: int, text_w: int, font_size: int, anchor: string, dominant: string, shift: string) -> [int] is
+    let a: string = string_lower(string_trim(anchor))
+    let mut left: int = x
+    if a == "middle" is left = x - text_w / 2 end
+    if a == "end" is left = x - text_w end
+    let mut base: int = y + baseline_offset_em(dominant) * font_size / 1000
+    let sh: string = string_lower(string_trim(shift))
+    if sh == "sub" is
+        base = base + font_size * 3 / 10
+    elsif sh == "super" is
+        base = base - font_size * 4 / 10
+    elsif sh != "" && sh != "baseline" is
+        base = base - gfx::len_px(sh, font_size, font_size)
+    end
+    ;; pole tekstu zaczyna się nad linią bazową o wznios (≈0,8 em)
+    return [left, base - font_size * 8 / 10]
+end
+
+;; Przebiegi tekstu elementu <text> `tid`: lista rekordów "x\u0001y\u0001idwęzła\u0001tekst" (x,y w x1000 jednostek użytkownika).
+;; <tspan> z własnym x/y zaczyna nowy przebieg; pozostałe łączą się z bieżącym.
+pub fn text_runs(d: dom::Dom, tid: int) -> [string] is
+    let n: dom::DomNode = d.nodes[tid]
+    let mut runs: [string] = []
+    let mut cx: int = first_num(dom::get_attr(n, "x"))
+    let mut cy: int = first_num(dom::get_attr(n, "y"))
+    cx = cx + first_num(dom::get_attr(n, "dx"))
+    cy = cy + first_num(dom::get_attr(n, "dy"))
+    let mut cur: string = ""
+    let mut cur_id: int = tid
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let c: dom::DomNode = d.nodes[n.children[i]]
+        i += 1
+        if c.removed is continue end
+        if i > 1 && cur != "" && !c.glue is cur = cur + " " end
+        if c.tag == "text" is
+            cur = cur + c.text
+        elsif c.tag == "tspan" is
+            let has_pos: bool = dom::has_attr(c, "x") || dom::has_attr(c, "y")
+            if has_pos is
+                if string_trim(cur) != "" is runs = array_push(runs, to_string(cx) + "\u0001" + to_string(cy) + "\u0001" + to_string(cur_id) + "\u0001" + cur) end
+                cur = collect_text(d, c.id, 0)
+                cur_id = c.id
+                if dom::has_attr(c, "x") is cx = first_num(dom::get_attr(c, "x")) end
+                if dom::has_attr(c, "y") is cy = first_num(dom::get_attr(c, "y")) end
+                cx = cx + first_num(dom::get_attr(c, "dx"))
+                cy = cy + first_num(dom::get_attr(c, "dy"))
+                runs = array_push(runs, to_string(cx) + "\u0001" + to_string(cy) + "\u0001" + to_string(cur_id) + "\u0001" + cur)
+                cur = ""
+                cur_id = tid
+            else is
+                cur = cur + collect_text(d, c.id, 0)
+            end
+        end
+    end
+    if string_trim(cur) != "" is runs = array_push(runs, to_string(cx) + "\u0001" + to_string(cy) + "\u0001" + to_string(cur_id) + "\u0001" + cur) end
+    return runs
+end
+
+;; wszystkie elementy <text> poddrzewa <svg> (z pominięciem display:none) w kolejności dokumentu
+pub fn text_elements(d: dom::Dom, styles: [style::ComputedStyle], root: int) -> [int] is
+    let mut out: [int] = []
+    let mut stack: [int] = [root]
+    while array_len(stack) > 0 is
+        let id: int = stack[array_len(stack) - 1]
+        stack = array_slice_to(stack, array_len(stack) - 1)
+        let n: dom::DomNode = d.nodes[id]
+        if n.removed is continue end
+        if id != root && n.tag == "svg-text" is
+            if styles[id].display != "none" is out = array_push(out, id) end
+            continue
+        end
+        let mut k: int = array_len(n.children) - 1
+        while k >= 0 is
+            stack = array_push(stack, n.children[k])
+            k -= 1
+        end
+    end
+    return out
+end
+
+fn array_slice_to(a: [int], n: int) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < n is
+        out = array_push(out, a[i])
+        i += 1
+    end
+    return out
+end
+
+
+;; ====================================================================
+;;  markery (marker-start / marker-mid / marker-end)
+;; ====================================================================
+pub fn isqrt_pub(n0: int) -> int is
+    return isqrt(n0)
+end
+
+fn isqrt(n0: int) -> int is
+    if n0 <= 0 is return 0 end
+    let mut x: int = n0
+    let mut y: int = (x + 1) / 2
+    let mut guard: int = 0
+    while y < x && guard < 80 is
+        x = y
+        y = (x + n0 / x) / 2
+        guard += 1
+    end
+    return x
+end
+
+;; wektor jednostkowy ×1000 z (dx, dy) (dowolna skala); [1000, 0] dla zera
+fn unit2(dx: int, dy: int) -> [int] is
+    let l: int = isqrt(dx * dx + dy * dy)
+    if l == 0 is return [1000, 0] end
+    return [dx * 1000 / l, dy * 1000 / l]
+end
+
+fn is_cmd_ch(c: string) -> bool is
+    return string_find("MmLlHhVvZzCcSsQqTtAa", c) >= 0 && c != ""
+end
+
+;; Tokeny ścieżki: litery poleceń i liczby (x1000) jako teksty ("C" / "12500").
+fn path_tokens(d: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = string_len(d)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(d, i)
+        if is_cmd_ch(c) is
+            out = array_push(out, c)
+            i += 1
+        elsif (c >= "0" && c <= "9") || c == "-" || c == "+" || c == "." is
+            let mut j: int = i + 1
+            let mut seen_dot: bool = c == "."
+            while j < n is
+                let e: string = string_at(d, j)
+                if e >= "0" && e <= "9" is
+                    j += 1
+                elsif e == "." && !seen_dot is
+                    seen_dot = true
+                    j += 1
+                else is
+                    break
+                end
+            end
+            out = array_push(out, to_string(gfx::parse_x1000(string_slice(d, i, j))))
+            i = j
+        else is
+            i += 1
+        end
+    end
+    return out
+end
+
+fn is_cmd_tok(t: string) -> bool is
+    return string_len(t) == 1 && is_cmd_ch(t)
+end
+
+;; Wierzchołki ścieżki: płaska lista po 6 liczb [x, y, in_ux, in_uy, out_ux, out_uy] (x1000; wektory jednostkowe ×1000).
+;; Kierunki wchodzący i wychodzący z krzywych liczone z punktów kontrolnych (łuki → cięciwa).
+pub fn path_vertices(d: string) -> [int] is
+    let t: [string] = path_tokens(d)
+    let mut v: [int] = []
+    let mut ti: int = 0
+    let mut cx: int = 0
+    let mut cy: int = 0
+    let mut sx: int = 0
+    let mut sy: int = 0
+    let mut cmd: string = ""
+    let mut last_in_x: int = 1000
+    let mut last_in_y: int = 0
+    let mut open: bool = false
+    let mut qx: int = 0
+    let mut qy: int = 0
+    let mut guard: int = 0
+    while ti < array_len(t) && guard < 4000 is
+        guard += 1
+        if is_cmd_tok(t[ti]) is
+            cmd = t[ti]
+            ti += 1
+            if cmd == "Z" || cmd == "z" is
+                if open is
+                    let ux: [int] = unit2(sx - cx, sy - cy)
+                    v = array_push(v, sx)
+                    v = array_push(v, sy)
+                    v = array_push(v, ux[0])
+                    v = array_push(v, ux[1])
+                    v = array_push(v, ux[0])
+                    v = array_push(v, ux[1])
+                    cx = sx
+                    cy = sy
+                end
+                continue
+            end
+        end
+        if cmd == "" is break end
+        let rel: bool = cmd >= "a" && cmd <= "z"
+        let up: string = string_upper(cmd)
+        let mut ex: int = cx
+        let mut ey: int = cy
+        let mut sdx: int = 0
+        let mut sdy: int = 0
+        let mut edx: int = 0
+        let mut edy: int = 0
+        let mut need: int = 2
+        if up == "H" || up == "V" is need = 1 end
+        if up == "C" is need = 6 end
+        if up == "S" || up == "Q" is need = 4 end
+        if up == "A" is need = 7 end
+        if ti + need > array_len(t) is break end
+        let mut a: [int] = []
+        let mut k: int = 0
+        while k < need is
+            if is_cmd_tok(t[ti + k]) is break end
+            a = array_push(a, str_to_int(t[ti + k]))
+            k += 1
+        end
+        if array_len(a) < need is
+            ti += 1
+            continue
+        end
+        ti += need
+        let ox: int = if rel then cx else 0
+        let oy: int = if rel then cy else 0
+        if up == "M" is
+            ex = ox + a[0]
+            ey = oy + a[1]
+            v = array_push(v, ex)
+            v = array_push(v, ey)
+            v = array_push(v, last_in_x)
+            v = array_push(v, last_in_y)
+            v = array_push(v, 0)
+            v = array_push(v, 0)
+            sx = ex
+            sy = ey
+            open = true
+            cx = ex
+            cy = ey
+            cmd = if rel then "l" else "L"
+            last_in_x = 1000
+            last_in_y = 0
+            continue
+        elsif up == "L" is
+            ex = ox + a[0]
+            ey = oy + a[1]
+            sdx = ex - cx
+            sdy = ey - cy
+            edx = sdx
+            edy = sdy
+        elsif up == "H" is
+            ex = ox + a[0]
+            ey = cy
+            sdx = ex - cx
+            sdy = 0
+            edx = sdx
+            edy = 0
+        elsif up == "V" is
+            ex = cx
+            ey = oy + a[0]
+            sdx = 0
+            sdy = ey - cy
+            edx = 0
+            edy = sdy
+        elsif up == "C" is
+            let x1: int = ox + a[0]
+            let y1: int = oy + a[1]
+            let x2: int = ox + a[2]
+            let y2: int = oy + a[3]
+            ex = ox + a[4]
+            ey = oy + a[5]
+            sdx = if x1 == cx && y1 == cy then x2 - cx else x1 - cx
+            sdy = if x1 == cx && y1 == cy then y2 - cy else y1 - cy
+            edx = if x2 == ex && y2 == ey then ex - x1 else ex - x2
+            edy = if x2 == ex && y2 == ey then ey - y1 else ey - y2
+            qx = x2
+            qy = y2
+        elsif up == "S" is
+            let x2: int = ox + a[0]
+            let y2: int = oy + a[1]
+            ex = ox + a[2]
+            ey = oy + a[3]
+            sdx = x2 - cx
+            sdy = y2 - cy
+            edx = ex - x2
+            edy = ey - y2
+        elsif up == "Q" is
+            let x1: int = ox + a[0]
+            let y1: int = oy + a[1]
+            ex = ox + a[2]
+            ey = oy + a[3]
+            sdx = x1 - cx
+            sdy = y1 - cy
+            edx = ex - x1
+            edy = ey - y1
+        elsif up == "T" is
+            ex = ox + a[0]
+            ey = oy + a[1]
+            sdx = ex - cx
+            sdy = ey - cy
+            edx = sdx
+            edy = sdy
+        else is
+            ex = ox + a[5]
+            ey = oy + a[6]
+            sdx = ex - cx
+            sdy = ey - cy
+            edx = sdx
+            edy = sdy
+        end
+        let su: [int] = unit2(sdx, sdy)
+        let eu: [int] = unit2(edx, edy)
+        ;; kierunek wychodzący z poprzedniego wierzchołka = początek tego odcinka
+        let pv: int = array_len(v) - 6
+        if pv >= 0 is
+            v[pv + 4] = su[0]
+            v[pv + 5] = su[1]
+        end
+        v = array_push(v, ex)
+        v = array_push(v, ey)
+        v = array_push(v, eu[0])
+        v = array_push(v, eu[1])
+        v = array_push(v, eu[0])
+        v = array_push(v, eu[1])
+        last_in_x = eu[0]
+        last_in_y = eu[1]
+        cx = ex
+        cy = ey
+    end
+    ;; pierwszy wierzchołek bez kierunku wchodzącego: użyj wychodzącego
+    if array_len(v) >= 6 is
+        v[2] = v[4]
+        v[3] = v[5]
+    end
+    return v
+end
+
+;; Wierzchołki z atrybutu points (polyline/polygon) w tym samym formacie co path_vertices
+pub fn points_vertices(pts: string, closed: bool) -> [int] is
+    let t: [string] = path_tokens(string_replace(pts, ",", " "))
+    let mut xs: [int] = []
+    let mut ys: [int] = []
+    let mut i: int = 0
+    while i + 1 < array_len(t) is
+        xs = array_push(xs, str_to_int(t[i]))
+        ys = array_push(ys, str_to_int(t[i + 1]))
+        i += 2
+    end
+    let n: int = array_len(xs)
+    let mut v: [int] = []
+    let mut k: int = 0
+    while k < n is
+        let mut nx: int = k
+        if k + 1 < n is nx = k + 1 elsif closed is nx = 0 end
+        let mut px: int = k
+        if k > 0 is px = k - 1 elsif closed is px = n - 1 end
+        let o: [int] = unit2(xs[nx] - xs[k], ys[nx] - ys[k])
+        let inn: [int] = unit2(xs[k] - xs[px], ys[k] - ys[px])
+        v = array_push(v, xs[k])
+        v = array_push(v, ys[k])
+        v = array_push(v, if k == 0 && !closed then o[0] else inn[0])
+        v = array_push(v, if k == 0 && !closed then o[1] else inn[1])
+        v = array_push(v, if k == n - 1 && !closed then inn[0] else o[0])
+        v = array_push(v, if k == n - 1 && !closed then inn[1] else o[1])
+        k += 1
+    end
+    return v
+end
+
+;; macierz SVG matrix(a b c d e f) markera w wierzchołku (vx,vy) o kierunku (ux,uy): T(v)·R·S(k)·T(−ref)
+pub fn marker_matrix(vx: int, vy: int, ux: int, uy: int, k1000: int, refx: int, refy: int) -> string is
+    let a: int = ux * k1000 / 1000
+    let b: int = uy * k1000 / 1000
+    let c: int = 0 - b
+    let dd: int = a
+    let e: int = vx - (a * refx + c * refy) / 1000
+    let f: int = vy - (b * refx + dd * refy) / 1000
+    return "matrix(" + gfx::fmt_x1000(a) + " " + gfx::fmt_x1000(b) + " " + gfx::fmt_x1000(c) + " " + gfx::fmt_x1000(dd) + " " + gfx::fmt_x1000(e) + " " + gfx::fmt_x1000(f) + ")"
+end
+
+fn marker_ref(v: string) -> string is
+    let t: string = string_trim(v)
+    if !string_starts_with(string_lower(t), "url(") is return "" end
+    let close: int = string_find(t, ")")
+    if close < 0 is return "" end
+    let inner: string = string_trim(string_slice(t, 4, close))
+    let unq: string = if string_len(inner) >= 2 && (string_starts_with(inner, "\"") || string_starts_with(inner, "'")) then string_slice(inner, 1, string_len(inner) - 1) else inner
+    if string_starts_with(unq, "#") is return string_slice(unq, 1, string_len(unq)) end
+    return ""
+end
+
+;; Jeden egzemplarz markera: grupa z macierzą + zawartość <marker>.
+fn marker_instance(d: dom::Dom, styles: [style::ComputedStyle], mid: int, vx: int, vy: int, ux: int, uy: int, sw1000: int, auto_dir: bool, depth: int, scale1000: int) -> string is
+    let m: dom::DomNode = d.nodes[mid]
+    let mw: int = if dom::has_attr(m, "markerwidth") then gfx::parse_x1000(dom::get_attr(m, "markerwidth")) else 3000
+    let mh: int = if dom::has_attr(m, "markerheight") then gfx::parse_x1000(dom::get_attr(m, "markerheight")) else 3000
+    let units: string = string_lower(dom::get_attr(m, "markerunits"))
+    let vb: [int] = view_box(m)
+    let mut k: int = if units == "userspaceonuse" then 1000 else sw1000
+    if array_len(vb) == 4 is
+        let s1: int = mw * 1000 / vb[2]
+        let s2: int = mh * 1000 / vb[3]
+        k = k * (if s1 < s2 then s1 else s2) / 1000
+    end
+    let refx: int = gfx::parse_x1000(dom::get_attr(m, "refx"))
+    let refy: int = gfx::parse_x1000(dom::get_attr(m, "refy"))
+    let mut dx: int = 1000
+    let mut dy: int = 0
+    let orient: string = string_lower(dom::get_attr(m, "orient"))
+    if orient == "auto" || orient == "auto-start-reverse" is
+        dx = ux
+        dy = uy
+        if orient == "auto-start-reverse" && !auto_dir is
+            dx = 0 - ux
+            dy = 0 - uy
+        end
+    elsif orient != "" is
+        ;; kąt stały — przybliżenie dla wielokrotności 90°
+        let ang: int = gfx::parse_x1000(string_replace(orient, "deg", "")) / 1000
+        let q: int = ((ang % 360) + 360) % 360
+        if q == 90 is
+            dx = 0
+            dy = 1000
+        elsif q == 180 is
+            dx = -1000
+            dy = 0
+        elsif q == 270 is
+            dx = 0
+            dy = -1000
+        end
+    end
+    let mut inner: string = ""
+    let mut i: int = 0
+    while i < array_len(m.children) is
+        inner = inner + node_markup(d, styles, m.children[i], depth + 1, scale1000)
+        i += 1
+    end
+    return "<g transform=\"" + marker_matrix(vx, vy, dx, dy, k, refx, refy) + "\">" + inner + "</g>"
+end
+
+
+;; ====================================================================
+;;  Ścieżki ruchu (offset-path): spłaszczanie do łamanej, długość łuku, próbkowanie
+;;  Współrzędne x1000 (tysięczne px); wektory kierunku jednostkowe ×1000.
+;; ====================================================================
+fn cubic_pt(p0: int, p1: int, p2: int, p3: int, t1000: int) -> int is
+    let t: int = t1000
+    let u: int = 1000 - t
+    return (u * u / 1000 * u / 1000 * p0 + 3 * (u * u / 1000 * t / 1000) * p1 + 3 * (u * t / 1000 * t / 1000) * p2 + (t * t / 1000 * t / 1000) * p3) / 1000
+end
+
+fn quad_pt(p0: int, p1: int, p2: int, t1000: int) -> int is
+    let u: int = 1000 - t1000
+    return ((u * u / 1000) * p0 + 2 * (u * t1000 / 1000) * p1 + (t1000 * t1000 / 1000) * p2) / 1000
+end
+
+;; Pierwsza podścieżka `d` jako łamana [x0,y0,x1,y1,…] (x1000); krzywe w 16 odcinkach, łuki jako odcinki do punktu końcowego.
+pub fn flatten_path(d: string) -> [int] is
+    let t: [string] = path_tokens(d)
+    let mut pts: [int] = []
+    let mut ti: int = 0
+    let mut cx: int = 0
+    let mut cy: int = 0
+    let mut sx: int = 0
+    let mut sy: int = 0
+    let mut cmd: string = ""
+    let mut guard: int = 0
+    let mut started: bool = false
+    while ti < array_len(t) && guard < 4000 is
+        guard += 1
+        if is_cmd_tok(t[ti]) is
+            cmd = t[ti]
+            ti += 1
+            if cmd == "Z" || cmd == "z" is
+                if started && (cx != sx || cy != sy) is
+                    pts = array_push(pts, sx)
+                    pts = array_push(pts, sy)
+                    cx = sx
+                    cy = sy
+                end
+                continue
+            end
+        end
+        if cmd == "" is break end
+        let rel: bool = cmd >= "a" && cmd <= "z"
+        let up: string = string_upper(cmd)
+        let mut need: int = 2
+        if up == "H" || up == "V" is need = 1 end
+        if up == "C" is need = 6 end
+        if up == "S" || up == "Q" is need = 4 end
+        if up == "A" is need = 7 end
+        if ti + need > array_len(t) is break end
+        let mut a: [int] = []
+        let mut k: int = 0
+        while k < need is
+            if is_cmd_tok(t[ti + k]) is break end
+            a = array_push(a, str_to_int(t[ti + k]))
+            k += 1
+        end
+        if array_len(a) < need is
+            ti += 1
+            continue
+        end
+        ti += need
+        let ox: int = if rel then cx else 0
+        let oy: int = if rel then cy else 0
+        if up == "M" is
+            if started is break end
+            cx = ox + a[0]
+            cy = oy + a[1]
+            sx = cx
+            sy = cy
+            started = true
+            pts = array_push(pts, cx)
+            pts = array_push(pts, cy)
+            cmd = if rel then "l" else "L"
+            continue
+        end
+        if !started is break end
+        if up == "L" || up == "T" is
+            cx = ox + a[0]
+            cy = oy + a[1]
+            pts = array_push(pts, cx)
+            pts = array_push(pts, cy)
+        elsif up == "H" is
+            cx = ox + a[0]
+            pts = array_push(pts, cx)
+            pts = array_push(pts, cy)
+        elsif up == "V" is
+            cy = oy + a[0]
+            pts = array_push(pts, cx)
+            pts = array_push(pts, cy)
+        elsif up == "C" || up == "S" is
+            let x1: int = if up == "C" then ox + a[0] else cx
+            let y1: int = if up == "C" then oy + a[1] else cy
+            let x2: int = if up == "C" then ox + a[2] else ox + a[0]
+            let y2: int = if up == "C" then oy + a[3] else oy + a[1]
+            let ex: int = if up == "C" then ox + a[4] else ox + a[2]
+            let ey: int = if up == "C" then oy + a[5] else oy + a[3]
+            let mut s: int = 1
+            while s <= 16 is
+                let tt: int = s * 1000 / 16
+                pts = array_push(pts, cubic_pt(cx, x1, x2, ex, tt))
+                pts = array_push(pts, cubic_pt(cy, y1, y2, ey, tt))
+                s += 1
+            end
+            cx = ex
+            cy = ey
+        elsif up == "Q" is
+            let x1: int = ox + a[0]
+            let y1: int = oy + a[1]
+            let ex: int = ox + a[2]
+            let ey: int = oy + a[3]
+            let mut s2: int = 1
+            while s2 <= 16 is
+                let tt2: int = s2 * 1000 / 16
+                pts = array_push(pts, quad_pt(cx, x1, ex, tt2))
+                pts = array_push(pts, quad_pt(cy, y1, ey, tt2))
+                s2 += 1
+            end
+            cx = ex
+            cy = ey
+        else is
+            cx = ox + a[5]
+            cy = oy + a[6]
+            pts = array_push(pts, cx)
+            pts = array_push(pts, cy)
+        end
+    end
+    return pts
+end
+
+;; Całkowita długość łamanej (x1000)
+pub fn poly_length(pts: [int]) -> int is
+    let mut total: int = 0
+    let mut i: int = 2
+    while i + 1 < array_len(pts) is
+        let dx: int = pts[i] - pts[i - 2]
+        let dy: int = pts[i + 1] - pts[i - 1]
+        total = total + isqrt(dx * dx + dy * dy)
+        i += 2
+    end
+    return total
+end
+
+;; Punkt i kierunek styczny w odległości `dist` od początku: [x, y, ux, uy]; poza końcami przycina (closed → zawija)
+pub fn poly_sample(pts: [int], dist0: int, closed: bool) -> [int] is
+    let n: int = array_len(pts) / 2
+    if n == 0 is return [0, 0, 1000, 0] end
+    if n == 1 is return [pts[0], pts[1], 1000, 0] end
+    let total: int = poly_length(pts)
+    let mut dist: int = dist0
+    if closed && total > 0 is
+        dist = ((dist % total) + total) % total
+    elsif dist < 0 is
+        dist = 0
+    elsif dist > total is
+        dist = total
+    end
+    let mut acc: int = 0
+    let mut i: int = 2
+    let mut lastu: [int] = [1000, 0]
+    while i + 1 < array_len(pts) is
+        let dx: int = pts[i] - pts[i - 2]
+        let dy: int = pts[i + 1] - pts[i - 1]
+        let seg: int = isqrt(dx * dx + dy * dy)
+        if seg > 0 is
+            lastu = unit2(dx, dy)
+            if dist <= acc + seg is
+                let f: int = (dist - acc) * 1000 / seg
+                return [pts[i - 2] + dx * f / 1000, pts[i - 1] + dy * f / 1000, lastu[0], lastu[1]]
+            end
+        end
+        acc = acc + seg
+        i += 2
+    end
+    return [pts[array_len(pts) - 2], pts[array_len(pts) - 1], lastu[0], lastu[1]]
+end
+
+;; Kształty CSS (circle/ellipse/polygon/inset) → łamana; długości względem pola odniesienia (rw × rh px). Pusta lista, gdy nieobsługiwany.
+pub fn shape_polyline(v0: string, rw: int, rh: int, em: int) -> [int] is
+    let v: string = string_trim(v0)
+    let l: string = string_lower(v)
+    let open: int = string_find(v, "(")
+    if open < 0 || !string_ends_with(v, ")") is return [] end
+    let fname: string = string_slice(l, 0, open)
+    let body: string = string_trim(string_slice(v, open + 1, string_len(v) - 1))
+    let mut pts: [int] = []
+    if fname == "polygon" is
+        let items: [string] = cssval::split_commas(body)
+        let mut i: int = 0
+        while i < array_len(items) is
+            let xy: [string] = cssval::split_top(items[i])
+            if array_len(xy) >= 2 is
+                pts = array_push(pts, gfx::len_px(xy[0], rw, em) * 1000)
+                pts = array_push(pts, gfx::len_px(xy[1], rh, em) * 1000)
+            end
+            i += 1
+        end
+        if array_len(pts) >= 4 is
+            pts = array_push(pts, pts[0])
+            pts = array_push(pts, pts[1])
+        end
+        return pts
+    end
+    if fname == "inset" is
+        let t: [string] = cssval::split_top(string_lower(body))
+        let mut e: [int] = []
+        let mut i2: int = 0
+        while i2 < array_len(t) && t[i2] != "round" is
+            e = array_push(e, gfx::len_px(t[i2], if array_len(e) % 2 == 0 then rh else rw, em))
+            i2 += 1
+        end
+        if array_len(e) == 0 is return [] end
+        let top: int = e[0]
+        let right: int = if array_len(e) > 1 then e[1] else top
+        let bottom: int = if array_len(e) > 2 then e[2] else top
+        let left: int = if array_len(e) > 3 then e[3] else right
+        let x0: int = left * 1000
+        let y0: int = top * 1000
+        let x1: int = (rw - right) * 1000
+        let y1: int = (rh - bottom) * 1000
+        return [x0, y0, x1, y0, x1, y1, x0, y1, x0, y0]
+    end
+    if fname == "circle" || fname == "ellipse" is
+        let at: int = string_find(string_lower(body), "at ")
+        let shape: string = if at >= 0 then string_trim(string_slice(body, 0, at)) else body
+        let pos: string = if at >= 0 then string_slice(body, at + 3, string_len(body)) else "50% 50%"
+        let pp: [string] = cssval::split_top(string_lower(pos))
+        let cxp: int = gfx::len_px(if array_len(pp) > 0 then kw_pos_pct(pp[0], true) else "50%", rw, em)
+        let cyp: int = gfx::len_px(if array_len(pp) > 1 then kw_pos_pct(pp[1], false) else "50%", rh, em)
+        let sz: [string] = cssval::split_top(string_lower(shape))
+        let mut rx: int = 0
+        let mut ry: int = 0
+        if fname == "circle" is
+            let ref: int = isqrt((rw * rw + rh * rh) / 2)
+            rx = if array_len(sz) > 0 then gfx::len_px(sz[0], ref, em) else ref
+            ry = rx
+        else is
+            rx = if array_len(sz) > 0 then gfx::len_px(sz[0], rw, em) else rw / 2
+            ry = if array_len(sz) > 1 then gfx::len_px(sz[1], rh, em) else rh / 2
+        end
+        ;; 64-kąt: punkty (cx + rx·sin φ, cy − ry·cos φ) od góry zgodnie z zegarem
+        let mut k: int = 0
+        while k <= 64 is
+            let deci: int = k * 3600 / 64
+            pts = array_push(pts, cxp * 1000 + rx * style::sin_m(deci))
+            pts = array_push(pts, cyp * 1000 - ry * style::cos_m(deci))
+            k += 1
+        end
+        return pts
+    end
+    return []
+end
+
+fn kw_pos_pct(t: string, horizontal: bool) -> string is
+    if t == "left" || t == "top" is return "0%" end
+    if t == "right" || t == "bottom" is return "100%" end
+    if t == "center" is return "50%" end
+    return t
+end
