@@ -1,4 +1,4 @@
-# Silver 0.3
+# Silver 0.4
 
 Framework okienkowy w stylu Tauri **bez WebView**: frontend w HTML/CSS/JS (albo TypeScript, React, Vue, Solid, Preact, Svelte),
 backend w [H#](https://github.com/HackerOS-Linux-System/H-Sharp). Własny silnik układu i rysowania na SDL2,
@@ -51,7 +51,7 @@ document.querySelector('#btn').addEventListener('click', async () => {
 });
 ```
 
-## Co potrafi (0.3)
+## Co potrafi (0.4)
 
 | Obszar | Zakres |
 |---|---|
@@ -100,12 +100,12 @@ silver bundle <appimage|deb|macos|dmg|windows>
 
 ## Co jest zweryfikowane, a co nie
 
-Środowisko, w którym powstało 0.3, nie miało kompilatora H# (LLVM), więc:
+Środowisko, w którym powstało 0.4, nie miało kompilatora H# (LLVM), więc:
 
 - **Sprawdzone realnie:**
   - parsowanie i sprawdzanie typów całej biblioteki parserem i type-checkerem H# (w tym `app.h#`, `paint.h#`);
-  - **287 testów silnika** (DOM, CSS, style, układ, tabele, grid, kolumny, `@container`, zagnieżdżanie, transformacje, animacje, pseudo-elementy, szablony, edycja, IPC)
-    wykonanych interpreterem H#: 283 przechodzi, 4 (enum w polu struktury w `ipc`, UTF-8 przez FFI w edycji) wymaga skompilowanego H#;
+  - **382 testy silnika** + **35 testów end-to-end rysowania** (DOM, CSS, style, układ, tabele, grid, kolumny, `@container`, zagnieżdżanie, transformacje, animacje, pseudo-elementy, szablony, edycja, IPC)
+    wykonanych interpreterem H# (`tools/run_engine_tests.sh`): wszystkie przechodzą — wymaga interpretera H# z poprawkami z `CHANGELOG.md` (sekcja 0.4);
   - **warstwy transformacji, `backdrop blur` i dekoder WOFF** sprawdzone na pikselach / bajtach (`native/tests/run-layer.sh`, `run-woff.sh`; renderer programowy SDL);
   - warstwa natywna: SDL2 pod Xvfb (`native/tests/run.sh`), rodziny czcionek na prawdziwym SDL_ttf (`fonts_test.c`), QuickJS z DOM, polyfillami, modułami ES,
     **WebSocket względem prawdziwego serwera**, 20 kontroli API JS, frontendy TypeScript/Preact/Svelte oraz **React 18, Vue 3, Solid** zbudowane
