@@ -1,0 +1,1038 @@
+mod ffi_shim
+mod cssval
+
+;; ====================================================================
+;;  Silver 0.4 — grafika CSS: gradienty, warstwy tła/maski, geometria kafelków
+;;  Czysta logika (bez rysowania) — rysowanie robi paint.h# przez silver_draw_tiled.
+;;  Liczby ułamkowe liczymy jako całkowite ×1000 (x1000), by uniknąć zależności od f64 w kompilowanym H#.
+;; ====================================================================
+
+;; ---------- liczby x1000 ----------
+pub fn parse_x1000(s0: string) -> int is
+    let s: string = string_trim(s0)
+    let n: int = string_len(s)
+    let mut i: int = 0
+    let mut neg: bool = false
+    if i < n && (string_at(s, i) == "-" || string_at(s, i) == "+") is
+        neg = string_at(s, i) == "-"
+        i += 1
+    end
+    let mut whole: int = 0
+    while i < n && string_at(s, i) >= "0" && string_at(s, i) <= "9" is
+        whole = whole * 10 + str_to_int(string_at(s, i))
+        i += 1
+    end
+    let mut frac: int = 0
+    let mut scale: int = 100
+    if i < n && string_at(s, i) == "." is
+        i += 1
+        while i < n && string_at(s, i) >= "0" && string_at(s, i) <= "9" is
+            frac = frac + str_to_int(string_at(s, i)) * scale
+            scale = scale / 10
+            i += 1
+        end
+    end
+    let v: int = whole * 1000 + frac
+    return if neg then 0 - v else v
+end
+
+pub fn fmt_x1000(v: int) -> string is
+    let neg: bool = v < 0
+    let a: int = if neg then 0 - v else v
+    let whole: int = a / 1000
+    let frac: int = a - whole * 1000
+    let mut fs: string = to_string(frac)
+    while string_len(fs) < 3 is fs = "0" + fs end
+    return (if neg then "-" else "") + to_string(whole) + "." + fs
+end
+
+;; długość znacznikowa: liczba (x1000) + jednostka ("" | "%" | "px" | "deg" | …)
+fn num_len(tok: string) -> int is
+    let mut i: int = 0
+    let n: int = string_len(tok)
+    if i < n && (string_at(tok, i) == "-" || string_at(tok, i) == "+") is i += 1 end
+    while i < n && ((string_at(tok, i) >= "0" && string_at(tok, i) <= "9") || string_at(tok, i) == ".") is i += 1 end
+    return i
+end
+
+pub fn num_len_pub(tok: string) -> int is
+    return num_len(tok)
+end
+
+fn is_numeric_tok(tok: string) -> bool is
+    let nl: int = num_len(tok)
+    if nl == 0 is return false end
+    if nl == 1 && (string_at(tok, 0) == "-" || string_at(tok, 0) == "+" || string_at(tok, 0) == ".") is return false end
+    return true
+end
+
+;; piksele z tokenu długości względem `full` (dla %), `em` (font-size). ok = false przy błędzie.
+pub fn len_px(tok0: string, full: int, em: int) -> int is
+    let tok: string = string_lower(string_trim(tok0))
+    let nl: int = num_len(tok)
+    if nl == 0 is return 0 end
+    let v: int = parse_x1000(string_slice(tok, 0, nl))
+    let unit: string = string_slice(tok, nl, string_len(tok))
+    if unit == "%" is return (v * full + 50000) / 100000 end
+    if unit == "em" || unit == "rem" is return (v * em + 500) / 1000 end
+    if unit == "pt" is return (v * 4 / 3 + 500) / 1000 end
+    if unit == "cm" is return (v * 96 * 100 / 254 + 500) / 1000 end
+    if unit == "mm" is return (v * 96 * 10 / 254 + 500) / 1000 end
+    if unit == "in" is return (v * 96 + 500) / 1000 end
+    return (v + 500) / 1000
+end
+
+;; kąt → stopnie x1000 (deg, grad, rad, turn); -999999999 gdy to nie kąt
+fn angle_x1000(tok0: string) -> int is
+    let tok: string = string_lower(string_trim(tok0))
+    let nl: int = num_len(tok)
+    if nl == 0 is return -999999999 end
+    let v: int = parse_x1000(string_slice(tok, 0, nl))
+    let unit: string = string_slice(tok, nl, string_len(tok))
+    if unit == "deg" is return v end
+    if unit == "turn" is return v * 360 end
+    if unit == "grad" is return v * 9 / 10 end
+    if unit == "rad" is return v * 57296 / 1000 end
+    if unit == "" && v == 0 is return 0 end
+    return -999999999
+end
+
+;; ---------- obrazy (warstwa tła/maski) ----------
+pub fn is_gradient_fn(img: string) -> bool is
+    let l: string = string_lower(string_trim(img))
+    return string_starts_with(l, "linear-gradient(") || string_starts_with(l, "radial-gradient(") || string_starts_with(l, "conic-gradient(") ||
+           string_starts_with(l, "repeating-linear-gradient(") || string_starts_with(l, "repeating-radial-gradient(") || string_starts_with(l, "repeating-conic-gradient(")
+end
+
+;; 0 = brak (none/nieznane), 1 = url(...) / image-set, 2 = gradient
+pub fn image_kind(img: string) -> int is
+    let l: string = string_lower(string_trim(img))
+    if l == "" || l == "none" is return 0 end
+    if string_starts_with(l, "url(") || string_starts_with(l, "image-set(") || string_starts_with(l, "-webkit-image-set(") is return 1 end
+    if is_gradient_fn(l) is return 2 end
+    return 0
+end
+
+fn unq(v0: string) -> string is
+    let v: string = string_trim(v0)
+    if string_len(v) >= 2 && (string_starts_with(v, "\"") || string_starts_with(v, "'")) is
+        return string_slice(v, 1, string_len(v) - 1)
+    end
+    return v
+end
+
+;; url("a.png") → a.png; image-set(url(a) 1x, url(b) 2x) → pierwszy url
+pub fn url_of(img: string) -> string is
+    let v: string = string_trim(img)
+    let l: string = string_lower(v)
+    let at: int = string_find(l, "url(")
+    if at < 0 is
+        ;; image-set("a.png" 1x, ...) bez url()
+        if string_find(l, "image-set(") >= 0 is
+            let open: int = string_find(v, "(")
+            let inner: string = string_slice(v, open + 1, string_len(v) - 1)
+            let parts: [string] = cssval::split_commas(inner)
+            if array_len(parts) > 0 is
+                let first: [string] = cssval::split_top(parts[0])
+                if array_len(first) > 0 is return unq(first[0]) end
+            end
+        end
+        return ""
+    end
+    let rest: string = string_slice(v, at + 4, string_len(v))
+    let close: int = string_find(rest, ")")
+    if close < 0 is return "" end
+    return unq(string_slice(rest, 0, close))
+end
+
+;; ---------- gradienty ----------
+fn pos_token(tok0: string, em: int, conic: bool) -> string is
+    let tok: string = string_lower(string_trim(tok0))
+    let nl: int = num_len(tok)
+    if nl == 0 is return "" end
+    let unit: string = string_slice(tok, nl, string_len(tok))
+    let a: int = angle_x1000(tok)
+    if a != -999999999 && unit != "" is return fmt_x1000(a) + "deg" end
+    if unit == "%" is return fmt_x1000(parse_x1000(string_slice(tok, 0, nl))) + "%" end
+    if unit == "" is
+        let v: int = parse_x1000(string_slice(tok, 0, nl))
+        if v == 0 is
+            if conic is return "0%" end
+            return "0px"
+        end
+        return fmt_x1000(v) + "px"
+    end
+    return to_string(len_px(tok, 0, em)) + "px"
+end
+
+fn color_spec(tok: string, cur: cssval::Color) -> string is
+    let l: string = string_lower(string_trim(tok))
+    let c: cssval::Color = if l == "currentcolor" then cur else cssval::parse_color(l)
+    return to_string(c.r) + "," + to_string(c.g) + "," + to_string(c.b) + "," + to_string(c.a)
+end
+
+;; lista przystanków z argumentów (od indeksu `from`) → "r,g,b,a@poz;…" ; "" gdy brak
+fn stops_spec(args: [string], from: int, cur: cssval::Color, em: int, conic: bool) -> string is
+    let mut out: string = ""
+    let mut i: int = from
+    while i < array_len(args) is
+        let toks: [string] = cssval::split_top(string_trim(args[i]))
+        i += 1
+        if array_len(toks) == 0 is continue end
+        let first: string = toks[0]
+        let first_is_color: bool = cssval::is_color(first)
+        if !first_is_color is
+            ;; podpowiedź (color hint): sama pozycja
+            let p: string = pos_token(first, em, conic)
+            if p != "" is
+                if out != "" is out = out + ";" end
+                out = out + "h@" + p
+            end
+            continue
+        end
+        let cs: string = color_spec(first, cur)
+        if array_len(toks) == 1 is
+            if out != "" is out = out + ";" end
+            out = out + cs + "@"
+        else is
+            let mut k: int = 1
+            while k < array_len(toks) && k <= 2 is
+                if out != "" is out = out + ";" end
+                out = out + cs + "@" + pos_token(toks[k], em, conic)
+                k += 1
+            end
+        end
+    end
+    return out
+end
+
+fn kw_axis(tok: string, horizontal: bool) -> string is
+    let t: string = string_lower(tok)
+    if horizontal is
+        if t == "left" is return "0%" end
+        if t == "right" is return "100%" end
+        if t == "center" is return "50%" end
+    else is
+        if t == "top" is return "0%" end
+        if t == "bottom" is return "100%" end
+        if t == "center" is return "50%" end
+    end
+    return ""
+end
+
+;; „pozycja” gradientu radialnego/stożkowego → "x,y" (px lub %)
+fn grad_pos(s: string, em: int) -> string is
+    let t: [string] = cssval::split_top(string_lower(string_trim(s)))
+    let mut x: string = "50%"
+    let mut y: string = "50%"
+    if array_len(t) == 1 is
+        if t[0] == "top" || t[0] == "bottom" is
+            y = kw_axis(t[0], false)
+        elsif kw_axis(t[0], true) != "" is
+            x = kw_axis(t[0], true)
+        else is
+            x = pos_token(t[0], em, false)
+        end
+    elsif array_len(t) >= 2 is
+        let a: string = t[0]
+        let b: string = t[1]
+        let swapped: bool = a == "top" || a == "bottom" || b == "left" || b == "right"
+        let hx: string = if swapped then b else a
+        let vy: string = if swapped then a else b
+        x = if kw_axis(hx, true) != "" then kw_axis(hx, true) else pos_token(hx, em, false)
+        y = if kw_axis(vy, false) != "" then kw_axis(vy, false) else pos_token(vy, em, false)
+    end
+    return x + "," + y
+end
+
+;; Gradient CSS → specyfikacja natywna (patrz silver_fx.h); "" przy błędzie. cur = currentcolor, em = font-size.
+pub fn gradient_spec(img: string, cur: cssval::Color, em: int) -> string is
+    let v: string = string_trim(img)
+    let l: string = string_lower(v)
+    if !is_gradient_fn(l) is return "" end
+    let open: int = string_find(v, "(")
+    if open < 0 || !string_ends_with(v, ")") is return "" end
+    let name: string = string_slice(l, 0, open)
+    let repeating: bool = string_starts_with(name, "repeating-")
+    let base: string = if repeating then string_slice(name, 10, string_len(name)) else name
+    let args: [string] = cssval::split_commas(string_slice(v, open + 1, string_len(v) - 1))
+    if array_len(args) < 2 is return "" end
+    let pre: string = if repeating then "R" else ""
+    let head: string = string_lower(string_trim(args[0]))
+    if base == "linear-gradient" is
+        let mut params: string = "180"
+        let mut from: int = 0
+        if string_starts_with(head, "to ") is
+            let w: [string] = cssval::split_top(string_slice(head, 3, string_len(head)))
+            let a: string = w[0]
+            let b: string = if array_len(w) > 1 then w[1] else ""
+            let has_top: bool = a == "top" || b == "top"
+            let has_bottom: bool = a == "bottom" || b == "bottom"
+            let has_left: bool = a == "left" || b == "left"
+            let has_right: bool = a == "right" || b == "right"
+            if has_top && has_right is params = "to:tr"
+            elsif has_top && has_left is params = "to:tl"
+            elsif has_bottom && has_right is params = "to:br"
+            elsif has_bottom && has_left is params = "to:bl"
+            elsif has_top is params = "0"
+            elsif has_right is params = "90"
+            elsif has_bottom is params = "180"
+            elsif has_left is params = "270"
+            end
+            from = 1
+        else is
+            let ang: int = angle_x1000(head)
+            if ang != -999999999 && !cssval::is_color(head) is
+                params = fmt_x1000(ang)
+                from = 1
+            end
+        end
+        let st: string = stops_spec(args, from, cur, em, false)
+        if st == "" is return "" end
+        return pre + "L|" + params + "|" + st
+    end
+    if base == "radial-gradient" is
+        let mut shape: string = "ellipse"
+        let mut size: string = "farthest-corner"
+        let mut at: string = "50%,50%"
+        let mut from: int = 0
+        let looks_cfg: bool = string_find(head, "circle") >= 0 || string_find(head, "ellipse") >= 0 || string_find(head, "closest") >= 0 ||
+                              string_find(head, "farthest") >= 0 || string_starts_with(head, "at ") || (is_numeric_tok(head) && !cssval::is_color(head))
+        if looks_cfg is
+            from = 1
+            let mut cfg: string = head
+            let at_i: int = string_find(head, "at ")
+            if at_i >= 0 is
+                at = grad_pos(string_slice(head, at_i + 3, string_len(head)), em)
+                cfg = string_trim(string_slice(head, 0, at_i))
+            end
+            let ct: [string] = cssval::split_top(cfg)
+            let mut lens: [string] = []
+            let mut ci: int = 0
+            while ci < array_len(ct) is
+                let t: string = ct[ci]
+                ci += 1
+                if t == "circle" || t == "ellipse" is shape = t
+                elsif t == "closest-side" || t == "closest-corner" || t == "farthest-side" || t == "farthest-corner" is size = t
+                elsif is_numeric_tok(t) is lens = array_push(lens, pos_token(t, em, false))
+                end
+            end
+            if array_len(lens) == 1 is
+                size = lens[0]
+                if string_find(cfg, "ellipse") < 0 is shape = "circle" end
+            elsif array_len(lens) >= 2 is
+                size = lens[0] + "," + lens[1]
+                shape = "ellipse"
+            end
+        end
+        let st2: string = stops_spec(args, from, cur, em, false)
+        if st2 == "" is return "" end
+        return pre + "R|" + shape + ";" + size + ";" + at + "|" + st2
+    end
+    ;; conic-gradient
+    let mut from_deg: string = "0"
+    let mut cat: string = "50%,50%"
+    let mut f: int = 0
+    if string_starts_with(head, "from ") || string_starts_with(head, "at ") is
+        f = 1
+        let mut cfg: string = head
+        let at_i: int = string_find(head, "at ")
+        if at_i >= 0 is
+            cat = grad_pos(string_slice(head, at_i + 3, string_len(head)), em)
+            cfg = string_trim(string_slice(head, 0, at_i))
+        end
+        if string_starts_with(cfg, "from ") is
+            let a2: int = angle_x1000(string_trim(string_slice(cfg, 5, string_len(cfg))))
+            if a2 != -999999999 is from_deg = fmt_x1000(a2) end
+        end
+    end
+    let st3: string = stops_spec(args, f, cur, em, true)
+    if st3 == "" is return "" end
+    return pre + "C|" + from_deg + ";" + cat + "|" + st3
+end
+
+;; ---------- skrót `background` (jedna lub wiele warstw) ----------
+;; Zwraca 8 list rozdzielonych przecinkami: [image, position, size, repeat, attachment, origin, clip, color]
+pub fn is_repeat_kw(t: string) -> bool is
+    return t == "repeat" || t == "no-repeat" || t == "repeat-x" || t == "repeat-y" || t == "space" || t == "round"
+end
+
+fn is_box_kw(t: string) -> bool is
+    return t == "border-box" || t == "padding-box" || t == "content-box" || t == "text"
+end
+
+fn is_pos_kw(t: string) -> bool is
+    return t == "left" || t == "right" || t == "top" || t == "bottom" || t == "center"
+end
+
+fn join_list(acc: string, item: string) -> string is
+    if acc == "" is return item end
+    return acc + ", " + item
+end
+
+pub fn split_shorthand(val: string) -> [string] is
+    let layers: [string] = cssval::split_commas(val)
+    let mut img: string = ""
+    let mut pos: string = ""
+    let mut size: string = ""
+    let mut rep: string = ""
+    let mut att: string = ""
+    let mut org: string = ""
+    let mut clp: string = ""
+    let mut color: string = ""
+    let mut li: int = 0
+    while li < array_len(layers) is
+        let toks: [string] = cssval::split_top(string_trim(layers[li]))
+        li += 1
+        let mut l_img: string = "none"
+        let mut l_pos: string = ""
+        let mut l_size: string = ""
+        let mut l_rep: string = ""
+        let mut l_att: string = ""
+        let mut boxes: [string] = []
+        let mut in_size: bool = false
+        let mut ti: int = 0
+        while ti < array_len(toks) is
+            let t: string = toks[ti]
+            let tl: string = string_lower(t)
+            ti += 1
+            if tl == "/" is
+                in_size = true
+            elsif string_starts_with(tl, "url(") || is_gradient_fn(tl) || string_starts_with(tl, "image-set(") || tl == "none" is
+                l_img = t
+            elsif is_repeat_kw(tl) is
+                l_rep = if l_rep == "" then tl else l_rep + " " + tl
+            elsif tl == "scroll" || tl == "fixed" || tl == "local" is
+                l_att = tl
+            elsif is_box_kw(tl) is
+                boxes = array_push(boxes, tl)
+            elsif cssval::is_color(t) && !is_pos_kw(tl) is
+                color = t
+            elsif in_size is
+                l_size = if l_size == "" then tl else l_size + " " + tl
+            elsif is_pos_kw(tl) || is_numeric_tok(tl) is
+                l_pos = if l_pos == "" then tl else l_pos + " " + tl
+            elsif tl == "auto" || tl == "cover" || tl == "contain" is
+                l_size = if l_size == "" then tl else l_size + " " + tl
+            end
+        end
+        if string_find(l_pos, "/") >= 0 is l_pos = string_trim(string_replace(l_pos, "/", " ")) end
+        let mut l_org: string = "padding-box"
+        let mut l_clp: string = "border-box"
+        if array_len(boxes) >= 1 is
+            l_org = boxes[0]
+            l_clp = boxes[0]
+        end
+        if array_len(boxes) >= 2 is l_clp = boxes[1] end
+        if l_pos == "" is l_pos = "0% 0%" end
+        if l_size == "" is l_size = "auto" end
+        if l_rep == "" is l_rep = "repeat" end
+        if l_att == "" is l_att = "scroll" end
+        img = join_list(img, l_img)
+        pos = join_list(pos, l_pos)
+        size = join_list(size, l_size)
+        rep = join_list(rep, l_rep)
+        att = join_list(att, l_att)
+        org = join_list(org, l_org)
+        clp = join_list(clp, l_clp)
+    end
+    return [img, pos, size, rep, att, org, clp, color]
+end
+
+;; n-ty element listy rozdzielonej przecinkami, z cyklicznym powtarzaniem (CSS: listy wartości są powielane do liczby warstw)
+pub fn list_at(list: string, i: int) -> string is
+    let items: [string] = cssval::split_commas(list)
+    if array_len(items) == 0 is return "" end
+    return string_trim(items[i % array_len(items)])
+end
+
+pub fn list_len(list: string) -> int is
+    return array_len(cssval::split_commas(list))
+end
+
+;; ---------- geometria kafelka ----------
+;; repeat → [rep_x, rep_y, mode_x, mode_y]; mode: 0 normalnie, 1 space, 2 round; rep: 0/1
+pub fn parse_repeat(r0: string) -> [int] is
+    let r: [string] = cssval::split_top(string_lower(string_trim(r0)))
+    if array_len(r) == 0 is return [1, 1, 0, 0] end
+    if r[0] == "repeat-x" is return [1, 0, 0, 0] end
+    if r[0] == "repeat-y" is return [0, 1, 0, 0] end
+    let ax: string = r[0]
+    let ay: string = if array_len(r) > 1 then r[1] else r[0]
+    let rx: int = if ax == "no-repeat" then 0 else 1
+    let ry: int = if ay == "no-repeat" then 0 else 1
+    let mx: int = if ax == "space" then 1 elsif ax == "round" then 2 else 0
+    let my: int = if ay == "space" then 1 elsif ay == "round" then 2 else 0
+    return [rx, ry, mx, my]
+end
+
+;; Rozmiar kafelka [w, h] wg `size` (auto | cover | contain | <w> [<h>]) dla obszaru aw×ah i rozmiaru naturalnego nw×nh (0 = brak).
+pub fn tile_size(size0: string, aw: int, ah: int, nw: int, nh: int, em: int) -> [int] is
+    let size: string = string_lower(string_trim(size0))
+    let has_nat: bool = nw > 0 && nh > 0
+    if size == "cover" || size == "contain" is
+        if !has_nat is return [aw, ah] end
+        ;; porównanie aw/nw z ah/nh bez ułamków
+        let wider: bool = aw * nh >= ah * nw
+        let use_w: bool = if size == "cover" then wider else !wider
+        if use_w is return [aw, (nh * aw + nw / 2) / nw] end
+        return [(nw * ah + nh / 2) / nh, ah]
+    end
+    let t: [string] = cssval::split_top(size)
+    let sw: string = if array_len(t) >= 1 then t[0] else "auto"
+    let sh: string = if array_len(t) >= 2 then t[1] else "auto"
+    let mut w: int = -1
+    let mut h: int = -1
+    if sw != "auto" is w = len_px(sw, aw, em) end
+    if sh != "auto" is h = len_px(sh, ah, em) end
+    if w < 0 && h < 0 is
+        if has_nat is return [nw, nh] end
+        return [aw, ah]
+    end
+    if w < 0 is
+        if has_nat is w = (nw * h + nh / 2) / nh else w = aw end
+    end
+    if h < 0 is
+        if has_nat is h = (nh * w + nw / 2) / nw else h = ah end
+    end
+    return [if w < 1 then 1 else w, if h < 1 then 1 else h]
+end
+
+;; Pozycja kafelka [x, y] względem lewego górnego rogu obszaru; obsługuje 1–4 wartości (z odsunięciami od krawędzi).
+pub fn tile_pos(pos0: string, aw: int, ah: int, tw: int, th: int, em: int) -> [int] is
+    let t: [string] = cssval::split_top(string_lower(string_trim(pos0)))
+    let n: int = array_len(t)
+    if n == 0 is return [0, 0] end
+    let fw: int = aw - tw
+    let fh: int = ah - th
+    if n <= 2 is
+        let a: string = t[0]
+        let b: string = if n == 2 then t[1] else ""
+        let mut hx: string = a
+        let mut vy: string = if n == 2 then b else "center"
+        if n == 1 is
+            if a == "top" || a == "bottom" is
+                hx = "center"
+                vy = a
+            end
+        else is
+            if a == "top" || a == "bottom" || b == "left" || b == "right" is
+                hx = b
+                vy = a
+            end
+        end
+        let x: int = if hx == "left" then 0 elsif hx == "right" then fw elsif hx == "center" then fw / 2 else len_px_pos(hx, fw, em)
+        let y: int = if vy == "top" then 0 elsif vy == "bottom" then fh elsif vy == "center" then fh / 2 else len_px_pos(vy, fh, em)
+        return [x, y]
+    end
+    ;; 3–4 wartości: słowo kluczowe [odsunięcie] …
+    let mut x2: int = fw / 2
+    let mut y2: int = fh / 2
+    let mut i: int = 0
+    while i < n is
+        let kw: string = t[i]
+        i += 1
+        let has_off: bool = i < n && !is_pos_kw(t[i])
+        let off: int = if has_off then len_px(t[i], if kw == "left" || kw == "right" then aw else ah, em) else 0
+        if has_off is i += 1 end
+        if kw == "left" is x2 = off
+        elsif kw == "right" is x2 = fw - off
+        elsif kw == "top" is y2 = off
+        elsif kw == "bottom" is y2 = fh - off
+        end
+    end
+    return [x2, y2]
+end
+
+;; procent pozycji liczony względem (obszar − kafelek), długości bezpośrednio
+fn len_px_pos(tok: string, free: int, em: int) -> int is
+    if string_ends_with(tok, "%") is
+        return (parse_x1000(string_slice(tok, 0, string_len(tok) - 1)) * free + 50000) / 100000
+    end
+    return len_px(tok, 0, em)
+end
+
+;; Pełna geometria warstwy: [tx, ty, tw, th, stepx, stepy, rep_x, rep_y]
+pub fn layer_geometry(ax: int, ay: int, aw: int, ah: int, nw: int, nh: int, size: string, pos: string, repeat: string, em: int) -> [int] is
+    let rp: [int] = parse_repeat(repeat)
+    let mut ts: [int] = tile_size(size, aw, ah, nw, nh, em)
+    let mut tw: int = ts[0]
+    let mut th: int = ts[1]
+    ;; round: liczba kafelków zaokrąglona, kafelek rozciągnięty (przy auto w drugiej osi — proporcjonalnie)
+    let st: [string] = cssval::split_top(string_lower(string_trim(size)))
+    let w_auto: bool = array_len(st) == 0 || st[0] == "auto"
+    let h_auto: bool = array_len(st) < 2 || st[1] == "auto"
+    if rp[2] == 2 && tw > 0 is
+        let cnt: int = if (aw + tw / 2) / tw < 1 then 1 else (aw + tw / 2) / tw
+        let ntw: int = aw / cnt
+        if h_auto && nw > 0 is th = th * ntw / tw end
+        tw = ntw
+    end
+    if rp[3] == 2 && th > 0 is
+        let cnt2: int = if (ah + th / 2) / th < 1 then 1 else (ah + th / 2) / th
+        let nth: int = ah / cnt2
+        if w_auto && nh > 0 && rp[2] != 2 is tw = tw * nth / th end
+        th = nth
+    end
+    let mut stepx: int = tw
+    let mut stepy: int = th
+    let mut repx: int = rp[0]
+    let mut repy: int = rp[1]
+    let mut p: [int] = tile_pos(pos, aw, ah, tw, th, em)
+    ;; space: kafelki rozłożone równomiernie bez przycinania; < 2 kafelki → pojedynczy
+    if rp[2] == 1 is
+        let cx: int = if tw > 0 then aw / tw else 0
+        if cx >= 2 is
+            stepx = tw + (aw - cx * tw) / (cx - 1)
+            p[0] = 0
+        else is
+            repx = 0
+        end
+    end
+    if rp[3] == 1 is
+        let cy: int = if th > 0 then ah / th else 0
+        if cy >= 2 is
+            stepy = th + (ah - cy * th) / (cy - 1)
+            p[1] = 0
+        else is
+            repy = 0
+        end
+    end
+    return [ax + p[0], ay + p[1], tw, th, stepx, stepy, repx, repy]
+end
+
+
+;; ---------- filter: funkcje przetwarzane na pikselach warstwy (blur, saturate, hue-rotate, drop-shadow) ----------
+;; Pozostałe funkcje (brightness, contrast, grayscale, sepia, invert, opacity) obsługuje przybliżenie kolorów w stylu.
+fn fn_args(tok: string) -> string is
+    let open: int = string_find(tok, "(")
+    if open < 0 || !string_ends_with(tok, ")") is return "" end
+    return string_trim(string_slice(tok, open + 1, string_len(tok) - 1))
+end
+
+;; "blur:4;sat:150;hue:30;shadow:2,3,1.5,0,0,0,128" w kolejności z listy; "" gdy brak funkcji do przetworzenia.
+pub fn filter_fx_spec(filter: string, cur: cssval::Color, em: int) -> string is
+    let toks: [string] = cssval::split_top(string_trim(filter))
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        let l: string = string_lower(t)
+        i += 1
+        let args: string = fn_args(t)
+        let mut piece: string = ""
+        if string_starts_with(l, "blur(") is
+            let r: int = len_px(args, 0, em)
+            if args != "" && r > 0 is piece = "blur:" + to_string(r) end
+        elsif string_starts_with(l, "saturate(") is
+            let a: string = string_lower(args)
+            let pct: int = if string_ends_with(a, "%") then parse_x1000(string_slice(a, 0, string_len(a) - 1)) / 1000 else parse_x1000(a) / 10
+            if args != "" is piece = "sat:" + to_string(pct) end
+        elsif string_starts_with(l, "hue-rotate(") is
+            let ang: int = angle_x1000(args)
+            if ang != -999999999 is piece = "hue:" + fmt_x1000(ang) end
+        elsif string_starts_with(l, "drop-shadow(") is
+            let parts: [string] = cssval::split_top(args)
+            let mut lens: [int] = []
+            let mut col: cssval::Color = cur
+            let mut pi: int = 0
+            while pi < array_len(parts) is
+                let q: string = parts[pi]
+                pi += 1
+                if cssval::is_color(q) is
+                    col = if string_lower(q) == "currentcolor" then cur else cssval::parse_color(q)
+                elsif is_numeric_tok(q) is
+                    lens = array_push(lens, len_px(q, 0, em))
+                end
+            end
+            if array_len(lens) >= 2 is
+                let blur: int = if array_len(lens) >= 3 then lens[2] else 0
+                piece = "shadow:" + to_string(lens[0]) + "," + to_string(lens[1]) + "," + fmt_x1000(blur * 500) + "," + to_string(col.r) + "," + to_string(col.g) + "," + to_string(col.b) + "," + to_string(col.a)
+            end
+        end
+        if piece != "" is
+            if out != "" is out = out + ";" end
+            out = out + piece
+        end
+    end
+    return out
+end
+
+;; Zapas (px) wokół poddrzewa na rozlew efektów warstwy (rozmycie, cień).
+pub fn filter_pad(spec: string) -> int is
+    let toks: [string] = string_split(spec, ";")
+    let mut pad: int = 0
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if string_starts_with(t, "blur:") is
+            pad = pad + str_to_int(string_slice(t, 5, string_len(t))) * 3
+        elsif string_starts_with(t, "shadow:") is
+            let f: [string] = string_split(string_slice(t, 7, string_len(t)), ",")
+            if array_len(f) >= 3 is
+                let dx: int = str_to_int(f[0])
+                let dy: int = str_to_int(f[1])
+                let ax: int = if dx < 0 then 0 - dx else dx
+                let ay: int = if dy < 0 then 0 - dy else dy
+                pad = pad + (if ax > ay then ax else ay) + parse_x1000(f[2]) * 3 / 1000 + 1
+            end
+        end
+    end
+    return pad
+end
+
+;; ---------- skrót `mask` ----------
+fn is_composite_kw(t: string) -> bool is
+    return t == "add" || t == "subtract" || t == "intersect" || t == "exclude"
+end
+
+fn is_mode_kw(t: string) -> bool is
+    return t == "alpha" || t == "luminance" || t == "match-source"
+end
+
+;; [image, position, size, repeat, origin, clip, composite, mode] — listy rozdzielone przecinkami (jak split_shorthand)
+pub fn split_mask_shorthand(val: string) -> [string] is
+    let layers: [string] = cssval::split_commas(val)
+    let mut img: string = ""
+    let mut pos: string = ""
+    let mut size: string = ""
+    let mut rep: string = ""
+    let mut org: string = ""
+    let mut clp: string = ""
+    let mut comp: string = ""
+    let mut mode: string = ""
+    let mut li: int = 0
+    while li < array_len(layers) is
+        let toks: [string] = cssval::split_top(string_trim(layers[li]))
+        li += 1
+        let mut l_img: string = "none"
+        let mut l_pos: string = ""
+        let mut l_size: string = ""
+        let mut l_rep: string = ""
+        let mut l_comp: string = "add"
+        let mut l_mode: string = "match-source"
+        let mut boxes: [string] = []
+        let mut no_clip: bool = false
+        let mut in_size: bool = false
+        let mut ti: int = 0
+        while ti < array_len(toks) is
+            let t: string = toks[ti]
+            let tl: string = string_lower(t)
+            ti += 1
+            if tl == "/" is
+                in_size = true
+            elsif string_starts_with(tl, "url(") || is_gradient_fn(tl) || string_starts_with(tl, "image-set(") || tl == "none" is
+                l_img = t
+            elsif is_repeat_kw(tl) is
+                l_rep = if l_rep == "" then tl else l_rep + " " + tl
+            elsif is_composite_kw(tl) is
+                l_comp = tl
+            elsif is_mode_kw(tl) is
+                l_mode = tl
+            elsif tl == "no-clip" is
+                no_clip = true
+            elsif tl == "border-box" || tl == "padding-box" || tl == "content-box" || tl == "margin-box" || tl == "fill-box" || tl == "stroke-box" || tl == "view-box" is
+                boxes = array_push(boxes, tl)
+            elsif in_size is
+                l_size = if l_size == "" then tl else l_size + " " + tl
+            elsif is_pos_kw(tl) || is_numeric_tok(tl) is
+                l_pos = if l_pos == "" then tl else l_pos + " " + tl
+            elsif tl == "auto" || tl == "cover" || tl == "contain" is
+                l_size = if l_size == "" then tl else l_size + " " + tl
+            end
+        end
+        let mut l_org: string = "border-box"
+        let mut l_clp: string = "border-box"
+        if array_len(boxes) >= 1 is
+            l_org = boxes[0]
+            l_clp = boxes[0]
+        end
+        if array_len(boxes) >= 2 is l_clp = boxes[1] end
+        if no_clip is l_clp = "no-clip" end
+        if l_pos == "" is l_pos = "0% 0%" end
+        if l_size == "" is l_size = "auto" end
+        if l_rep == "" is l_rep = "repeat" end
+        img = join_list(img, l_img)
+        pos = join_list(pos, l_pos)
+        size = join_list(size, l_size)
+        rep = join_list(rep, l_rep)
+        org = join_list(org, l_org)
+        clp = join_list(clp, l_clp)
+        comp = join_list(comp, l_comp)
+        mode = join_list(mode, l_mode)
+    end
+    return [img, pos, size, rep, org, clp, comp, mode]
+end
+
+;; kod operacji mask-composite dla natywnego capture_mask: 1 add, 2 subtract, 3 intersect, 4 exclude
+pub fn composite_code(kw: string) -> int is
+    if kw == "subtract" is return 2 end
+    if kw == "intersect" is return 3 end
+    if kw == "exclude" is return 4 end
+    return 1
+end
+
+
+;; ====================================================================
+;;  border-image (slice / width / outset / repeat) — geometria 9 fragmentów
+;; ====================================================================
+;; Skrót `border-image`: [source, slice, width, outset, repeat]
+pub fn split_border_image(val: string) -> [string] is
+    let v: string = string_trim(val)
+    let mut src: string = "none"
+    let mut rep: string = ""
+    ;; wydziel źródło (url(...) lub funkcja gradientu) — bywa pierwszym tokenem z nawiasem
+    let toks: [string] = cssval::split_top(v)
+    let mut nums: string = ""
+    let mut ti: int = 0
+    while ti < array_len(toks) is
+        let t: string = toks[ti]
+        let tl: string = string_lower(t)
+        ti += 1
+        if string_starts_with(tl, "url(") || is_gradient_fn(tl) || string_starts_with(tl, "image-set(") is
+            src = t
+        elsif tl == "stretch" || tl == "repeat" || tl == "round" || tl == "space" is
+            rep = if rep == "" then tl else rep + " " + tl
+        elsif tl == "none" is
+            src = "none"
+        else is
+            nums = if nums == "" then t else nums + " " + t
+        end
+    end
+    ;; nums = "<slice> [/ <width> [/ <outset>]]" — tokeny rozdzielone, ukośnik może być osobnym tokenem lub przy liczbie
+    let spaced: string = string_replace(nums, "/", " / ")
+    let parts: [string] = cssval::split_top(spaced)
+    let mut slice: string = ""
+    let mut width: string = ""
+    let mut outset: string = ""
+    let mut stage: int = 0
+    let mut pi: int = 0
+    while pi < array_len(parts) is
+        let p: string = parts[pi]
+        pi += 1
+        if p == "/" is
+            stage += 1
+        elsif stage == 0 is
+            slice = if slice == "" then p else slice + " " + p
+        elsif stage == 1 is
+            width = if width == "" then p else width + " " + p
+        else is
+            outset = if outset == "" then p else outset + " " + p
+        end
+    end
+    if slice == "" is slice = "100%" end
+    if width == "" is width = "1" end
+    if outset == "" is outset = "0" end
+    if rep == "" is rep = "stretch" end
+    return [src, slice, width, outset, rep]
+end
+
+;; 1–4 wartości → [top, right, bottom, left] (tokeny)
+fn expand4(v: string) -> [string] is
+    let t: [string] = cssval::split_top(string_trim(v))
+    let n: int = array_len(t)
+    if n == 0 is return ["0", "0", "0", "0"] end
+    if n == 1 is return [t[0], t[0], t[0], t[0]] end
+    if n == 2 is return [t[0], t[1], t[0], t[1]] end
+    if n == 3 is return [t[0], t[1], t[2], t[1]] end
+    return [t[0], t[1], t[2], t[3]]
+end
+
+;; Przecięcia obrazka: [t, r, b, l, fill] w px obrazka (liczby = px, % wg wymiaru obrazka); fill = 1 gdy słowo `fill`.
+pub fn bi_slice(slice: string, iw: int, ih: int) -> [int] is
+    let fill: bool = string_find(string_lower(slice), "fill") >= 0
+    let clean: string = string_replace(string_lower(slice), "fill", " ")
+    let e: [string] = expand4(clean)
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < 4 is
+        let full: int = if i == 0 || i == 2 then ih else iw
+        let tok: string = e[i]
+        let mut px: int = 0
+        if string_ends_with(tok, "%") is
+            px = len_px(tok, full, 16)
+        else is
+            px = (parse_x1000(tok) + 500) / 1000
+        end
+        if px < 0 is px = 0 end
+        if px > full is px = full end
+        out = array_push(out, px)
+        i += 1
+    end
+    out = array_push(out, if fill then 1 else 0)
+    return out
+end
+
+;; Szerokości obramowania obrazkowego [t, r, b, l]: liczba = krotność szerokości ramki, długość = px, % od obszaru, auto = rozmiar przecięcia.
+pub fn bi_width(width: string, bw: [int], aw: int, ah: int, slice: [int], em: int) -> [int] is
+    let e: [string] = expand4(width)
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < 4 is
+        let tok: string = string_lower(e[i])
+        let mut px: int = 0
+        if tok == "auto" is
+            px = slice[i]
+        elsif string_ends_with(tok, "%") is
+            px = len_px(tok, if i == 0 || i == 2 then ah else aw, em)
+        elsif is_numeric_tok(tok) && num_len(tok) == string_len(tok) is
+            px = (parse_x1000(tok) * bw[i] + 500) / 1000
+        else is
+            px = len_px(tok, 0, em)
+        end
+        out = array_push(out, if px < 0 then 0 else px)
+        i += 1
+    end
+    return out
+end
+
+pub fn bi_outset(outset: string, bw: [int], em: int) -> [int] is
+    let e: [string] = expand4(outset)
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < 4 is
+        let tok: string = string_lower(e[i])
+        let mut px: int = 0
+        if is_numeric_tok(tok) && num_len(tok) == string_len(tok) is
+            px = (parse_x1000(tok) * bw[i] + 500) / 1000
+        else is
+            px = len_px(tok, 0, em)
+        end
+        out = array_push(out, if px < 0 then 0 else px)
+        i += 1
+    end
+    return out
+end
+
+;; border-image-repeat → [rx, ry]: 0 stretch, 1 repeat, 2 round, 3 space
+pub fn bi_repeat(rep: string) -> [int] is
+    let t: [string] = cssval::split_top(string_lower(string_trim(rep)))
+    let a: string = if array_len(t) > 0 then t[0] else "stretch"
+    let b: string = if array_len(t) > 1 then t[1] else a
+    let ma: int = if a == "repeat" then 1 elsif a == "round" then 2 elsif a == "space" then 3 else 0
+    let mb: int = if b == "repeat" then 1 elsif b == "round" then 2 elsif b == "space" then 3 else 0
+    return [ma, mb]
+end
+
+;; Kafelkowanie wzdłuż osi krawędzi: [start, długość_kafelka, krok, powtarzaj(0/1)]; długość_kafelka = 0 → pomiń (space bez miejsca)
+fn edge_tiles(start: int, len: int, tile: int, mode: int) -> [int] is
+    if mode == 0 || tile < 1 is return [start, len, len, 0] end
+    if mode == 1 is
+        return [start + (len - tile) / 2, tile, tile, 1]
+    end
+    if mode == 2 is
+        let n: int = if (len + tile / 2) / tile < 1 then 1 else (len + tile / 2) / tile
+        let t2: int = len / n
+        return [start, if t2 < 1 then 1 else t2, if t2 < 1 then 1 else t2, 1]
+    end
+    let n3: int = len / tile
+    if n3 < 1 is return [start, 0, 0, 0] end
+    let gap: int = (len - n3 * tile) / (n3 + 1)
+    return [start + gap, tile, tile + gap, 1]
+end
+
+;; Fragmenty: płaska lista po 17 liczb [id, sx,sy,sw,sh, dx,dy,dw,dh, tw,th, tx,ty, stepx,stepy, repx,repy]; id 0..8 = TL,T,TR,L,M,R,BL,B,BR.
+pub fn border_image_pieces(ax: int, ay: int, aw: int, ah: int, iw: int, ih: int, slice: [int], width0: [int], rx: int, ry: int) -> [int] is
+    let mut wd: [int] = width0
+    ;; zbyt duże szerokości skalujemy proporcjonalnie
+    let mut f1000: int = 1000
+    if wd[1] + wd[3] > aw && wd[1] + wd[3] > 0 is f1000 = aw * 1000 / (wd[1] + wd[3]) end
+    if wd[0] + wd[2] > ah && wd[0] + wd[2] > 0 is
+        let fv: int = ah * 1000 / (wd[0] + wd[2])
+        if fv < f1000 is f1000 = fv end
+    end
+    if f1000 < 1000 is
+        wd = [wd[0] * f1000 / 1000, wd[1] * f1000 / 1000, wd[2] * f1000 / 1000, wd[3] * f1000 / 1000]
+    end
+    let st: int = slice[0]
+    let sr: int = slice[1]
+    let sb: int = slice[2]
+    let sl: int = slice[3]
+    let wt: int = wd[0]
+    let wr: int = wd[1]
+    let wb: int = wd[2]
+    let wl: int = wd[3]
+    let mut out: [int] = []
+    let midw: int = aw - wl - wr
+    let midh: int = ah - wt - wb
+    let srcmw: int = iw - sl - sr
+    let srcmh: int = ih - st - sb
+    ;; narożniki: id, źródło, cel
+    out = piece_add(out, 0, 0, 0, sl, st, ax, ay, wl, wt, wl, wt, ax, ay, wl, wt, 0, 0)
+    out = piece_add(out, 2, iw - sr, 0, sr, st, ax + aw - wr, ay, wr, wt, wr, wt, ax + aw - wr, ay, wr, wt, 0, 0)
+    out = piece_add(out, 6, 0, ih - sb, sl, sb, ax, ay + ah - wb, wl, wb, wl, wb, ax, ay + ah - wb, wl, wb, 0, 0)
+    out = piece_add(out, 8, iw - sr, ih - sb, sr, sb, ax + aw - wr, ay + ah - wb, wr, wb, wr, wb, ax + aw - wr, ay + ah - wb, wr, wb, 0, 0)
+    ;; krawędzie poziome (góra, dół): kafelek ma wysokość grubości, szerokość z zachowaniem proporcji
+    if midw > 0 && srcmw > 0 is
+        if st > 0 && wt > 0 is
+            let tw: int = if rx == 0 then midw else (srcmw * wt + st / 2) / st
+            let et: [int] = edge_tiles(ax + wl, midw, tw, rx)
+            if et[1] > 0 is out = piece_add(out, 1, sl, 0, srcmw, st, ax + wl, ay, midw, wt, et[1], wt, et[0], ay, et[2], wt, et[3], 0) end
+        end
+        if sb > 0 && wb > 0 is
+            let tw2: int = if rx == 0 then midw else (srcmw * wb + sb / 2) / sb
+            let eb: [int] = edge_tiles(ax + wl, midw, tw2, rx)
+            if eb[1] > 0 is out = piece_add(out, 7, sl, ih - sb, srcmw, sb, ax + wl, ay + ah - wb, midw, wb, eb[1], wb, eb[0], ay + ah - wb, eb[2], wb, eb[3], 0) end
+        end
+    end
+    if midh > 0 && srcmh > 0 is
+        if sl > 0 && wl > 0 is
+            let th: int = if ry == 0 then midh else (srcmh * wl + sl / 2) / sl
+            let el: [int] = edge_tiles(ay + wt, midh, th, ry)
+            if el[1] > 0 is out = piece_add(out, 3, 0, st, sl, srcmh, ax, ay + wt, wl, midh, wl, el[1], ax, el[0], wl, el[2], 0, el[3]) end
+        end
+        if sr > 0 && wr > 0 is
+            let th2: int = if ry == 0 then midh else (srcmh * wr + sr / 2) / sr
+            let er: [int] = edge_tiles(ay + wt, midh, th2, ry)
+            if er[1] > 0 is out = piece_add(out, 5, iw - sr, st, sr, srcmh, ax + aw - wr, ay + wt, wr, midh, wr, er[1], ax + aw - wr, er[0], wr, er[2], 0, er[3]) end
+        end
+    end
+    return out
+end
+
+;; środek (border-image-slice: fill) rysowany osobno — rozciągnięty na całe wnętrze
+pub fn border_image_middle(ax: int, ay: int, aw: int, ah: int, iw: int, ih: int, slice: [int], wd: [int]) -> [int] is
+    let midw: int = aw - wd[1] - wd[3]
+    let midh: int = ah - wd[0] - wd[2]
+    let srcmw: int = iw - slice[3] - slice[1]
+    let srcmh: int = ih - slice[0] - slice[2]
+    if midw <= 0 || midh <= 0 || srcmw <= 0 || srcmh <= 0 is return [] end
+    return piece_add([], 4, slice[3], slice[0], srcmw, srcmh, ax + wd[3], ay + wd[0], midw, midh, midw, midh, ax + wd[3], ay + wd[0], midw, midh, 0, 0)
+end
+
+fn piece_add(out0: [int], id: int, sx: int, sy: int, sw: int, sh: int, dx: int, dy: int, dw: int, dh: int, tw: int, th: int, tx: int, ty: int, stx: int, sty: int, repx: int, repy: int) -> [int] is
+    if sw < 1 || sh < 1 || dw < 1 || dh < 1 is return out0 end
+    let mut out: [int] = out0
+    out = array_push(out, id)
+    out = array_push(out, sx)
+    out = array_push(out, sy)
+    out = array_push(out, sw)
+    out = array_push(out, sh)
+    out = array_push(out, dx)
+    out = array_push(out, dy)
+    out = array_push(out, dw)
+    out = array_push(out, dh)
+    out = array_push(out, tw)
+    out = array_push(out, th)
+    out = array_push(out, tx)
+    out = array_push(out, ty)
+    out = array_push(out, stx)
+    out = array_push(out, sty)
+    out = array_push(out, repx)
+    out = array_push(out, repy)
+    return out
+end
+
+;; fragment (17 liczb) numer k → ciąg dla natywnego silver_draw_part
+pub fn piece_spec(pieces: [int], k: int) -> string is
+    let b: int = k * 17 + 1
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < 16 is
+        if i > 0 is s = s + "," end
+        s = s + to_string(pieces[b + i])
+        i += 1
+    end
+    return s
+end
