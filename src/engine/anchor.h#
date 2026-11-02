@@ -1,0 +1,306 @@
+mod cssval
+mod props
+use "std -> conv" from "conv"
+
+;; 0.4: CSS Anchor Positioning — część czysta (bez układu): parsowanie anchor(), anchor-size(), position-area
+;; i odwracanie stron dla position-try-fallbacks. Prostokąt kotwicy to [x, y, w, h] we współrzędnych dokumentu.
+;; Obsługiwane: anchor([--nazwa] <strona>[, fallback]) w top/right/bottom/left, anchor-size([--nazwa] <oś>[, fallback]) w width/height,
+;; position-area (kratka 3×3 wokół kotwicy; słowa top/bottom/left/right/center/span-*/x-*/y-*/block-*/inline-* jak w ltr + horizontal-tb),
+;; position-try-fallbacks: flip-block, flip-inline, flip-start (oraz kombinacje). Bez @position-try (reguły nazwane).
+
+;; Zawartość nawiasów pierwszego wywołania `fname(...)` w `val` ("" gdy brak).
+pub fn fn_args(val: string, fname: string) -> string is
+    let low: string = string_lower(val)
+    let key: string = fname + "("
+    let p: int = string_find(low, key)
+    if p < 0 is return "" end
+    if p > 0 && string_at(low, p - 1) != " " && string_at(low, p - 1) != "(" && string_at(low, p - 1) != "," && string_at(low, p - 1) != "+" && string_at(low, p - 1) != "-" && string_at(low, p - 1) != "*" is return "" end
+    let start: int = p + string_len(key)
+    let mut depth: int = 1
+    let mut i: int = start
+    let n: int = string_len(val)
+    while i < n && depth > 0 is
+        let c: string = string_at(val, i)
+        if c == "(" is depth += 1 end
+        if c == ")" is depth -= 1 end
+        i += 1
+    end
+    if depth != 0 is return "" end
+    return string_trim(string_slice(val, start, i - 1))
+end
+
+;; "--a bottom, 10px" → [nazwa, słowo, fallback]
+pub fn split_args(args: string) -> [string] is
+    let parts: [string] = cssval::split_commas(args)
+    let main: string = if array_len(parts) >= 1 then string_trim(parts[0]) else ""
+    let fb: string = if array_len(parts) >= 2 then string_trim(parts[1]) else ""
+    let toks: [string] = cssval::split_top(main)
+    let mut name: string = ""
+    let mut word: string = ""
+    let mut i: int = 0
+    while i < array_len(toks) is
+        if string_starts_with(toks[i], "--") is
+            name = toks[i]
+        else is
+            word = string_lower(toks[i])
+        end
+        i += 1
+    end
+    return [name, word, fb]
+end
+
+;; Współrzędna boku kotwicy: `horizontal` = oś x (left/right/start/end), inaczej oś y. Zwraca -1000000 dla nieznanego słowa.
+pub fn side_coord(word: string, ax: [int], horizontal: bool) -> int is
+    let x0: int = if horizontal then ax[0] else ax[1]
+    let len: int = if horizontal then ax[2] else ax[3]
+    if horizontal is
+        if word == "left" || word == "start" || word == "self-start" is return x0 end
+        if word == "right" || word == "end" || word == "self-end" is return x0 + len end
+    else is
+        if word == "top" || word == "start" || word == "self-start" is return x0 end
+        if word == "bottom" || word == "end" || word == "self-end" is return x0 + len end
+    end
+    if word == "center" is return x0 + len / 2 end
+    if string_ends_with(word, "%") is
+        return x0 + conv::float_to_int(conv::str_to_float(string_slice(word, 0, string_len(word) - 1)) * conv::int_to_float(len) / 100.0)
+    end
+    return -1000000
+end
+
+pub fn size_val(word: string, ax: [int]) -> int is
+    if word == "width" || word == "inline" || word == "self-inline" is return ax[2] end
+    if word == "height" || word == "block" || word == "self-block" is return ax[3] end
+    return -1
+end
+
+;; ---------- position-area ----------
+;; Zwraca [x0, y0, x1, y1, wyrównanie poziome, wyrównanie pionowe]; wyrównanie: 0 = do początku, 1 = środek, 2 = do końca.
+;; Kratka: kolumny lewa/środkowa/prawa, wiersze górny/środkowy/dolny, kotwica w środku; `cb` = [x, y, w, h].
+pub fn area_region(area0: string, ax: [int], cb: [int]) -> [int] is
+    let toks: [string] = cssval::split_top(string_lower(string_trim(area0)))
+    let mut cx0: int = 0
+    let mut cx1: int = 2
+    let mut ry0: int = 0
+    let mut ry1: int = 2
+    let mut have_h: bool = false
+    let mut have_v: bool = false
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        ;; słowa logiczne w ltr/horizontal-tb → fizyczne
+        let mut w: string = t
+        if t == "x-start" || t == "inline-start" || t == "self-x-start" || t == "self-inline-start" is w = "left" end
+        if t == "x-end" || t == "inline-end" || t == "self-x-end" || t == "self-inline-end" is w = "right" end
+        if t == "y-start" || t == "block-start" || t == "self-y-start" || t == "self-block-start" is w = "top" end
+        if t == "y-end" || t == "block-end" || t == "self-y-end" || t == "self-block-end" is w = "bottom" end
+        if t == "start" is
+            w = if have_h || i > 1 then "top" else "left"
+        end
+        if t == "end" is
+            w = if have_h || i > 1 then "bottom" else "right"
+        end
+        if w == "left" is
+            cx0 = 0
+            cx1 = 0
+            have_h = true
+        elsif w == "right" is
+            cx0 = 2
+            cx1 = 2
+            have_h = true
+        elsif w == "top" is
+            ry0 = 0
+            ry1 = 0
+            have_v = true
+        elsif w == "bottom" is
+            ry0 = 2
+            ry1 = 2
+            have_v = true
+        elsif w == "center" is
+            if !have_h && (array_len(toks) == 1 || i == 1) && !(array_len(toks) == 2 && (toks[1] == "top" || toks[1] == "bottom" || toks[1] == "y-start" || toks[1] == "y-end" || toks[1] == "block-start" || toks[1] == "block-end")) is
+                cx0 = 1
+                cx1 = 1
+                have_h = true
+                if array_len(toks) == 1 is
+                    ry0 = 1
+                    ry1 = 1
+                    have_v = true
+                end
+            else is
+                ry0 = 1
+                ry1 = 1
+                have_v = true
+            end
+        elsif w == "span-left" is
+            cx0 = 0
+            cx1 = 1
+            have_h = true
+        elsif w == "span-right" is
+            cx0 = 1
+            cx1 = 2
+            have_h = true
+        elsif w == "span-top" is
+            ry0 = 0
+            ry1 = 1
+            have_v = true
+        elsif w == "span-bottom" is
+            ry0 = 1
+            ry1 = 2
+            have_v = true
+        elsif w == "span-all" is
+            if have_h && !have_v is
+                ry0 = 0
+                ry1 = 2
+                have_v = true
+            else is
+                cx0 = 0
+                cx1 = 2
+                have_h = true
+            end
+        end
+    end
+    ;; pojedyncze słowo osi = ta oś ustalona, druga rozciągnięta na całość (span-all)
+    if have_h && !have_v is
+        ry0 = 0
+        ry1 = 2
+    end
+    if have_v && !have_h is
+        cx0 = 0
+        cx1 = 2
+    end
+    let colx: [int] = [cb[0], ax[0], ax[0] + ax[2], cb[0] + cb[2]]
+    let rowy: [int] = [cb[1], ax[1], ax[1] + ax[3], cb[1] + cb[3]]
+    let x0: int = colx[cx0]
+    let x1: int = colx[cx1 + 1]
+    let y0: int = rowy[ry0]
+    let y1: int = rowy[ry1 + 1]
+    ;; wyrównanie `normal`: przy kotwicy — do jej strony; środek/span-all — wyśrodkowanie na kotwicy
+    let mut ha: int = 1
+    if cx0 == 0 && cx1 == 0 is ha = 2 end
+    if cx0 == 2 && cx1 == 2 is ha = 0 end
+    if cx0 == 0 && cx1 == 1 is ha = 2 end
+    if cx0 == 1 && cx1 == 2 is ha = 0 end
+    let mut va: int = 1
+    if ry0 == 0 && ry1 == 0 is va = 2 end
+    if ry0 == 2 && ry1 == 2 is va = 0 end
+    if ry0 == 0 && ry1 == 1 is va = 2 end
+    if ry0 == 1 && ry1 == 2 is va = 0 end
+    return [x0, y0, x1, y1, ha, va]
+end
+
+;; ---------- odwracanie dla position-try-fallbacks ----------
+pub fn flip_word(w: string, block: bool, inline_: bool) -> string is
+    if block is
+        if w == "top" is return "bottom" end
+        if w == "bottom" is return "top" end
+        if w == "span-top" is return "span-bottom" end
+        if w == "span-bottom" is return "span-top" end
+        if w == "y-start" || w == "block-start" is return "y-end" end
+        if w == "y-end" || w == "block-end" is return "y-start" end
+    end
+    if inline_ is
+        if w == "left" is return "right" end
+        if w == "right" is return "left" end
+        if w == "span-left" is return "span-right" end
+        if w == "span-right" is return "span-left" end
+        if w == "x-start" || w == "inline-start" is return "x-end" end
+        if w == "x-end" || w == "inline-end" is return "x-start" end
+    end
+    return w
+end
+
+pub fn flip_area(area: string, block: bool, inline_: bool) -> string is
+    let toks: [string] = cssval::split_top(string_lower(string_trim(area)))
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(toks) is
+        out = (if i == 0 then "" else out + " ") + flip_word(toks[i], block, inline_)
+        i += 1
+    end
+    return out
+end
+
+;; Strona wstawki po odwróceniu: top↔bottom (block), left↔right (inline).
+pub fn flip_prop(prop: string, block: bool, inline_: bool) -> string is
+    if block && prop == "top" is return "bottom" end
+    if block && prop == "bottom" is return "top" end
+    if inline_ && prop == "left" is return "right" end
+    if inline_ && prop == "right" is return "left" end
+    return prop
+end
+
+;; Lista prób z position-try-fallbacks: każda próba = [odwróć block (0/1), odwróć inline (0/1)]. Pierwsza próba to zawsze [0,0].
+pub fn try_list(v: string) -> [[int]] is
+    let mut out: [[int]] = [[0, 0]]
+    let low: string = string_lower(string_trim(v))
+    if low == "" || low == "none" is
+        return out
+    end
+    let items: [string] = cssval::split_commas(low)
+    let mut i: int = 0
+    while i < array_len(items) is
+        let it: string = items[i]
+        i += 1
+        let b: bool = string_find(it, "flip-block") >= 0
+        let l: bool = string_find(it, "flip-inline") >= 0
+        let st: bool = string_find(it, "flip-start") >= 0
+        if b || l is
+            out = array_push(out, [if b then 1 else 0, if l then 1 else 0])
+        elsif st is
+            out = array_push(out, [1, 1])
+        end
+    end
+    return out
+end
+
+;; 0.4: position-try (skrót: [<order>] <fallbacks>) i position-try-order. Zwraca [order, fallbacks];
+;; osobne właściwości mają pierwszeństwo przed skrótem.
+pub fn try_spec(xp: string) -> [string] is
+    let mut order: string = string_lower(string_trim(props::xget(xp, "position-try-order")))
+    let mut fb: string = string_trim(props::xget(xp, "position-try-fallbacks"))
+    let sh: string = string_trim(props::xget(xp, "position-try"))
+    if sh != "" && string_lower(sh) != "none" is
+        let low: string = string_lower(sh)
+        let toks: [string] = cssval::split_top(low)
+        if array_len(toks) > 0 && (string_starts_with(toks[0], "most-") || toks[0] == "normal") is
+            if order == "" || order == "normal" || order == "none" is order = toks[0] end
+            if fb == "" || string_lower(fb) == "none" is
+                fb = string_trim(string_slice(sh, string_len(toks[0]), string_len(sh)))
+            end
+        else is
+            if fb == "" || string_lower(fb) == "none" is fb = sh end
+        end
+    end
+    if order == "" || order == "none" is order = "normal" end
+    return [order, fb]
+end
+
+;; Miara przestrzeni dla position-try-order: szerokość lub wysokość obszaru (region = [x0, y0, x1, y1]); -1 dla normal.
+pub fn order_metric(order: string, rw: int, rh: int) -> int is
+    if order == "most-width" || order == "most-inline-size" is return rw end
+    if order == "most-height" || order == "most-block-size" is return rh end
+    return -1
+end
+
+;; Indeksy prób posortowane malejąco wg miary (stabilnie); `metrics` = miary w kolejności prób.
+pub fn sort_by_metric(metrics: [int]) -> [int] is
+    let n: int = array_len(metrics)
+    let mut idx: [int] = []
+    let mut i: int = 0
+    while i < n is
+        idx = array_push(idx, i)
+        i += 1
+    end
+    i = 1
+    while i < n is
+        let cur: int = idx[i]
+        let mut j: int = i - 1
+        while j >= 0 && metrics[idx[j]] < metrics[cur] is
+            idx[j + 1] = idx[j]
+            j -= 1
+        end
+        idx[j + 1] = cur
+        i += 1
+    end
+    return idx
+end
