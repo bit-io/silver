@@ -16,7 +16,12 @@ data = open(os.path.join(H, '..', 'src', 'engine', 'props_data.h#'), encoding='u
 registry = set(re.findall(r'([a-z0-9-]+)\\u0001[01]\\u0001', data))
 parsed = [p for p in props if p in registry]
 rend = [p for p in props if p in rendered]
+noop = set(words('css_noop_by_spec.txt'))
 bad = [p for p in rendered if p not in props]
+bad += [p for p in noop if p not in props]
+both = [p for p in noop if p in rendered]
+spec_noop = [p for p in props if p in noop and p not in rendered]
+missing = [p for p in props if p not in rendered and p not in noop]
 # najczęściej używane właściwości (przekrój typowych arkuszy stylów)
 TOP = """display position top right bottom left z-index float clear width height min-width max-width min-height max-height
 margin margin-top margin-right margin-bottom margin-left padding padding-top padding-right padding-bottom padding-left
@@ -37,6 +42,10 @@ print("Właściwości CSS na liście:        %d" % len(props))
 print("Parsowane / walidowane / w stylu: %d (%s)" % (len(parsed), pct(len(parsed), len(props))))
 print("Faktycznie renderowane:           %d (%s)" % (len(rend), pct(len(rend), len(props))))
 print("Najczęściej używane (%d):          renderowane %d (%s)" % (len(TOP), len(top_r), pct(len(top_r), len(TOP))))
+print("Bez efektu wg specyfikacji (platforma): %d (%s) — nie liczone jako renderowane" % (len(spec_noop), pct(len(spec_noop), len(props))))
+print("Renderowane + bez efektu wg specyfikacji: %d (%s)" % (len(rend) + len(spec_noop), pct(len(rend) + len(spec_noop), len(props))))
+print("Brakuje (parsowane, ale bez implementacji, %d): %s" % (len(missing), " ".join(missing)))
+if both: print("UWAGA: te nazwy są jednocześnie w css_rendered.txt i css_noop_by_spec.txt:", " ".join(both)); sys.exit(1)
 if top_p: print("  popularne, ale tylko parsowane:  " + " ".join(top_p))
 if bad: print("UWAGA: w css_rendered.txt są nazwy spoza listy:", " ".join(bad)); sys.exit(1)
 if len(parsed) < len(props) * 0.5 or len(rend) < len(props) * 0.5:
