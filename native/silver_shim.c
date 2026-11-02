@@ -9,6 +9,11 @@
 #include <string.h>
 #include <math.h>
 #include <stdarg.h>
+#include "silver_fx.h"
+#define NANOSVG_IMPLEMENTATION
+#define NANOSVGRAST_IMPLEMENTATION
+#include "third_party/nanosvg/nanosvg.h"
+#include "third_party/nanosvg/nanosvgrast.h"
 
 #define SILVER_MAX_WINDOWS   8
 #define SILVER_EV_QUEUE      512
@@ -36,7 +41,8 @@ typedef struct {
 typedef struct {
     char        *path;
     SDL_Texture *tex;
-    int          w, h;
+    int          w, h;          /* piksele surowe (przed orientacją EXIF) */
+    int          exif;          /* 0.4: orientacja EXIF 1..8 (1 = brak) */
     Uint32       used;
 } SilverImage;
 
@@ -276,11 +282,13 @@ static TTF_Font *get_font(SilverWindow *w, int size) {
     return get_font_tag(w, size, 0, w->font_path);
 }
 
-/* Wybiera font dla `style` (bity 0..7 = flagi, 8..22 = klucz rodziny). `eff_style` = flagi,
- * które trzeba jeszcze zasymulować przez TTF (pogrubienie/kursywa, gdy brak prawdziwego kroju). */
+/* Wybiera font dla `style` (0.4: bity 0..15 = flagi, 16..30 = klucz rodziny).
+ * Flagi: 1 bold, 2 italic, 4 underline, 8 strike, 16 bez kerningu, 32 bez hintingu, 64/128 bez syntezy b/i,
+ * 256 = cyfry tabelaryczne (font-variant-numeric: tabular-nums), bity 9..14 = font-stretch w krokach 5% (0 = 100%), 32768 = text-spacing-trim.
+ * `eff_style` = flagi, które trzeba jeszcze zasymulować przez TTF (pogrubienie/kursywa, gdy brak prawdziwego kroju). */
 static TTF_Font *get_font_style(SilverWindow *w, int size, int style, int *eff_style) {
-    int key = (style >> 8) & 0x7FFF;
-    *eff_style = style & 0xFF;
+    int key = (style >> 16) & 0x7FFF;
+    *eff_style = style & 0xFFFF;
     if (key) {
         int variant = (style & 1) | ((style & 2));
         for (int fi = 0; fi < w->fam_count; fi++) {
@@ -752,9 +760,14 @@ int silver_set_icon(int h, const char *path) {
     return 1;
 }
 
+static void grad_cache_purge(SDL_Renderer *ren);
+static void svg_cache_purge(SDL_Renderer *ren);
+
 int silver_window_close(int h) {
     if (!VALID(h)) return 0;
     SilverWindow *w = &g_windows[h];
+    grad_cache_purge(w->ren);
+    svg_cache_purge(w->ren);
     flush_fonts(w);
     flush_texts(w);
     for (int i = 0; i < SILVER_IMAGE_CACHE; i++) {
@@ -1109,6 +1122,137 @@ static Uint32 fnv(const char *s) {
     return h;
 }
 
+/* 0.4: font-kerning: none — SDL_ttf (HarfBuzz) zawsze stosuje kerning GPOS i nie pozwala go wyłączyć,
+ * więc przy fladze 16 mierzymy i rysujemy znak po znaku (suma przesunięć pojedynczych glifów). */
+static int utf8_step(const char *s) {
+    unsigned char c = (unsigned char)*s;
+    if (c < 0x80) return 1;
+    if ((c >> 5) == 6) return 2;
+    if ((c >> 4) == 14) return 3;
+    if ((c >> 3) == 30) return 4;
+    return 1;
+}
+
+/* 0.4: komórka cyfry tabelarycznej = szerokość najszerszej cyfry 0..9 */
+static int digit_cell(TTF_Font *font) {
+    int best = 0;
+    for (char c = '0'; c <= '9'; c++) {
+        char buf[2] = { c, 0 };
+        int gw = 0, gh = 0;
+        TTF_SizeUTF8(font, buf, &gw, &gh);
+        if (gw > best) best = gw;
+    }
+    return best;
+}
+
+/* szerokość znaku w trybie „po znaku" (bez kerningu i/lub z cyframi tabelarycznymi) */
+static int glyph_adv(TTF_Font *font, const char *buf, int tnum, int cell) {
+    int gw = 0, gh = 0;
+    TTF_SizeUTF8(font, buf, &gw, &gh);
+    if (tnum && buf[0] >= '0' && buf[0] <= '9' && buf[1] == 0) return cell;
+    return gw;
+}
+
+/* 0.4: text-spacing-trim — klasy pełnoszerokiej interpunkcji CJK: 1 otwierająca, 2 zamykająca/kropka/przecinek */
+static int cp_of(const char *b) {
+    unsigned char c = (unsigned char)b[0];
+    if (c < 0x80) return c;
+    if ((c & 0xE0) == 0xC0) return ((c & 0x1F) << 6) | (b[1] & 0x3F);
+    if ((c & 0xF0) == 0xE0) return ((c & 0x0F) << 12) | ((b[1] & 0x3F) << 6) | (b[2] & 0x3F);
+    return 0x10000;
+}
+static int trim_class(int cp) {
+    switch (cp) {
+        case 0x3008: case 0x300A: case 0x300C: case 0x300E: case 0x3010: case 0x3014: case 0xFF08: case 0xFF3B: case 0xFF5B: return 1;
+        case 0x3009: case 0x300B: case 0x300D: case 0x300F: case 0x3011: case 0x3015: case 0xFF09: case 0xFF3D: case 0xFF5D:
+        case 0x3001: case 0x3002: case 0xFF0C: case 0xFF0E: case 0xFF1A: case 0xFF1B: case 0xFF01: case 0xFF1F: return 2;
+        default: return 0;
+    }
+}
+/* tekst zawiera bajty, od których zaczynają się znaki z trim_class (U+3000–U+30FF lub U+FF00–U+FFEF) */
+static int has_trim_candidates(const char *text) {
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (p[0] == 0xE3 && (p[1] == 0x80 || p[1] == 0x81 || p[1] == 0x82 || p[1] == 0x83)) return 1;
+        if (p[0] == 0xEF && (p[1] == 0xBC || p[1] == 0xBD)) return 1;
+    }
+    return 0;
+}
+
+/* Rozmieszczenie znaków: szerokość zaawansowania każdego znaku i przesunięcie rysowania (x), z uwzględnieniem
+ * cyfr tabelarycznych (tnum) i przycinania odstępów między sąsiednimi znakami interpunkcji CJK (trim). */
+typedef struct { int adv; int dx; } GlyphPos;
+
+static int layout_glyphs(TTF_Font *font, const char *text, int tnum, int trim, GlyphPos *out, int cap) {
+    int cell = tnum ? digit_cell(font) : 0;
+    int n = 0, prev_cls = 0;
+    for (const char *p = text; *p && n < cap; ) {
+        int len = utf8_step(p);
+        char buf[8];
+        memcpy(buf, p, (size_t)len); buf[len] = 0;
+        int gw = glyph_adv(font, buf, tnum, cell);
+        int cls = trim ? trim_class(cp_of(buf)) : 0;
+        out[n].adv = gw; out[n].dx = 0;
+        if (trim && n > 0) {
+            if (prev_cls == 2 && (cls == 1 || cls == 2)) out[n - 1].adv -= out[n - 1].adv / 2;   /* …）（ i …）） — przytnij prawą połowę poprzedniego */
+            else if (prev_cls == 1 && cls == 1) { out[n].adv -= gw / 2; out[n].dx = -(gw / 2); } /* （（ — przytnij lewą połowę drugiego */
+        }
+        prev_cls = cls;
+        n++;
+        p += len;
+    }
+    return n;
+}
+
+static int nokern_width(TTF_Font *font, const char *text, int tnum, int trim) {
+    enum { CAP = 4096 };
+    static GlyphPos gp[CAP];
+    int n = layout_glyphs(font, text, tnum, trim, gp, CAP);
+    int total = 0;
+    for (int i = 0; i < n; i++) total += gp[i].adv;
+    return total;
+}
+
+static SDL_Surface *render_nokern(TTF_Font *font, const char *text, SDL_Color col, int tnum, int trim) {
+    enum { CAP = 4096 };
+    static GlyphPos gp[CAP];
+    int n = layout_glyphs(font, text, tnum, trim, gp, CAP);
+    int total = 0;
+    for (int i = 0; i < n; i++) total += gp[i].adv;
+    int fh = TTF_FontHeight(font);
+    int cell = tnum ? digit_cell(font) : 0;
+    if (total < 1 || fh < 1) return NULL;
+    SDL_Surface *dst = SDL_CreateRGBSurfaceWithFormat(0, total, fh, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!dst) return NULL;
+    SDL_FillRect(dst, NULL, 0);
+    SDL_SetSurfaceBlendMode(dst, SDL_BLENDMODE_BLEND);
+    int x = 0, k = 0;
+    for (const char *p = text; *p && k < n; k++) {
+        int len = utf8_step(p);
+        char buf[8];
+        memcpy(buf, p, (size_t)len); buf[len] = 0;
+        if (buf[0] != ' ') {
+            SDL_Surface *g = TTF_RenderUTF8_Blended(font, buf, col);
+            if (g) {
+                SDL_SetSurfaceBlendMode(g, SDL_BLENDMODE_NONE);
+                int ox = (tnum && buf[0] >= '0' && buf[0] <= '9' && buf[1] == 0) ? (gp[k].adv - g->w) / 2 : 0;
+                SDL_Rect r = { x + ox + gp[k].dx, 0, g->w, g->h };
+                SDL_BlitSurface(g, NULL, dst, &r);
+                SDL_FreeSurface(g);
+            }
+        }
+        x += gp[k].adv;
+        p += len;
+    }
+    (void)cell;
+    return dst;
+}
+
+/* 0.4: font-stretch → współczynnik poziomego skalowania w procentach (bity 9..15 flag × 5) */
+static int stretch_pct(int eff_style) {
+    int v = (eff_style >> 9) & 0x3F;
+    return v ? v * 5 : 100;
+}
+
 static SilverTextEntry *text_entry(SilverWindow *w, TTF_Font *font, const char *text,
                                    int size, int style, int eff_style, int r, int g, int b) {
     size_t kl = strlen(text) + 48;
@@ -1129,10 +1273,15 @@ static SilverTextEntry *text_entry(SilverWindow *w, TTF_Font *font, const char *
     SilverTextEntry *e = &w->texts[slot];
     if (e->key) { SDL_DestroyTexture(e->tex); free(e->key); memset(e, 0, sizeof(*e)); }
 
-    TTF_SetFontStyle(font, (eff_style & 1 ? TTF_STYLE_BOLD : 0) | (eff_style & 2 ? TTF_STYLE_ITALIC : 0) |
+    TTF_SetFontStyle(font, ((eff_style & 1) && !(eff_style & 64) ? TTF_STYLE_BOLD : 0) | ((eff_style & 2) && !(eff_style & 128) ? TTF_STYLE_ITALIC : 0) |
                            (eff_style & 4 ? TTF_STYLE_UNDERLINE : 0) | (eff_style & 8 ? TTF_STYLE_STRIKETHROUGH : 0));
+    /* 0.4: bit 16 = font-kerning: none, bit 32 = text-rendering: geometricPrecision (bez hintingu) */
+    TTF_SetFontKerning(font, (eff_style & 16) ? 0 : 1);
+    TTF_SetFontHinting(font, (eff_style & 32) ? TTF_HINTING_NONE : TTF_HINTING_NORMAL);
     SDL_Color col = { (Uint8)r, (Uint8)g, (Uint8)b, 255 };
-    SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, col);
+    int tnum = (eff_style & 256) ? 1 : 0;
+    int trim = ((eff_style & 32768) && has_trim_candidates(text)) ? 1 : 0;
+    SDL_Surface *surf = ((eff_style & 16) || tnum || trim) ? render_nokern(font, text, col, tnum, trim) : TTF_RenderUTF8_Blended(font, text, col);
     if (!surf) { free(key); return NULL; }
     SDL_Texture *tex = SDL_CreateTextureFromSurface(w->ren, surf);
     e->w = surf->w; e->h = surf->h;
@@ -1156,6 +1305,7 @@ int silver_draw_text_ex(int h, int x, int y, const char *text, int r, int g, int
     SilverTextEntry *e = text_entry(w, font, text, size, style, eff, r, g, b);
     if (!e) return 0;
     float fw = e->w * 100.0f / w->scale_pct, fh = e->h * 100.0f / w->scale_pct;
+    fw = fw * stretch_pct(eff) / 100.0f;      /* 0.4: font-stretch (skalowanie poziome) */
     SDL_SetTextureAlphaMod(e->tex, (Uint8)a);
     SDL_FRect dst = { (float)x, (float)y, fw, fh };
     SDL_RenderCopyF(w->ren, e->tex, NULL, &dst);
@@ -1172,9 +1322,13 @@ int silver_measure_text_ex(int h, const char *text, int size, int style) {
     int eff = 0;
     TTF_Font *font = get_font_style(w, size, style, &eff);
     if (!font) return 0;
-    TTF_SetFontStyle(font, (eff & 1 ? TTF_STYLE_BOLD : 0) | (eff & 2 ? TTF_STYLE_ITALIC : 0));
+    TTF_SetFontStyle(font, ((eff & 1) && !(eff & 64) ? TTF_STYLE_BOLD : 0) | ((eff & 2) && !(eff & 128) ? TTF_STYLE_ITALIC : 0));
+    TTF_SetFontKerning(font, (eff & 16) ? 0 : 1);
+    TTF_SetFontHinting(font, (eff & 32) ? TTF_HINTING_NONE : TTF_HINTING_NORMAL);
     int tw = 0, th = 0;
-    TTF_SizeUTF8(font, text, &tw, &th);
+    int trim_m = ((eff & 32768) && has_trim_candidates(text)) ? 1 : 0;
+    if ((eff & 16) || (eff & 256) || trim_m) tw = nokern_width(font, text, (eff & 256) ? 1 : 0, trim_m); else TTF_SizeUTF8(font, text, &tw, &th);
+    tw = tw * stretch_pct(eff) / 100;         /* 0.4: font-stretch */
     return (tw * 100 + w->scale_pct - 1) / w->scale_pct;
 }
 
@@ -1188,6 +1342,25 @@ int silver_font_height(int h, int size) {
     TTF_Font *font = get_font(w, size);
     if (!font) return 0;
     return (TTF_FontHeight(font) * 100 + w->scale_pct - 1) / w->scale_pct;
+}
+
+/* 0.4: proporcje kroju (promil rozmiaru) dla font-size-adjust:
+ * kind 0 = wysokość x, 1 = wysokość wersalika (H), 2 = szerokość „0" (ch), 3 = szerokość ideogramu 水 (ic).
+ * Zwraca 0, gdy nie da się zmierzyć (brak glifu). `style` jak w silver_measure_text_ex (wybór rodziny). */
+int silver_font_ratio(int h, int size, int style, int kind) {
+    if (!VALID(h)) return 0;
+    SilverWindow *w = &g_windows[h];
+    int eff = 0;
+    TTF_Font *font = get_font_style(w, size, style, &eff);
+    if (!font) return 0;
+    int phys = (size <= 0 ? w->font_base : size) * w->scale_pct / 100;
+    if (phys < 4) phys = 4;
+    Uint16 ch = kind == 0 ? 'x' : kind == 1 ? 'H' : kind == 2 ? '0' : 0x6C34;
+    if (!TTF_GlyphIsProvided(font, ch)) return 0;
+    int minx = 0, maxx = 0, miny = 0, maxy = 0, adv = 0;
+    if (TTF_GlyphMetrics(font, ch, &minx, &maxx, &miny, &maxy, &adv) != 0) return 0;
+    int v = (kind <= 1) ? maxy : adv;
+    return v * 1000 / phys;
 }
 
 /* największy prefiks `text` (offset bajtowy, na granicy znaku), który mieści
@@ -1236,6 +1409,51 @@ int silver_set_text_input_rect(int h, int x, int y, int w, int hh) {
 }
 
 /* ---- obrazki: cache LRU kluczowany pełną ścieżką ---- */
+/* 0.4: orientacja EXIF (tag 0x0112) z nagłówka JPEG; 1 gdy brak / nie JPEG */
+static int read_exif_orientation(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;
+    unsigned char hdr[2];
+    int res = 1;
+    if (fread(hdr, 1, 2, f) != 2 || hdr[0] != 0xFF || hdr[1] != 0xD8) { fclose(f); return 1; }
+    for (int guard = 0; guard < 64; guard++) {
+        int c = fgetc(f);
+        while (c != EOF && c != 0xFF) c = fgetc(f);
+        int m = fgetc(f);
+        while (m == 0xFF) m = fgetc(f);
+        if (c == EOF || m == EOF || m == 0xDA || m == 0xD9) break;
+        unsigned char lb[2];
+        if (fread(lb, 1, 2, f) != 2) break;
+        int len = (lb[0] << 8) | lb[1];
+        if (len < 2) break;
+        if (m == 0xE1 && len >= 14) {
+            unsigned char buf[4096];
+            int n = len - 2 > (int)sizeof(buf) ? (int)sizeof(buf) : len - 2;
+            if (fread(buf, 1, (size_t)n, f) != (size_t)n) break;
+            if (memcmp(buf, "Exif\0\0", 6) != 0) { fseek(f, len - 2 - n, SEEK_CUR); continue; }
+            unsigned char *t = buf + 6;
+            int le = t[0] == 'I';
+            #define RD16(p) (le ? (t[p] | (t[(p) + 1] << 8)) : ((t[p] << 8) | t[(p) + 1]))
+            #define RD32(p) (le ? (t[p] | (t[(p) + 1] << 8) | (t[(p) + 2] << 16) | ((unsigned)t[(p) + 3] << 24)) : (((unsigned)t[p] << 24) | (t[(p) + 1] << 16) | (t[(p) + 2] << 8) | t[(p) + 3]))
+            if (n < 14) break;
+            unsigned off = RD32(4);
+            if ((int)off + 2 > n - 6) break;
+            int cnt = RD16((int)off);
+            for (int i = 0; i < cnt; i++) {
+                int e = (int)off + 2 + i * 12;
+                if (e + 12 > n - 6) break;
+                if (RD16(e) == 0x0112) { int v = RD16(e + 8); if (v >= 1 && v <= 8) res = v; break; }
+            }
+            #undef RD16
+            #undef RD32
+            break;
+        }
+        fseek(f, len - 2, SEEK_CUR);
+    }
+    fclose(f);
+    return res;
+}
+
 static SilverImage *find_or_load_image(int h, const char *path) {
     SilverWindow *w = &g_windows[h];
     static Uint32 clock_ = 0;
@@ -1258,18 +1476,49 @@ static SilverImage *find_or_load_image(int h, const char *path) {
     if (im->path) { SDL_DestroyTexture(im->tex); free(im->path); }
     im->path = strdup(path);
     im->tex = tex; im->w = iw; im->h = ih; im->used = clock_;
+    im->exif = read_exif_orientation(path);
     return im;
 }
 
+/* 0.4: stan rysowania obrazu ustawiany przez silver_image_xform (jak silver_image_filter, na czas jednego rysowania):
+ * g_img_xf bity 0..1 = dodatkowy obrót w ćwiartkach (cw), bit 2 = dodatkowe odbicie poziome, bit 3 = ignoruj EXIF (none);
+ * g_img_view = kadr źródła w promilach surowego obrazu (sw > 0 → aktywny). */
+static int g_img_xf = 0;
+static int g_img_view[4] = { 0, 0, 0, 0 };
+int silver_image_xform(int h, int xf, int vx, int vy, int vw, int vh) {
+    (void)h; g_img_xf = xf; g_img_view[0] = vx; g_img_view[1] = vy; g_img_view[2] = vw; g_img_view[3] = vh; return 1;
+}
+/* (obrót cw w stopniach, odbicie) dla orientacji EXIF — SDL: najpierw odbicie, potem obrót */
+static void exif_xf(int o, int *rot, int *flip) {
+    static const int R[9] = { 0, 0, 0, 180, 180, 270, 90, 90, 270 };
+    static const int F[9] = { 0, 0, 1, 0, 1, 1, 0, 1, 0 };
+    if (o < 1 || o > 8) o = 1;
+    *rot = R[o]; *flip = F[o];
+}
+/* końcowa transformacja = dodatkowa ∘ bazowa; (r2,f2)∘(r1,f1): rot = r2 + (f2 ? -r1 : r1), flip = f1 ^ f2 */
+static void final_xf(SilverImage *im, int *rot, int *flip) {
+    int r1 = 0, f1 = 0;
+    if (!(g_img_xf & 8)) exif_xf(im->exif, &r1, &f1);
+    int r2 = (g_img_xf & 3) * 90, f2 = (g_img_xf >> 2) & 1;
+    int r = r2 + (f2 ? -r1 : r1);
+    r %= 360; if (r < 0) r += 360;
+    *rot = r; *flip = f1 ^ f2;
+}
 int silver_image_width(int h, const char *path) {
     if (!VALID(h) || !path) return 0;
     SilverImage *im = find_or_load_image(h, path);
-    return im ? im->w : 0;
+    if (!im) return 0;
+    if (g_img_view[2] > 0) return im->w * g_img_view[2] / 1000;
+    int rot, flip; final_xf(im, &rot, &flip);
+    return (rot == 90 || rot == 270) ? im->h : im->w;
 }
 int silver_image_height(int h, const char *path) {
     if (!VALID(h) || !path) return 0;
     SilverImage *im = find_or_load_image(h, path);
-    return im ? im->h : 0;
+    if (!im) return 0;
+    if (g_img_view[3] > 0) return im->h * g_img_view[3] / 1000;
+    int rot, flip; final_xf(im, &rot, &flip);
+    return (rot == 90 || rot == 270) ? im->w : im->h;
 }
 /* usuwa obrazek z cache (np. po zmianie pliku na dysku) */
 int silver_image_forget(int h, const char *path) {
@@ -1300,10 +1549,285 @@ int silver_draw_image(int h, const char *path, int x, int y, int w, int rh, int 
     SDL_SetTextureBlendMode(im->tex, SDL_BLENDMODE_BLEND);
     SDL_SetTextureAlphaMod(im->tex, (Uint8)a);
     SDL_Rect dst = { x, y, w, rh };
-    SDL_RenderCopy(g_windows[h].ren, im->tex, NULL, &dst);
+    SDL_Rect src, *sp = NULL;
+    if (g_img_view[2] > 0 && g_img_view[3] > 0) {
+        src.x = im->w * g_img_view[0] / 1000; src.y = im->h * g_img_view[1] / 1000;
+        src.w = im->w * g_img_view[2] / 1000; src.h = im->h * g_img_view[3] / 1000;
+        if (src.w < 1) src.w = 1;
+        if (src.h < 1) src.h = 1;
+        sp = &src;
+    }
+    int rot = 0, flip = 0;
+    if (g_img_view[2] > 0) { rot = (g_img_xf & 3) * 90; flip = (g_img_xf >> 2) & 1; }
+    else final_xf(im, &rot, &flip);
+    if (rot == 0 && !flip) {
+        SDL_RenderCopy(g_windows[h].ren, im->tex, sp, &dst);
+    } else {
+        SDL_Rect d2 = dst;
+        if (rot == 90 || rot == 270) {   /* prostokąt przed obrotem ma zamienione boki, ten sam środek */
+            int cx = x + w / 2, cy = y + rh / 2;
+            d2.w = rh; d2.h = w; d2.x = cx - d2.w / 2; d2.y = cy - d2.h / 2;
+        }
+        SDL_RenderCopyEx(g_windows[h].ren, im->tex, sp, &d2, (double)rot, NULL, flip ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE);
+    }
     return 1;
 }
 
+
+/* ---- 0.4: kafelkowanie obrazków i gradientów (background-*, mask-*, border-image) ----
+ * kind 0: src = ścieżka obrazka; kind 1: src = specyfikacja gradientu (patrz silver_fx.h).
+ * Kafelek tw×th (px logiczne) jest rysowany od (tx,ty) co (stepx,stepy); repx/repy włączają powtarzanie
+ * w danej osi; wszystko przycięte do prostokąta (cx,cy,cw,ch) (część wspólna z aktualnym przycięciem). */
+static SDL_Texture *fx_texture(SDL_Renderer *ren, const uint32_t *px, int w, int h);
+#define GRAD_CACHE 24
+static struct { char *key; SDL_Texture *tex; SDL_Renderer *ren; unsigned used; } g_grad_cache[GRAD_CACHE];
+
+static SDL_Texture *gradient_texture(SilverWindow *sw, const char *spec, int tw, int th) {
+    static unsigned clk = 0;
+    clk++;
+    int pw = (tw * sw->scale_pct + 50) / 100, ph = (th * sw->scale_pct + 50) / 100;
+    if (pw < 1) pw = 1;
+    if (ph < 1) ph = 1;
+    if (pw > 4096) pw = 4096;
+    if (ph > 4096) ph = 4096;
+    char keybuf[2300];
+    snprintf(keybuf, sizeof(keybuf), "%dx%d#%s", pw, ph, spec);
+    int free_i = -1, old_i = 0;
+    for (int i = 0; i < GRAD_CACHE; i++) {
+        if (g_grad_cache[i].key && g_grad_cache[i].ren == sw->ren && strcmp(g_grad_cache[i].key, keybuf) == 0) {
+            g_grad_cache[i].used = clk;
+            return g_grad_cache[i].tex;
+        }
+        if (!g_grad_cache[i].key && free_i < 0) free_i = i;
+        if (g_grad_cache[i].key && g_grad_cache[i].used < g_grad_cache[old_i].used) old_i = i;
+    }
+    uint32_t *px = (uint32_t *)malloc((size_t)pw * (size_t)ph * 4);
+    if (!px) return NULL;
+    if (!fx_gradient_render(px, pw, ph, spec)) { free(px); return NULL; }
+    /* tekstura z niemnożonym kolorem + zwykłe BLEND (działa też w rendererze programowym) */
+    for (long i = 0; i < (long)pw * ph; i++) {
+        uint32_t q = px[i];
+        int a = FX_A(q);
+        if (a > 0 && a < 255) px[i] = FX_PACK(a, fx_clamp255(FX_R(q) * 255 / a), fx_clamp255(FX_G(q) * 255 / a), fx_clamp255(FX_B(q) * 255 / a));
+    }
+    SDL_Texture *t = fx_texture(sw->ren, px, pw, ph);
+    free(px);
+    if (!t) return NULL;
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    int slot = free_i >= 0 ? free_i : old_i;
+    if (g_grad_cache[slot].key) { SDL_DestroyTexture(g_grad_cache[slot].tex); free(g_grad_cache[slot].key); }
+    g_grad_cache[slot].key = strdup(keybuf);
+    g_grad_cache[slot].tex = t;
+    g_grad_cache[slot].ren = sw->ren;
+    g_grad_cache[slot].used = clk;
+    return t;
+}
+
+/* usuwa tekstury gradientów należące do zamykanego renderera (adres renderera może zostać użyty ponownie) */
+static void grad_cache_purge(SDL_Renderer *ren) {
+    for (int i = 0; i < GRAD_CACHE; i++) {
+        if (g_grad_cache[i].key && g_grad_cache[i].ren == ren) {
+            SDL_DestroyTexture(g_grad_cache[i].tex);
+            free(g_grad_cache[i].key);
+            g_grad_cache[i].key = NULL;
+            g_grad_cache[i].tex = NULL;
+            g_grad_cache[i].ren = NULL;
+        }
+    }
+}
+
+static int floor_div(int a, int b) { int q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) q--; return q; }
+
+int silver_draw_tiled(int h, int kind, const char *src, int cx, int cy, int cw, int ch,
+                      int tx, int ty, int tw, int th, int stepx, int stepy, int repx, int repy, int alpha) {
+    if (!VALID(h) || !src || tw < 1 || th < 1 || cw < 1 || ch < 1) return 0;
+    SilverWindow *sw = &g_windows[h];
+    SDL_Texture *tex = NULL;
+    if (kind == 1) {
+        tex = gradient_texture(sw, src, tw, th);
+    } else {
+        SilverImage *im = find_or_load_image(h, src);
+        if (im) {
+            tex = im->tex;
+            if (g_img_filter == 1) SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+            else if (g_img_filter == 2) SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
+            SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        }
+    }
+    if (!tex) return 0;
+    SDL_SetTextureAlphaMod(tex, (Uint8)(alpha < 0 ? 0 : alpha > 255 ? 255 : alpha));
+    if (stepx < 1) stepx = tw;
+    if (stepy < 1) stepy = th;
+    /* przycięcie = część wspólna (cx,cy,cw,ch) z bieżącym */
+    SDL_Rect want = { cx, cy, cw, ch }, cur, isect;
+    int had = SDL_RenderIsClipEnabled(sw->ren);
+    SDL_RenderGetClipRect(sw->ren, &cur);
+    if (had) {
+        if (!SDL_IntersectRect(&want, &cur, &isect)) return 1;
+    } else isect = want;
+    SDL_RenderSetClipRect(sw->ren, &isect);
+    int x0 = repx ? tx + floor_div(isect.x - tx, stepx) * stepx : tx;
+    int y0 = repy ? ty + floor_div(isect.y - ty, stepy) * stepy : ty;
+    int xe = repx ? isect.x + isect.w : tx + 1;
+    int ye = repy ? isect.y + isect.h : ty + 1;
+    int count = 0;
+    for (int y = y0; y < ye && count < 40000; y += stepy) {
+        for (int x = x0; x < xe && count < 40000; x += stepx) {
+            SDL_Rect dst = { x, y, tw, th };
+            SDL_RenderCopy(sw->ren, tex, NULL, &dst);
+            count++;
+            if (!repx) break;
+        }
+        if (!repy) break;
+    }
+    CNT(g_cnt_image);
+    if (had) SDL_RenderSetClipRect(sw->ren, &cur);
+    else SDL_RenderSetClipRect(sw->ren, NULL);
+    return 1;
+}
+
+/* ---- 0.4: SVG (NanoSVG) — silver_draw_svg rysuje znacznik SVG w prostokącie (x,y,w,h) w px logicznych ---- */
+#define SVG_CACHE 16
+static struct { unsigned long long hash; int pw, ph; SDL_Texture *tex; SDL_Renderer *ren; unsigned used; } g_svg_cache[SVG_CACHE];
+
+static unsigned long long fnv64(const char *s) {
+    unsigned long long h = 1469598103934665603ULL;
+    while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+static void svg_cache_purge(SDL_Renderer *ren) {
+    for (int i = 0; i < SVG_CACHE; i++)
+        if (g_svg_cache[i].tex && g_svg_cache[i].ren == ren) { SDL_DestroyTexture(g_svg_cache[i].tex); g_svg_cache[i].tex = NULL; g_svg_cache[i].ren = NULL; }
+}
+
+int silver_draw_svg(int h, const char *markup, int x, int y, int w, int hh, int alpha) {
+    if (!VALID(h) || !markup || w < 1 || hh < 1) return 0;
+    SilverWindow *sw = &g_windows[h];
+    static unsigned clk = 0;
+    clk++;
+    int pw = (w * sw->scale_pct + 50) / 100, ph = (hh * sw->scale_pct + 50) / 100;
+    if (pw < 1) pw = 1;
+    if (ph < 1) ph = 1;
+    if (pw > 4096) pw = 4096;
+    if (ph > 4096) ph = 4096;
+    unsigned long long key = fnv64(markup) ^ ((unsigned long long)pw * 2654435761ULL) ^ ((unsigned long long)ph * 40503ULL << 20);
+    SDL_Texture *tex = NULL;
+    int slot = -1, old_i = 0;
+    for (int i = 0; i < SVG_CACHE; i++) {
+        if (g_svg_cache[i].tex && g_svg_cache[i].ren == sw->ren && g_svg_cache[i].hash == key && g_svg_cache[i].pw == pw && g_svg_cache[i].ph == ph) {
+            tex = g_svg_cache[i].tex; g_svg_cache[i].used = clk; break;
+        }
+        if (!g_svg_cache[i].tex && slot < 0) slot = i;
+        if (g_svg_cache[i].tex && g_svg_cache[i].used < g_svg_cache[old_i].used) old_i = i;
+    }
+    if (!tex) {
+        char *copy = strdup(markup);
+        if (!copy) return 0;
+        NSVGimage *img = nsvgParse(copy, "px", 96.0f);
+        free(copy);
+        if (!img) return 0;
+        NSVGrasterizer *rast = nsvgCreateRasterizer();
+        unsigned char *rgba = (unsigned char *)calloc((size_t)pw * (size_t)ph, 4);
+        if (!rast || !rgba || img->width <= 0 || img->height <= 0) {
+            if (rast) nsvgDeleteRasterizer(rast);
+            free(rgba); nsvgDelete(img);
+            return 0;
+        }
+        /* dopasowanie jak preserveAspectRatio="xMidYMid meet" względem rozmiaru obrazu */
+        float sx = (float)pw / img->width, sy = (float)ph / img->height;
+        float sc = sx < sy ? sx : sy;
+        float ox = ((float)pw - img->width * sc) * 0.5f, oy = ((float)ph - img->height * sc) * 0.5f;
+        nsvgRasterize(rast, img, ox, oy, sc, rgba, pw, ph, pw * 4);
+        /* shape-rendering: crispEdges / optimizeSpeed (atrybut data-sr na korzeniu) → bez antyaliasingu */
+        if (strstr(markup, "data-sr=\"crisp") || strstr(markup, "data-sr=\"optimizespeed")) {
+            for (long qi = 0; qi < (long)pw * ph; qi++) rgba[qi * 4 + 3] = rgba[qi * 4 + 3] >= 128 ? 255 : 0;
+        }
+        uint32_t *px = (uint32_t *)malloc((size_t)pw * (size_t)ph * 4);
+        if (px) {
+            for (long i = 0; i < (long)pw * ph; i++) {
+                const unsigned char *q = rgba + i * 4;
+                px[i] = FX_PACK(q[3], q[0], q[1], q[2]);
+            }
+            tex = fx_texture(sw->ren, px, pw, ph);
+            free(px);
+        }
+        free(rgba);
+        nsvgDeleteRasterizer(rast);
+        nsvgDelete(img);
+        if (!tex) return 0;
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        int sl = slot >= 0 ? slot : old_i;
+        if (g_svg_cache[sl].tex) SDL_DestroyTexture(g_svg_cache[sl].tex);
+        g_svg_cache[sl].hash = key; g_svg_cache[sl].pw = pw; g_svg_cache[sl].ph = ph;
+        g_svg_cache[sl].tex = tex; g_svg_cache[sl].ren = sw->ren; g_svg_cache[sl].used = clk;
+    }
+    SDL_SetTextureAlphaMod(tex, (Uint8)(alpha < 0 ? 0 : alpha > 255 ? 255 : alpha));
+    SDL_Rect dst = { x, y, w, hh };
+    SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
+    CNT(g_cnt_image);
+    SDL_RenderCopy(sw->ren, tex, NULL, &dst);
+    return 1;
+}
+
+/* Rysuje fragment źródła (obrazek lub gradient) w prostokącie docelowym z kafelkowaniem — do border-image / mask-border.
+ * piece = "sx,sy,sw,sh,dx,dy,dw,dh,tw,th,tx,ty,stepx,stepy,repx,repy":
+ *   (sx,sy,sw,sh) fragment źródła w px naturalnych (dla gradientu: w obszarze nat_w×nat_h),
+ *   (dx,dy,dw,dh) obszar docelowy (przycięcie), kafelek tw×th od (tx,ty) co (stepx,stepy), repx/repy = powtarzanie. */
+int silver_draw_part(int h, int kind, const char *src, int nat_w, int nat_h, int alpha, const char *piece) {
+    if (!VALID(h) || !src || !piece || nat_w < 1 || nat_h < 1) return 0;
+    int v[16];
+    if (sscanf(piece, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7],
+               &v[8], &v[9], &v[10], &v[11], &v[12], &v[13], &v[14], &v[15]) != 16) return 0;
+    SilverWindow *sw = &g_windows[h];
+    SDL_Texture *tex = NULL;
+    float k = 1.0f;     /* skala źródła → tekstura */
+    if (kind == 1) {
+        tex = gradient_texture(sw, src, nat_w, nat_h);
+        k = sw->scale_pct / 100.0f;
+    } else {
+        SilverImage *im = find_or_load_image(h, src);
+        if (im) {
+            tex = im->tex;
+            SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+            if (g_img_filter == 1) SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+            else if (g_img_filter == 2) SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
+        }
+    }
+    if (!tex) return 0;
+    int sx = v[0], sy = v[1], sw_ = v[2], sh_ = v[3];
+    int dx = v[4], dy = v[5], dw = v[6], dh = v[7];
+    int tw = v[8], th = v[9], tx = v[10], ty = v[11], stx = v[12], sty = v[13], repx = v[14], repy = v[15];
+    if (sw_ < 1 || sh_ < 1 || dw < 1 || dh < 1 || tw < 1 || th < 1) return 1;
+    if (stx < 1) stx = tw;
+    if (sty < 1) sty = th;
+    SDL_Rect srcr = { (int)lroundf(sx * k), (int)lroundf(sy * k), (int)lroundf(sw_ * k), (int)lroundf(sh_ * k) };
+    if (srcr.w < 1) srcr.w = 1;
+    if (srcr.h < 1) srcr.h = 1;
+    SDL_SetTextureAlphaMod(tex, (Uint8)(alpha < 0 ? 0 : alpha > 255 ? 255 : alpha));
+    SDL_Rect want = { dx, dy, dw, dh }, cur, isect;
+    int had = SDL_RenderIsClipEnabled(sw->ren);
+    SDL_RenderGetClipRect(sw->ren, &cur);
+    if (had) { if (!SDL_IntersectRect(&want, &cur, &isect)) return 1; } else isect = want;
+    SDL_RenderSetClipRect(sw->ren, &isect);
+    int x0 = repx ? tx + floor_div(isect.x - tx, stx) * stx : tx;
+    int y0 = repy ? ty + floor_div(isect.y - ty, sty) * sty : ty;
+    int xe = repx ? isect.x + isect.w : tx + 1;
+    int ye = repy ? isect.y + isect.h : ty + 1;
+    int count = 0;
+    for (int y = y0; y < ye && count < 20000; y += sty) {
+        for (int x = x0; x < xe && count < 20000; x += stx) {
+            SDL_Rect dst = { x, y, tw, th };
+            SDL_RenderCopy(sw->ren, tex, &srcr, &dst);
+            count++;
+            if (!repx) break;
+        }
+        if (!repy) break;
+    }
+    CNT(g_cnt_image);
+    if (had) SDL_RenderSetClipRect(sw->ren, &cur); else SDL_RenderSetClipRect(sw->ren, NULL);
+    return 1;
+}
 
 /* ====================================================================
  *  0.3: warstwy z transformacją afiniczną (obrót, pochylenie, skala)
@@ -1347,19 +1871,158 @@ int silver_layer_begin(int h, int x, int y, int w, int hh) {
     return 1;
 }
 
-int silver_layer_end(int h, int a, int b, int c, int d, int e, int f, int ox, int oy, int alpha) {
+/* ---- 0.4: efekty warstw (filter / mask / mix-blend-mode) — operacje na pikselach, patrz silver_fx.h ---- */
+static struct { uint8_t *m; int w, h; } g_mask = { NULL, 0, 0 };
+
+static void fx_mask_clear(void) {
+    free(g_mask.m);
+    g_mask.m = NULL; g_mask.w = g_mask.h = 0;
+}
+
+int silver_mask_clear(void) { fx_mask_clear(); return 1; }
+
+/* Czyta cały cel renderowania (tekstura warstwy) jako ARGB8888 przemnożone alfą; wynik malloc, NULL przy błędzie. */
+static uint32_t *fx_read_target(SDL_Renderer *ren, int pw, int ph) {
+    uint32_t *px = (uint32_t *)malloc((size_t)pw * (size_t)ph * 4);
+    if (!px) return NULL;
+    float osx, osy; SDL_RenderGetScale(ren, &osx, &osy);
+    SDL_Rect ovp; SDL_RenderGetViewport(ren, &ovp);
+    SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    SDL_RenderSetViewport(ren, NULL);
+    int ok = SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_ARGB8888, px, pw * 4) == 0;
+    SDL_RenderSetViewport(ren, &ovp);
+    SDL_RenderSetScale(ren, osx, osy);
+    if (!ok) { free(px); return NULL; }
+    return px;
+}
+
+static SDL_Texture *fx_texture(SDL_Renderer *ren, const uint32_t *px, int w, int h) {
+    SDL_Texture *t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
+    if (!t) return NULL;
+    SDL_UpdateTexture(t, NULL, px, w * 4);
+    return t;
+}
+
+/* Wykonuje filtry z `spec` (rozdzielone ';'): blur:σ  sat:%  hue:deg  shadow:dx,dy,σ,r,g,b,a  mask.
+ * Zwraca tryb mieszania z `blend:<nazwa>` (FX_NORMAL gdy brak) przez *blend. scale = skala HiDPI. */
+static void fx_run_spec(uint32_t *px, int pw, int ph, const char *spec, float scale, int *blend) {
+    char buf[512];
+    strncpy(buf, spec, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+    char *save = NULL;
+    *blend = FX_NORMAL;
+    for (char *tok = strtok_r(buf, ";", &save); tok; tok = strtok_r(NULL, ";", &save)) {
+        if (strncmp(tok, "blur:", 5) == 0) {
+            fx_gauss_blur(px, pw, ph, (float)atof(tok + 5) * scale);
+        } else if (strncmp(tok, "sat:", 4) == 0) {
+            fx_saturate(px, (long)pw * ph, (float)atof(tok + 4) / 100.0f);
+        } else if (strncmp(tok, "hue:", 4) == 0) {
+            fx_hue_rotate(px, (long)pw * ph, (float)atof(tok + 4));
+        } else if (strncmp(tok, "shadow:", 7) == 0) {
+            int dx = 0, dy = 0, r = 0, g = 0, b = 0, a = 255; float sg = 0;
+            sscanf(tok + 7, "%d,%d,%f,%d,%d,%d,%d", &dx, &dy, &sg, &r, &g, &b, &a);
+            fx_drop_shadow(px, pw, ph, (int)lroundf(dx * scale), (int)lroundf(dy * scale), sg * scale, r, g, b, a);
+        } else if (strcmp(tok, "mask") == 0) {
+            if (g_mask.m && g_mask.w == pw && g_mask.h == ph) fx_apply_mask(px, g_mask.m, (long)pw * ph);
+            fx_mask_clear();
+        } else if (strncmp(tok, "blend:", 6) == 0) {
+            *blend = fx_blend_mode_from_name(tok + 6);
+        }
+    }
+}
+
+/* Jak silver_layer_end, ale z efektami na pikselach warstwy (spec == NULL/"" → zwykłe składanie).
+ * mix-blend-mode jest stosowany tylko przy macierzy tożsamościowej; inaczej warstwa składa się normalnie. */
+int silver_layer_end_fx(int h, int a, int b, int c, int d, int e, int f, int ox, int oy, int alpha, const char *spec) {
     if (!VALID(h) || g_layer_n <= 0) return 0;
     SilverWindow *sw = &g_windows[h];
     SilverLayer *L = &g_layers[--g_layer_n];
+    int has_spec = spec && *spec;
+    int blend = FX_NORMAL;
+    int pw = 0, ph = 0;
+    uint32_t *px = NULL;
+    /* renderer programowy nie zna trybów własnych → składanie „przemnożone” niedostępne; wtedy czytamy
+     * piksele i zamieniamy je na niemnożoną alfę, by zwykłe BLEND dawało poprawny wynik */
+    SDL_BlendMode pm_probe = SDL_ComposeCustomBlendMode(SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD,
+                                                        SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD);
+    int premult_ok = SDL_SetTextureBlendMode(L->tex, pm_probe) == 0;
+    if (has_spec || !premult_ok) {
+        SDL_QueryTexture(L->tex, NULL, NULL, &pw, &ph);
+        SDL_RenderSetClipRect(sw->ren, NULL);
+        px = fx_read_target(sw->ren, pw, ph);
+        if (px && has_spec) fx_run_spec(px, pw, ph, spec, sw->scale_pct / 100.0f, &blend);
+    }
     SDL_SetRenderTarget(sw->ren, L->prev_target);
     SDL_RenderSetViewport(sw->ren, &L->prev_vp);
     if (L->had_clip) SDL_RenderSetClipRect(sw->ren, &L->prev_clip);
     else SDL_RenderSetClipRect(sw->ren, NULL);
+    int identity = (a == 1000 && b == 0 && c == 0 && d == 1000);
+    Uint8 al = (Uint8)(alpha < 0 ? 0 : alpha > 255 ? 255 : alpha);
+
+    if (px && blend != FX_NORMAL && identity) {
+        /* tło = to, co już jest w celu pod prostokątem warstwy; składamy wg trybu i nadpisujemy (NONE) */
+        float sc = sw->scale_pct / 100.0f;
+        int tw = 0, th = 0;
+        SDL_Texture *tgt = SDL_GetRenderTarget(sw->ren);
+        if (tgt) SDL_QueryTexture(tgt, NULL, NULL, &tw, &th); else SDL_GetRendererOutputSize(sw->ren, &tw, &th);
+        int dlx = L->x + e, dly = L->y + f;                       /* prostokąt logiczny w układzie celu */
+        int rx = (int)lroundf((dlx + L->prev_vp.x) * sc), ry = (int)lroundf((dly + L->prev_vp.y) * sc);
+        uint32_t *bd = (uint32_t *)calloc((size_t)pw * (size_t)ph, 4);
+        if (bd) {
+            int x0 = rx < 0 ? -rx : 0, y0 = ry < 0 ? -ry : 0;
+            int x1 = rx + pw > tw ? tw - rx : pw, y1 = ry + ph > th ? th - ry : ph;
+            if (x1 > x0 && y1 > y0) {
+                SDL_Rect rr = { rx + x0, ry + y0, x1 - x0, y1 - y0 };
+                uint32_t *rowbuf = (uint32_t *)malloc((size_t)(x1 - x0) * (size_t)(y1 - y0) * 4);
+                if (rowbuf) {
+                    float osx, osy; SDL_RenderGetScale(sw->ren, &osx, &osy);
+                    SDL_Rect ovp; SDL_RenderGetViewport(sw->ren, &ovp);
+                    SDL_Rect oclip; int hadc = SDL_RenderIsClipEnabled(sw->ren);
+                    SDL_RenderGetClipRect(sw->ren, &oclip);
+                    SDL_RenderSetClipRect(sw->ren, NULL);
+                    SDL_RenderSetScale(sw->ren, 1.0f, 1.0f);
+                    SDL_RenderSetViewport(sw->ren, NULL);
+                    if (SDL_RenderReadPixels(sw->ren, &rr, SDL_PIXELFORMAT_ARGB8888, rowbuf, (x1 - x0) * 4) == 0) {
+                        for (int yy = y0; yy < y1; yy++)
+                            memcpy(bd + (size_t)yy * pw + x0, rowbuf + (size_t)(yy - y0) * (x1 - x0), (size_t)(x1 - x0) * 4);
+                    }
+                    SDL_RenderSetViewport(sw->ren, &ovp);
+                    SDL_RenderSetScale(sw->ren, osx, osy);
+                    if (hadc) SDL_RenderSetClipRect(sw->ren, &oclip);
+                    free(rowbuf);
+                }
+            }
+            fx_blend(bd, px, (long)pw * ph, blend, al);
+            SDL_Texture *bt = fx_texture(sw->ren, bd, pw, ph);
+            if (bt) {
+                SDL_SetTextureBlendMode(bt, SDL_BLENDMODE_NONE);
+                SDL_Rect dst = { dlx, dly, L->w, L->h };
+                SDL_RenderCopy(sw->ren, bt, NULL, &dst);
+                SDL_DestroyTexture(bt);
+            }
+            free(bd);
+        }
+        free(px);
+        SDL_DestroyTexture(L->tex);
+        L->tex = NULL;
+        return 1;
+    }
+    if (px) {
+        if (!premult_ok) {
+            for (long qi = 0; qi < (long)pw * ph; qi++) {
+                uint32_t q = px[qi];
+                int qa = FX_A(q);
+                if (qa > 0 && qa < 255)
+                    px[qi] = FX_PACK(qa, fx_clamp255(FX_R(q) * 255 / qa), fx_clamp255(FX_G(q) * 255 / qa), fx_clamp255(FX_B(q) * 255 / qa));
+            }
+        }
+        SDL_Texture *nt = fx_texture(sw->ren, px, pw, ph);
+        if (nt) { SDL_DestroyTexture(L->tex); L->tex = nt; }
+        free(px);
+    }
     float fa = a / 1000.0f, fb = b / 1000.0f, fc = c / 1000.0f, fd = d / 1000.0f;
     float cx[4] = { (float)L->x, (float)(L->x + L->w), (float)(L->x + L->w), (float)L->x };
     float cy[4] = { (float)L->y, (float)L->y, (float)(L->y + L->h), (float)(L->y + L->h) };
     float tu[4] = { 0, 1, 1, 0 }, tv[4] = { 0, 0, 1, 1 };
-    Uint8 al = (Uint8)(alpha < 0 ? 0 : alpha > 255 ? 255 : alpha);
     SDL_BlendMode pm = SDL_ComposeCustomBlendMode(SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD,
                                                   SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD);
     /* tekstura warstwy ma kolory przemnożone alfą → składanie (ONE, 1−srcA); renderer programowy
@@ -1382,6 +2045,198 @@ int silver_layer_end(int h, int a, int b, int c, int d, int e, int f, int ox, in
     SDL_DestroyTexture(L->tex);
     L->tex = NULL;
     return 1;
+}
+
+int silver_layer_end(int h, int a, int b, int c, int d, int e, int f, int ox, int oy, int alpha) {
+    return silver_layer_end_fx(h, a, b, c, d, e, f, ox, oy, alpha, NULL);
+}
+
+/* Kończy warstwę-maskę bez składania: zapamiętuje jej krycie (mode 0) lub luminancję (mode 1) jako maskę.
+ * op: 0 zastąp, 1 add, 2 subtract, 3 intersect, 4 exclude (mask-composite przy wielu warstwach maski). */
+/* 0.4: pas kanału alfa obrazu dla shape-outside: url(). Pas `band` z `bands` poziomych pasów; `thresh_pm` w promilach.
+ * Zwraca l * 2048 + r (promile szerokości, r > l) albo -1, gdy w pasie nie ma pikseli o alfa > threshold lub obrazu nie da się wczytać.
+ * Powierzchnia ostatnio użytego obrazu jest trzymana w pamięci (kolejne pasy tego samego obrazu nie ładują pliku od nowa). */
+int silver_image_alpha_band(int h, const char *path, int bands, int band, int thresh_pm) {
+    static SDL_Surface *sf = NULL;
+    static char cached[512] = "";
+    (void)h;
+    if (!path || bands < 1 || band < 0 || band >= bands) return -1;
+    if (!sf || strcmp(cached, path) != 0) {
+        if (sf) { SDL_FreeSurface(sf); sf = NULL; }
+        cached[0] = 0;
+        SDL_Surface *raw = IMG_Load(path);
+        if (!raw) return -1;
+        sf = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_RGBA32, 0);
+        SDL_FreeSurface(raw);
+        if (!sf) return -1;
+        snprintf(cached, sizeof(cached), "%s", path);
+    }
+    if (sf->w < 1 || sf->h < 1) return -1;
+    int thr = thresh_pm * 255 / 1000;
+    int y0 = band * sf->h / bands, y1 = (band + 1) * sf->h / bands;
+    if (y1 <= y0) y1 = y0 + 1;
+    if (y1 > sf->h) y1 = sf->h;
+    int lo = sf->w, hi = -1;
+    for (int y = y0; y < y1; y++) {
+        const Uint8 *row = (const Uint8 *)sf->pixels + (size_t)y * sf->pitch;
+        for (int x = 0; x < sf->w; x++) {
+            if (row[x * 4 + 3] > thr) { if (x < lo) lo = x; if (x > hi) hi = x; }
+        }
+    }
+    if (hi < 0) return -1;
+    return (lo * 1000 / sf->w) * 2048 + ((hi + 1) * 1000 / sf->w);
+}
+
+/* 0.4: warstwa rysowana przez macierz 4×4 (transformacje 3D). `mat` = 16 liczb ×1e6 (wierszowo, współrzędne dokumentu,
+ * po rzutowaniu x'=X/W), `dy` = przesunięcie przewijania (macierz jest w układzie dokumentu), `hide_back` = backface-visibility: hidden.
+ * Prostokąt warstwy dzielony na siatkę 16×16 i rzutowany punkt po punkcie (poprawna perspektywa); punkty z W<=0 są pomijane. */
+int silver_layer_end_3d(int h, const char *mat, int dy, int alpha, int hide_back) {
+    if (!VALID(h) || g_layer_n <= 0) return 0;
+    SilverWindow *sw = &g_windows[h];
+    SilverLayer *L = &g_layers[--g_layer_n];
+    double m[16];
+    int ok = 1;
+    {
+        const char *p = mat;
+        for (int i = 0; i < 16; i++) {
+            char *end = NULL;
+            long long v = strtoll(p ? p : "", &end, 10);
+            if (!end || end == p) { ok = 0; break; }
+            m[i] = (double)v / 1000000.0;
+            p = end;
+        }
+    }
+    SDL_SetRenderTarget(sw->ren, L->prev_target);
+    SDL_RenderSetViewport(sw->ren, &L->prev_vp);
+    if (L->had_clip) SDL_RenderSetClipRect(sw->ren, &L->prev_clip);
+    else SDL_RenderSetClipRect(sw->ren, NULL);
+    if (!ok) { SDL_DestroyTexture(L->tex); L->tex = NULL; return 0; }
+    Uint8 al = (Uint8)(alpha < 0 ? 0 : alpha > 255 ? 255 : alpha);
+    enum { N = 16 };
+    SDL_Vertex v[(N + 1) * (N + 1)];
+    int valid[(N + 1) * (N + 1)];
+    for (int gj = 0; gj <= N; gj++) {
+        for (int gi = 0; gi <= N; gi++) {
+            double u = (double)gi / N, t = (double)gj / N;
+            double x = L->x + u * L->w, y = (L->y - dy) + t * L->h;      /* y w układzie dokumentu */
+            double qx = m[0] * x + m[1] * y + m[3];
+            double qy = m[4] * x + m[5] * y + m[7];
+            double qw = m[12] * x + m[13] * y + m[15];
+            int idx = gj * (N + 1) + gi;
+            valid[idx] = qw > 1e-4;
+            if (valid[idx]) {
+                v[idx].position.x = (float)(qx / qw);
+                v[idx].position.y = (float)(qy / qw + dy);
+            } else {
+                v[idx].position.x = 0; v[idx].position.y = 0;
+            }
+            v[idx].tex_coord.x = (float)u; v[idx].tex_coord.y = (float)t;
+        }
+    }
+    /* tył: pole czworokąta (0,0)-(N,0)-(N,N)-(0,N) ze znakiem */
+    int back = 0;
+    {
+        int i0 = 0, i1 = N, i2 = N * (N + 1) + N, i3 = N * (N + 1);
+        if (valid[i0] && valid[i1] && valid[i2] && valid[i3]) {
+            double ar = 0;
+            int ids[4] = { i0, i1, i2, i3 };
+            for (int k = 0; k < 4; k++) {
+                int a = ids[k], b = ids[(k + 1) % 4];
+                ar += (double)v[a].position.x * v[b].position.y - (double)v[b].position.x * v[a].position.y;
+            }
+            back = ar < 0;
+        }
+    }
+    if (back && hide_back) { SDL_DestroyTexture(L->tex); L->tex = NULL; return 1; }
+    SDL_BlendMode pm = SDL_ComposeCustomBlendMode(SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD,
+                                                  SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD);
+    int premult = SDL_SetTextureBlendMode(L->tex, pm) == 0;
+    if (!premult) SDL_SetTextureBlendMode(L->tex, SDL_BLENDMODE_BLEND);
+    Uint8 cm = premult ? al : 255;
+    for (int i = 0; i < (N + 1) * (N + 1); i++) {
+        v[i].color.r = cm; v[i].color.g = cm; v[i].color.b = cm; v[i].color.a = al;
+    }
+    int idxs[N * N * 6];
+    int ni = 0;
+    for (int gj = 0; gj < N; gj++) {
+        for (int gi = 0; gi < N; gi++) {
+            int a = gj * (N + 1) + gi, b = a + 1, c = a + (N + 1) + 1, d = a + (N + 1);
+            if (!(valid[a] && valid[b] && valid[c] && valid[d])) continue;
+            idxs[ni++] = a; idxs[ni++] = b; idxs[ni++] = c;
+            idxs[ni++] = a; idxs[ni++] = c; idxs[ni++] = d;
+        }
+    }
+    SDL_SetTextureScaleMode(L->tex, SDL_ScaleModeLinear);
+    CNT(g_cnt_other);
+    if (ni > 0) SDL_RenderGeometry(sw->ren, L->tex, v, (N + 1) * (N + 1), idxs, ni);
+    SDL_DestroyTexture(L->tex);
+    L->tex = NULL;
+    return 1;
+}
+
+int silver_layer_capture_mask(int h, int mode, int op) {
+    if (!VALID(h) || g_layer_n <= 0) return 0;
+    SilverWindow *sw = &g_windows[h];
+    SilverLayer *L = &g_layers[--g_layer_n];
+    int pw = 0, ph = 0;
+    SDL_QueryTexture(L->tex, NULL, NULL, &pw, &ph);
+    SDL_RenderSetClipRect(sw->ren, NULL);
+    uint32_t *px = fx_read_target(sw->ren, pw, ph);
+    SDL_SetRenderTarget(sw->ren, L->prev_target);
+    SDL_RenderSetViewport(sw->ren, &L->prev_vp);
+    if (L->had_clip) SDL_RenderSetClipRect(sw->ren, &L->prev_clip);
+    else SDL_RenderSetClipRect(sw->ren, NULL);
+    SDL_DestroyTexture(L->tex);
+    L->tex = NULL;
+    if (!px) return 0;
+    uint8_t *m = (uint8_t *)malloc((size_t)pw * (size_t)ph);
+    if (!m) { free(px); return 0; }
+    fx_mask_from_pixels(px, m, (long)pw * ph, mode);
+    free(px);
+    if (op > 0 && g_mask.m && g_mask.w == pw && g_mask.h == ph) {
+        fx_mask_combine(g_mask.m, m, (long)pw * ph, op);
+        free(m);
+    } else {
+        free(g_mask.m);
+        g_mask.m = m; g_mask.w = pw; g_mask.h = ph;
+    }
+    return 1;
+}
+
+/* Piksel celu renderowania (okno albo bieżąca warstwa) w pikselach fizycznych → 0xAARRGGBB; -1 przy błędzie. */
+int silver_pixel(int h, int x, int y) {
+    if (!VALID(h)) return -1;
+    SilverWindow *sw = &g_windows[h];
+    float osx, osy; SDL_RenderGetScale(sw->ren, &osx, &osy);
+    SDL_Rect ovp; SDL_RenderGetViewport(sw->ren, &ovp);
+    SDL_RenderSetScale(sw->ren, 1.0f, 1.0f);
+    SDL_RenderSetViewport(sw->ren, NULL);
+    SDL_Rect r = { x, y, 1, 1 };
+    uint32_t px = 0;
+    int ok = SDL_RenderReadPixels(sw->ren, &r, SDL_PIXELFORMAT_ARGB8888, &px, 4) == 0;
+    SDL_RenderSetViewport(sw->ren, &ovp);
+    SDL_RenderSetScale(sw->ren, osx, osy);
+    return ok ? (int)px : -1;
+}
+
+/* Zapis całego okna do PNG (testy wizualne, zrzuty ekranu). */
+int silver_save_png(int h, const char *path) {
+    if (!VALID(h) || !path) return 0;
+    SilverWindow *sw = &g_windows[h];
+    int w = 0, hh = 0;
+    SDL_GetRendererOutputSize(sw->ren, &w, &hh);
+    SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormat(0, w, hh, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!surf) return 0;
+    float osx, osy; SDL_RenderGetScale(sw->ren, &osx, &osy);
+    SDL_Rect ovp; SDL_RenderGetViewport(sw->ren, &ovp);
+    SDL_RenderSetScale(sw->ren, 1.0f, 1.0f);
+    SDL_RenderSetViewport(sw->ren, NULL);
+    int ok = SDL_RenderReadPixels(sw->ren, NULL, SDL_PIXELFORMAT_ARGB8888, surf->pixels, surf->pitch) == 0;
+    SDL_RenderSetViewport(sw->ren, &ovp);
+    SDL_RenderSetScale(sw->ren, osx, osy);
+    if (ok) ok = IMG_SavePNG(surf, path) == 0;
+    SDL_FreeSurface(surf);
+    return ok;
 }
 
 /* ====================================================================
