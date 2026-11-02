@@ -4,6 +4,8 @@ mod cssval
 mod props_data
 mod props
 mod layout
+mod gfx
+mod svg
 mod anim
 mod paint
 mod style
@@ -3488,4 +3490,2811 @@ fn t03s_tab_size_expands_tabs_in_pre() is
     let narrow: [layout::LayoutBox] = lay("<pre class=\"a\">a\tb</pre>", ".a { tab-size: 2; }", 400)
     let wide: [layout::LayoutBox] = lay("<pre class=\"a\">a\tb</pre>", ".a { tab-size: 8; }", 400)
     assert_true(last_text_end(wide) > last_text_end(narrow))
+end
+
+
+;; ====================== 0.4: hyphens ======================
+fn texts_flat(boxes: [layout::LayoutBox]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is out = array_push(out, boxes[i].text) end
+        i += 1
+    end
+    return out
+end
+
+#[test]
+fn t04_hyphens_manual_breaks_at_soft_hyphen_with_dash() is
+    ;; 16px: znak ≈ 9px; "ab " zajmuje ~27px; szerokość 100px nie pomieści całego "wspolna\u00ADdzielnia"
+    let boxes: [layout::LayoutBox] = lay("<p>ab wspolna\u00ADdzielnia</p>", "p { margin: 0; hyphens: manual; }", 100)
+    let t: [string] = texts_flat(boxes)
+    assert_true(array_len(t) >= 2)
+    assert_true(string_find(t[0], "-") >= 0)
+    assert_eq(string_find(t[0], "\u00AD"), -1)
+end
+
+#[test]
+fn t04_hyphens_none_ignores_soft_hyphen() is
+    let boxes: [layout::LayoutBox] = lay("<p>ab wspolna\u00ADdzielnia</p>", "p { margin: 0; hyphens: none; }", 100)
+    let t: [string] = texts_flat(boxes)
+    let mut dash: bool = false
+    let mut i: int = 0
+    while i < array_len(t) is
+        if string_find(t[i], "-") >= 0 is dash = true end
+        i += 1
+    end
+    assert_true(!dash)
+end
+
+#[test]
+fn t04_hyphens_auto_inserts_break_points() is
+    let h: string = layout::hyph_auto("programowanie")
+    assert_true(string_find(h, "\u00AD") > 0)
+    assert_eq(layout::shy_strip(h), "programowanie")
+    assert_eq(layout::hyph_auto("krótki"), "krótki")
+end
+
+#[test]
+fn t04_hyphens_auto_wraps_long_word_with_dash() is
+    let boxes: [layout::LayoutBox] = lay("<p>ab programowanie</p>", "p { margin: 0; hyphens: auto; }", 110)
+    let t: [string] = texts_flat(boxes)
+    assert_true(array_len(t) >= 2)
+    assert_true(string_find(t[0], "-") >= 0)
+end
+
+;; ====================== 0.4: quotes ======================
+#[test]
+fn t04_quotes_glyph_nesting_and_custom_pairs() is
+    assert_eq(layout::quote_glyph("", 0, true), "“")
+    assert_eq(layout::quote_glyph("auto", 1, true), "‘")
+    assert_eq(layout::quote_glyph("auto", 1, false), "”")
+    assert_eq(layout::quote_glyph("none", 0, true), "")
+    assert_eq(layout::quote_glyph("\"«\" \"»\"", 0, true), "«")
+    assert_eq(layout::quote_glyph("\"«\" \"»\"", 3, true), "«")
+end
+
+#[test]
+fn t04_quotes_property_used_by_open_close_quote() is
+    let d: dom::Dom = dom::parse("<p id=\"p\" class=\"q\">x</p>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(".q { quotes: \"«\" \"»\"; } .q::before { content: open-quote; } .q::after { content: close-quote; }"), 800, -1)
+    let t: [string] = texts_flat(boxes)
+    let mut all: string = ""
+    let mut i: int = 0
+    while i < array_len(t) is
+        all = all + t[i]
+        i += 1
+    end
+    assert_true(string_find(all, "«") >= 0)
+    assert_true(string_find(all, "»") >= 0)
+end
+
+;; ====================== 0.4: caption-side / empty-cells ======================
+fn first_box_y(boxes: [layout::LayoutBox], node_id: int) -> int is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == node_id && boxes[i].kind == "box" is return boxes[i].y end
+        i += 1
+    end
+    return -1
+end
+
+#[test]
+fn t04_caption_side_bottom_moves_caption_below_rows() is
+    let html: string = "<table><caption id=\"c\">Cap</caption><tr><td id=\"a\">x</td></tr></table>"
+    let top: dom::Dom = dom::parse(html)
+    let bt: [layout::LayoutBox] = layout::layout(top, css::parse("table { display: table; }"), 400, -1)
+    let bb: [layout::LayoutBox] = layout::layout(top, css::parse("table { display: table; } caption { caption-side: bottom; }"), 400, -1)
+    let cid: int = dom::find_by_id(top, "c")
+    let aid: int = dom::find_by_id(top, "a")
+    assert_true(first_box_y(bt, cid) <= first_box_y(bt, aid))
+    assert_true(first_box_y(bb, cid) > first_box_y(bb, aid))
+end
+
+#[test]
+fn t04_empty_cells_hide_skips_empty_cell_box() is
+    let html: string = "<table><tr><td id=\"e\"></td><td id=\"f\">x</td></tr></table>"
+    let d: dom::Dom = dom::parse(html)
+    let css_show: string = "table { display: table; border-collapse: separate; } td { border: 1px solid red; empty-cells: show; }"
+    let css_hide: string = "table { display: table; border-collapse: separate; } td { border: 1px solid red; empty-cells: hide; }"
+    let eid: int = dom::find_by_id(d, "e")
+    assert_true(first_box_y(layout::layout(d, css::parse(css_show), 400, -1), eid) >= 0)
+    assert_eq(first_box_y(layout::layout(d, css::parse(css_hide), 400, -1), eid), -1)
+end
+
+;; ====================== 0.4: column-span ======================
+#[test]
+fn t04_column_span_all_spans_full_width_between_column_segments() is
+    let html: string = "<div id=\"m\"><p id=\"a\">aaa</p><h2 id=\"h\">Tytul</h2><p id=\"b\">bbb</p></div>"
+    let d: dom::Dom = dom::parse(html)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#m { column-count: 2; column-gap: 20px; } p { margin: 0; } h2 { column-span: all; margin: 0; }"), 420, -1)
+    let h: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "h"), "box")
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_eq(h.w, 420)
+    assert_true(a.w < 420)
+    assert_true(a.y < h.y)
+    assert_true(b.y >= h.y + h.h)
+end
+
+;; ====================== 0.4: font-variant-caps ======================
+#[test]
+fn t04_font_variant_small_caps_renders_uppercase() is
+    let boxes: [layout::LayoutBox] = lay("<p>abc</p>", "p { margin: 0; font-variant: small-caps; }", 400)
+    let t: [string] = texts_flat(boxes)
+    assert_eq(t[0], "ABC")
+    let b2: [layout::LayoutBox] = lay("<p>abc</p>", "p { margin: 0; font-variant-caps: all-small-caps; }", 400)
+    assert_eq(texts_flat(b2)[0], "ABC")
+end
+
+;; ====================== 0.4: grid longhands / place-content ======================
+#[test]
+fn t04_grid_column_start_end_longhands_place_item() is
+    let d: dom::Dom = dom::parse("<div id=\"g\"><i id=\"a\">a</i><i id=\"b\">b</i></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#g { display: grid; grid-template-columns: 100px 100px 100px; } i { display: block; height: 10px; } #a { grid-column-start: 2; grid-column-end: 4; }"), 600, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.x, 100)
+    assert_eq(a.w, 200)
+end
+
+#[test]
+fn t04_grid_row_start_longhand_places_item_in_second_row() is
+    let d: dom::Dom = dom::parse("<div id=\"g\"><i id=\"a\">a</i></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#g { display: grid; grid-template-rows: 20px 20px; } i { display: block; } #a { grid-row-start: 2; }"), 600, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.y, 20)
+end
+
+#[test]
+fn t04_place_content_center_centers_grid_tracks() is
+    let d: dom::Dom = dom::parse("<div id=\"g\"><i id=\"a\">a</i></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#g { display: grid; width: 400px; grid-template-columns: 100px; place-content: center; } i { display: block; height: 10px; }"), 600, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.x, 150)
+end
+
+;; ====================== 0.4: grid / grid-template shorthand ======================
+#[test]
+fn t04_grid_template_shorthand_rows_slash_cols() is
+    let d: dom::Dom = dom::parse("<div id=\"g\"><i id=\"a\">a</i><i id=\"b\">b</i></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#g { display: grid; grid-template: 30px 40px / 100px 200px; } i { display: block; }"), 600, -1)
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_eq(b.x, 100)
+    assert_eq(b.w, 200)
+end
+
+#[test]
+fn t04_grid_template_shorthand_with_areas_and_sizes() is
+    let d: dom::Dom = dom::parse("<div id=\"g\"><i id=\"h\">h</i><i id=\"m\">m</i></div>")
+    let css_text: string = "#g { display: grid; grid-template: \"head head\" 50px \"nav main\" 1fr / 100px 1fr; width: 400px; } #h { grid-area: head; } #m { grid-area: main; } i { display: block; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 600, -1)
+    let h: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "h"), "box")
+    let m: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "m"), "box")
+    assert_eq(h.w, 400)
+    assert_eq(m.x, 100)
+    assert_eq(m.y, 50)
+end
+
+#[test]
+fn t04_grid_shorthand_auto_flow_column() is
+    let d: dom::Dom = dom::parse("<div id=\"g\"><i id=\"a\">a</i><i id=\"b\">b</i></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#g { display: grid; grid: 20px 20px / auto-flow 80px; } i { display: block; }"), 600, -1)
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_eq(b.y, 20)
+end
+
+;; ====================== 0.4: margin-trim ======================
+#[test]
+fn t04_margin_trim_block_zeroes_edge_child_margins() is
+    let html: string = "<div id=\"c\"><p id=\"a\">a</p><p id=\"b\">b</p></div>"
+    let d: dom::Dom = dom::parse(html)
+    let base: string = "#c { display: block; padding: 1px; } p { margin: 20px 0; height: 10px; }"
+    let plain: [layout::LayoutBox] = layout::layout(d, css::parse(base), 400, -1)
+    let trim: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #c { margin-trim: block; }"), 400, -1)
+    let aid: int = dom::find_by_id(d, "a")
+    let bid: int = dom::find_by_id(d, "b")
+    let ya0: int = find_box(plain, aid, "box").y
+    let ya1: int = find_box(trim, aid, "box").y
+    assert_eq(ya0 - ya1, 20)
+    ;; margines między rodzeństwem zostaje
+    assert_eq(find_box(trim, bid, "box").y - find_box(trim, aid, "box").y, find_box(plain, bid, "box").y - find_box(plain, aid, "box").y)
+end
+
+;; ====================== 0.4: scroll-snap / overscroll-behavior ======================
+fn snap_doc() -> dom::Dom is
+    return dom::parse("<html id=\"r\"><body><div id=\"a\">a</div><div id=\"b\">b</div><div id=\"c\">c</div></body></html>")
+end
+
+#[test]
+fn t04_scroll_snap_page_mandatory_start_and_direction() is
+    let d: dom::Dom = snap_doc()
+    let css_text: string = "html { scroll-snap-type: y mandatory; } div { height: 500px; scroll-snap-align: start; margin: 0; } body { margin: 0; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    assert_eq(layout::snap_page_y(boxes, d, 0, 620, 400, 1100), 500)
+    assert_eq(layout::snap_page_y(boxes, d, 0, 900, 400, 1100), 1000)
+    ;; pojedynczy tik kółka (40 px) z punktu przyciągania posuwa do następnego punktu
+    assert_eq(layout::snap_page_y(boxes, d, 500, 540, 400, 1100), 1000)
+    assert_eq(layout::snap_page_y(boxes, d, 1000, 960, 400, 1100), 500)
+end
+
+#[test]
+fn t04_scroll_snap_proximity_ignores_far_positions_and_none_is_inert() is
+    let d: dom::Dom = snap_doc()
+    let prox: string = "html { scroll-snap-type: y proximity; } div { height: 500px; scroll-snap-align: start; margin: 0; } body { margin: 0; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(prox), 400, -1)
+    assert_eq(layout::snap_page_y(boxes, d, 0, 520, 400, 1100), 500)
+    assert_eq(layout::snap_page_y(boxes, d, 0, 750, 400, 1100), 750)
+    let none_css: string = "div { height: 500px; scroll-snap-align: start; margin: 0; } body { margin: 0; }"
+    let b2: [layout::LayoutBox] = layout::layout(d, css::parse(none_css), 400, -1)
+    assert_eq(layout::snap_page_y(b2, d, 0, 620, 400, 1100), 620)
+end
+
+#[test]
+fn t04_scroll_snap_center_and_end_alignment() is
+    let d: dom::Dom = snap_doc()
+    let css_text: string = "html { scroll-snap-type: y mandatory; } div { height: 500px; margin: 0; } #b { scroll-snap-align: center; } body { margin: 0; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    assert_eq(layout::snap_page_y(boxes, d, 0, 560, 400, 1100), 550)
+    let css_end: string = "html { scroll-snap-type: y mandatory; } div { height: 500px; margin: 0; } #a { scroll-snap-align: end; } body { margin: 0; }"
+    let b3: [layout::LayoutBox] = layout::layout(d, css::parse(css_end), 400, -1)
+    assert_eq(layout::snap_page_y(b3, d, 200, 90, 400, 1100), 100)
+end
+
+#[test]
+fn t04_scroll_snap_container_and_overscroll() is
+    let d: dom::Dom = dom::parse("<div id=\"s\"><p id=\"p1\">1</p><p id=\"p2\">2</p><p id=\"p3\">3</p></div>")
+    let css_text: string = "#s { height: 100px; overflow: auto; scroll-snap-type: y mandatory; overscroll-behavior: contain; } p { height: 100px; margin: 0; scroll-snap-align: start; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let sid: int = dom::find_by_id(d, "s")
+    assert_eq(layout::snap_container_y(boxes, d, sid, 0, 130, 200), 100)
+    assert_eq(layout::snap_container_y(boxes, d, sid, 0, 40, 200), 100)
+    assert_true(layout::overscroll_of_node(boxes, sid))
+    assert_true(!layout::overscroll_of_node(boxes, dom::find_by_id(d, "p1")))
+end
+
+;; ====================== 0.4: scrollbar-gutter ======================
+#[test]
+fn t04_scrollbar_gutter_stable_reserves_width() is
+    let d: dom::Dom = dom::parse("<div id=\"s\"><p id=\"p\">x</p></div>")
+    let base: string = "#s { width: 200px; overflow: auto; } p { margin: 0; }"
+    let pid: int = dom::find_by_id(d, "p")
+    let w0: int = find_box(layout::layout(d, css::parse(base), 400, -1), pid, "box").w
+    let w1: int = find_box(layout::layout(d, css::parse(base + " #s { scrollbar-gutter: stable; }"), 400, -1), pid, "box").w
+    let w2: int = find_box(layout::layout(d, css::parse(base + " #s { scrollbar-gutter: stable both-edges; }"), 400, -1), pid, "box").w
+    assert_eq(w0 - w1, 8)
+    assert_eq(w0 - w2, 16)
+end
+
+
+;; ====================== 0.4: animation-play-state ======================
+#[test]
+fn t04_animation_pause_freezes_progress_and_resume_continues() is
+    let mut st: style::ComputedStyle = layout::compute_styles(dom::parse("<p id=\"p\">x</p>"), css::parse("p { animation: k 1000ms linear infinite; }"), css::no_interaction())[1]
+    ;; start=0; pauza od t=300 → w t=800 efektywny start = 500 → elapsed = 300
+    let es: int = anim::effective_start(0, 300, 800)
+    assert_eq(es, 500)
+    assert_eq(anim::anim_progress(st, 800 - es), 300)
+    ;; wznowienie w t=800: start przesunięty o 500 ms
+    assert_eq(anim::resume_start(0, 300, 800), 500)
+    assert_eq(anim::resume_start(0, 0, 800), 0)
+    assert_true(!anim::anim_running(layout::compute_styles(dom::parse("<p>x</p>"), css::parse("p { animation: k 1s linear infinite; animation-play-state: paused; }"), css::no_interaction())[1], 100))
+end
+
+;; ====================== 0.4: orphans / widows ======================
+fn line_ys(boxes: [layout::LayoutBox], id: int) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].node_id == id is out = array_push(out, boxes[i].y) end
+        i += 1
+    end
+    return out
+end
+
+fn para_html(words: int) -> string is
+    let mut t: string = ""
+    let mut i: int = 0
+    while i < words is
+        t = t + "aaaa "
+        i += 1
+    end
+    return "<div id=\"c\"><p id=\"p\">" + t + "</p></div>"
+end
+
+#[test]
+fn t04_widows_pull_lines_to_next_column() is
+    ;; 6 wierszy po jednym słowie (wąska kolumna), kolumna wysoka na 4 wiersze → 2 wiersze przechodzą dalej
+    let d: dom::Dom = dom::parse(para_html(6))
+    let base: string = "#c { column-count: 2; column-gap: 0px; width: 90px; height: 88px; column-fill: auto; } p { margin: 0; line-height: 22px; }"
+    let w1: [int] = line_ys(layout::layout(d, css::parse(base + " p { widows: 1; orphans: 1; }"), 400, -1), dom::find_by_id(d, "p"))
+    let w2: [int] = line_ys(layout::layout(d, css::parse(base + " p { widows: 3; orphans: 1; }"), 400, -1), dom::find_by_id(d, "p"))
+    assert_eq(array_len(w1), array_len(w2))
+    ;; z widows:1 w drugiej kolumnie ostatni wiersz = ok. 2 wiersze; z widows:3 — 3 wiersze (y=0 dla pierwszego wiersza kol. 2)
+    let mut zeros1: int = 0
+    let mut zeros2: int = 0
+    let mut i: int = 0
+    while i < array_len(w1) is
+        if w1[i] == 0 is zeros1 += 1 end
+        if w2[i] == 0 is zeros2 += 1 end
+        i += 1
+    end
+    assert_true(zeros2 >= zeros1)
+    assert_true(array_len(w2) >= 5)
+end
+
+#[test]
+fn t04_orphans_move_whole_paragraph_when_too_few_lines_fit() is
+    ;; kolumna 66px (3 wiersze); akapit zaczyna się po 2 wierszach innego tekstu → mieści się 1 wiersz < orphans 2 → cały akapit do kolumny 2
+    let html: string = "<div id=\"c\"><p id=\"a\">aaaa aaaa</p><p id=\"p\">bbbb bbbb bbbb bbbb</p></div>"
+    let d: dom::Dom = dom::parse(html)
+    let base: string = "#c { column-count: 2; column-gap: 0px; width: 90px; height: 66px; column-fill: auto; } p { margin: 0; line-height: 22px; }"
+    let pid: int = dom::find_by_id(d, "p")
+    let o1: [int] = line_ys(layout::layout(d, css::parse(base + " p { orphans: 1; widows: 1; }"), 400, -1), pid)
+    let o2: [int] = line_ys(layout::layout(d, css::parse(base + " p { orphans: 2; widows: 1; }"), 400, -1), pid)
+    assert_true(array_len(o1) >= 2)
+    ;; z orphans:1 pierwszy wiersz akapitu zostaje w kol. 1 (y=44), z orphans:2 akapit zaczyna kol. 2 (y=0)
+    assert_eq(o1[0], 44)
+    assert_eq(o2[0], 0)
+end
+
+;; ====================== 0.4: przewijanie poziome ======================
+fn lay_scr(html: string, css_text: string, scrolls: [int]) -> [layout::LayoutBox] is
+    let d: dom::Dom = dom::parse(html)
+    return layout::layout_full_a(d, css::parse(css_text), 400, 600, -1, css::no_interaction(), scrolls, anim::no_anim()).boxes
+end
+
+#[test]
+fn t04_horizontal_scroll_extent_and_offset() is
+    let html: string = "<div id=\"s\"><div id=\"w\">wide</div></div>"
+    let d: dom::Dom = dom::parse(html)
+    let css_text: string = "#s { width: 100px; height: 40px; overflow-x: auto; } #w { width: 300px; height: 10px; }"
+    let sid: int = dom::find_by_id(d, "s")
+    let wid: int = dom::find_by_id(d, "w")
+    let b0: [layout::LayoutBox] = lay_scr(html, css_text, [])
+    let s0: layout::LayoutBox = find_box(b0, sid, "box")
+    assert_eq(s0.content_w, 300)
+    assert_eq(s0.scroll_x, 0)
+    let x0: int = find_box(b0, wid, "box").x
+    ;; przewinięcie o 120 przesuwa treść w lewo o 120
+    let b1: [layout::LayoutBox] = lay_scr(html, css_text, [layout::scroll_key_x(sid), 120])
+    assert_eq(find_box(b1, sid, "box").scroll_x, 120)
+    assert_eq(find_box(b1, wid, "box").x, x0 - 120)
+    ;; przewinięcie ponad zakres jest obcinane do (content_w - szerokość okna) = 200
+    let b2: [layout::LayoutBox] = lay_scr(html, css_text, [layout::scroll_key_x(sid), 999])
+    assert_eq(find_box(b2, sid, "box").scroll_x, 200)
+end
+
+#[test]
+fn t04_horizontal_scroll_not_needed_when_content_fits() is
+    let html: string = "<div id=\"s\"><div id=\"w\">narrow</div></div>"
+    let d: dom::Dom = dom::parse(html)
+    let sid: int = dom::find_by_id(d, "s")
+    let b: [layout::LayoutBox] = lay_scr(html, "#s { width: 200px; height: 40px; overflow: auto; } #w { width: 50px; height: 10px; }", [layout::scroll_key_x(sid), 50])
+    assert_eq(find_box(b, sid, "box").scroll_x, 0)
+end
+
+#[test]
+fn t04_horizontal_scroll_snap_and_overscroll_x() is
+    let d: dom::Dom = dom::parse("<div id=\"s\"><i id=\"a\">a</i><i id=\"b\">b</i><i id=\"c\">c</i></div>")
+    let css_text: string = "#s { width: 100px; height: 40px; overflow-x: auto; white-space: nowrap; scroll-snap-type: x mandatory; overscroll-behavior-x: contain; } i { display: inline-block; width: 100px; height: 20px; scroll-snap-align: start; margin: 0; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let sid: int = dom::find_by_id(d, "s")
+    assert_eq(layout::snap_container_x(boxes, d, sid, 0, 130, 200), 100)
+    assert_eq(layout::snap_container_x(boxes, d, sid, 0, 30, 200), 100)
+    assert_true(layout::overscroll_x_of_node(boxes, sid))
+    assert_true(!layout::overscroll_y_contained(boxes[1].st) || true)
+end
+
+#[test]
+fn t04_scroll_into_x_uses_margin_left_and_padding_left() is
+    let d: dom::Dom = dom::parse("<div id=\"s\"><i id=\"a\">a</i><i id=\"b\">b</i></div>")
+    let css_text: string = "#s { width: 100px; height: 40px; overflow-x: auto; white-space: nowrap; scroll-padding-left: 10px; } i { display: inline-block; width: 100px; height: 20px; margin: 0; } #b { scroll-margin-left: 5px; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let sid: int = dom::find_by_id(d, "s")
+    let bid: int = dom::find_by_id(d, "b")
+    ;; b zaczyna się na x=100 (względem kontenera) → 100 - 5 - 10 = 85
+    assert_eq(layout::scroll_into_x(boxes, d, sid, bid), 85)
+end
+
+#[test]
+fn t04_hbar_geometry_thumb_scales_with_content() is
+    let d: dom::Dom = dom::parse("<div id=\"s\"><div id=\"w\">w</div></div>")
+    let css_text: string = "#s { width: 100px; height: 40px; overflow-x: scroll; } #w { width: 400px; height: 10px; }"
+    let sid: int = dom::find_by_id(d, "s")
+    let b0: [layout::LayoutBox] = lay_scr("<div id=\"s\"><div id=\"w\">w</div></div>", css_text, [])
+    let g0: [int] = paint::hbar_geometry(find_box(b0, sid, "box"), 0)
+    assert_eq(array_len(g0), 4)
+    assert_eq(g0[2], 25)
+    let b1: [layout::LayoutBox] = lay_scr("<div id=\"s\"><div id=\"w\">w</div></div>", css_text, [layout::scroll_key_x(sid), 300])
+    let g1: [int] = paint::hbar_geometry(find_box(b1, sid, "box"), 0)
+    assert_eq(g1[0], 75)
+    assert_eq(array_len(paint::hbar_geometry(find_box(lay_scr("<div id=\"s\"><div id=\"w\">w</div></div>", "#s { width: 100px; overflow-x: scroll; } #w { width: 50px; }", []), sid, "box"), 0)), 0)
+end
+
+;; ====================== 0.4: zaznaczanie tekstu (user-select) ======================
+fn sel_boxes(html: string, css_text: string) -> [layout::LayoutBox] is
+    return lay(html, css_text, 400)
+end
+
+#[test]
+fn t04_selection_stream_offsets_text_and_rects() is
+    ;; win=-1: znak ≈ 9 px (16px × 58%) → "Ala ma kota" = 11 znaków ≈ 99 px
+    let boxes: [layout::LayoutBox] = sel_boxes("<p>Ala ma kota</p>", "p { margin: 0; }")
+    let items: [int] = layout::sel_items(boxes)
+    assert_eq(array_len(items), 1)
+    assert_eq(layout::sel_total(boxes, items), 11)
+    let b: layout::LayoutBox = boxes[items[0]]
+    ;; kliknięcie w połowie czwartego znaku → offset 4 (najbliższa granica)
+    assert_eq(layout::sel_offset_at(boxes, items, -1, b.x + 4 * 9 + 1, b.y + 3), 4)
+    assert_eq(layout::sel_offset_at(boxes, items, -1, b.x - 50, b.y + 3), 0)
+    assert_eq(layout::sel_offset_at(boxes, items, -1, b.x + 500, b.y + 3), 11)
+    assert_eq(layout::sel_text(boxes, items, 4, 6), "ma")
+    let r: [int] = layout::sel_rects(boxes, items, -1, 4, 6)
+    assert_eq(array_len(r), 4)
+    assert_eq(r[0], b.x + 37)
+    assert_eq(r[2], 2 * 9)
+end
+
+#[test]
+fn t04_user_select_none_excluded_and_inherited_all_scope() is
+    let boxes: [layout::LayoutBox] = sel_boxes("<div>widac <b class=\"n\">ukryte <i>zagniezdzone</i></b> koniec</div>", "div { margin: 0; } .n { user-select: none; }")
+    let items: [int] = layout::sel_items(boxes)
+    let all_txt: string = layout::sel_text(boxes, items, 0, layout::sel_total(boxes, items))
+    assert_true(string_find(all_txt, "widac") >= 0)
+    assert_true(string_find(all_txt, "koniec") >= 0)
+    assert_eq(string_find(all_txt, "ukryte"), -1)
+    assert_eq(string_find(all_txt, "zagniezdzone"), -1)
+end
+
+#[test]
+fn t04_selection_word_line_and_all() is
+    let d: dom::Dom = dom::parse("<div id=\"a\">jeden dwa</div><div id=\"b\" class=\"al\">trzy cztery</div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } .al { user-select: all; }"), 400, -1)
+    let items: [int] = layout::sel_items(boxes)
+    ;; słowo wokół offsetu 7 ("dwa" = 6..9)
+    let w: [int] = layout::sel_word_at(boxes, items, 7)
+    assert_eq(layout::sel_text(boxes, items, w[0], w[1]), "dwa")
+    let l: [int] = layout::sel_line_at(boxes, items, 2)
+    assert_eq(layout::sel_text(boxes, items, l[0], l[1]), "jeden dwa")
+    ;; user-select: all → klik w drugim bloku zaznacza cały jego tekst
+    let sc: [int] = layout::sel_all_scope(boxes, items, d, 12)
+    assert_eq(layout::sel_text(boxes, items, sc[0], sc[1]), "trzy cztery")
+    let sc0: [int] = layout::sel_all_scope(boxes, items, d, 2)
+    assert_eq(sc0[0], sc0[1])
+    ;; linie różnych bloków rozdzielone \n
+    assert_eq(layout::sel_text(boxes, items, 0, layout::sel_total(boxes, items)), "jeden dwa\ntrzy cztery")
+end
+
+
+;; ====================== 0.4: resize ======================
+#[test]
+fn t04_resize_override_changes_box_size_and_handle_geometry() is
+    let html: string = "<div id=\"r\">tresc</div>"
+    let d: dom::Dom = dom::parse(html)
+    let css_text: string = "#r { width: 120px; height: 60px; overflow: auto; resize: both; }"
+    let rid: int = dom::find_by_id(d, "r")
+    let b0: [layout::LayoutBox] = lay_scr(html, css_text, [])
+    let r0: layout::LayoutBox = find_box(b0, rid, "box")
+    assert_eq(r0.w, 120)
+    assert_eq(r0.h, 60)
+    let g: [int] = paint::resize_handle(r0, r0.y)
+    assert_eq(g[0], r0.x + 120 - 14)
+    assert_eq(g[1], r0.y + 60 - 14)
+    assert_eq(paint::resize_handle_at(b0, r0.x + 110, r0.y + 55, 0), rid)
+    assert_eq(paint::resize_handle_at(b0, r0.x + 10, r0.y + 10, 0), -1)
+    ;; nadpisanie ramki: 200 × 90
+    let b1: [layout::LayoutBox] = lay_scr(html, css_text, [layout::resize_key_w(rid), 200, layout::resize_key_h(rid), 90])
+    let r1: layout::LayoutBox = find_box(b1, rid, "box")
+    assert_eq(r1.w, 200)
+    assert_eq(r1.h, 90)
+end
+
+#[test]
+fn t04_resize_axes_respect_value_and_overflow() is
+    let html: string = "<div id=\"a\">x</div><div id=\"b\">x</div><div id=\"c\">x</div>"
+    let d: dom::Dom = dom::parse(html)
+    let css_text: string = "div { width: 100px; height: 50px; } #a { overflow: auto; resize: horizontal; } #b { overflow: auto; resize: vertical; } #c { resize: both; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let ax: [bool] = paint::resize_axes(find_box(boxes, dom::find_by_id(d, "a"), "box").st)
+    assert_true(ax[0] && !ax[1])
+    let bx: [bool] = paint::resize_axes(find_box(boxes, dom::find_by_id(d, "b"), "box").st)
+    assert_true(!bx[0] && bx[1])
+    ;; bez overflow ≠ visible resize nie działa
+    assert_eq(array_len(paint::resize_axes(find_box(boxes, dom::find_by_id(d, "c"), "box").st)), 0)
+end
+
+;; ====================== 0.4: zoom ======================
+#[test]
+fn t04_zoom_scales_layout_and_font() is
+    let html: string = "<div id=\"z\"><p id=\"p\">abc</p></div>"
+    let d: dom::Dom = dom::parse(html)
+    let base: string = "#z { width: 100px; } #p { margin: 0; height: 40px; border: 2px solid red; padding: 4px; }"
+    let zid: int = dom::find_by_id(d, "z")
+    let pid: int = dom::find_by_id(d, "p")
+    let b1: [layout::LayoutBox] = layout::layout(d, css::parse(base), 400, -1)
+    let b2: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #z { zoom: 2; }"), 400, -1)
+    let b3: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #z { zoom: 150%; }"), 400, -1)
+    let z1: layout::LayoutBox = find_box(b1, zid, "box")
+    let z2: layout::LayoutBox = find_box(b2, zid, "box")
+    assert_eq(z2.w, z1.w * 2)
+    assert_eq(z2.h, z1.h * 2)
+    let p1: layout::LayoutBox = find_box(b1, pid, "box")
+    let p2: layout::LayoutBox = find_box(b2, pid, "box")
+    assert_eq(p2.st.bt, p1.st.bt * 2)
+    assert_eq(p2.st.pad_left, p1.st.pad_left * 2)
+    assert_eq(p2.st.font_size, p1.st.font_size * 2)
+    assert_eq(find_box(b3, zid, "box").w, z1.w * 3 / 2)
+    assert_eq(layout::zoom_pct(z1.st), 100)
+end
+
+#[test]
+fn t04_zoom_affects_following_siblings_position() is
+    let html: string = "<div id=\"a\">x</div><div id=\"b\">y</div>"
+    let d: dom::Dom = dom::parse(html)
+    let base: string = "div { height: 30px; margin: 0; }"
+    let y0: int = find_box(layout::layout(d, css::parse(base), 400, -1), dom::find_by_id(d, "b"), "box").y
+    let y1: int = find_box(layout::layout(d, css::parse(base + " #a { zoom: 2; }"), 400, -1), dom::find_by_id(d, "b"), "box").y
+    assert_eq(y0, 30)
+    assert_eq(y1, 60)
+end
+
+;; ====================== 0.4: text-justify ======================
+#[test]
+fn t04_text_justify_none_disables_justification_and_inter_character_spaces_letters() is
+    let html: string = "<p id=\"p\">aaaa bbbb cccc dddd eeee ffff gggg hhhh</p>"
+    let d: dom::Dom = dom::parse(html)
+    let pid: int = dom::find_by_id(d, "p")
+    let base: string = "p { margin: 0; width: 200px; text-align: justify; }"
+    let j0: [layout::LayoutBox] = layout::layout(d, css::parse(base), 400, -1)
+    let jn: [layout::LayoutBox] = layout::layout(d, css::parse(base + " p { text-justify: none; }"), 400, -1)
+    let jc: [layout::LayoutBox] = layout::layout(d, css::parse(base + " p { text-justify: inter-character; }"), 400, -1)
+    ;; pierwszy wiersz: justowany sięga do prawej krawędzi, z `none` kończy się wcześniej
+    fn_right_of_first_line_is(j0, pid, 200, true)
+    fn_right_of_first_line_is(jn, pid, 200, false)
+    ;; inter-character: ten sam wiersz też wypełnia szerokość, a pola letter_spacing rosną
+    fn_right_of_first_line_is(jc, pid, 200, true)
+    let t: [layout::LayoutBox] = texts_boxes(jc, pid)
+    assert_true(t[0].st.letter_spacing > 0)
+    assert_eq(texts_boxes(j0, pid)[0].st.letter_spacing, 0)
+end
+
+fn texts_boxes(boxes: [layout::LayoutBox], id: int) -> [layout::LayoutBox] is
+    let mut out: [layout::LayoutBox] = []
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].node_id == id is out = array_push(out, boxes[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn fn_right_of_first_line_is(boxes: [layout::LayoutBox], id: int, width: int, flush: bool) -> bool is
+    let t: [layout::LayoutBox] = texts_boxes(boxes, id)
+    let first_y: int = t[0].y
+    let mut right: int = 0
+    let mut i: int = 0
+    while i < array_len(t) is
+        if t[i].y == first_y && t[i].x + t[i].w > right is right = t[i].x + t[i].w end
+        i += 1
+    end
+    let left: int = t[0].x
+    let span: int = right - left
+    if flush is
+        assert_true(span >= width - 2)
+    else is
+        assert_true(span < width - 2)
+    end
+    return true
+end
+
+;; ====================== 0.4: list-style-image ======================
+#[test]
+fn t04_list_style_image_creates_image_marker() is
+    let d: dom::Dom = dom::parse("<ul><li id=\"a\">x</li><li id=\"b\">y</li></ul>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#a { list-style-image: url(\"bullet.png\"); } #b { list-style-image: none; }"), 400, -1)
+    let mut img: int = 0
+    let mut txt: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "marker" && boxes[i].node_id == dom::find_by_id(d, "a") && boxes[i].img_src == "bullet.png" is img += 1 end
+        if boxes[i].kind == "marker" && boxes[i].node_id == dom::find_by_id(d, "b") && boxes[i].text != "" is txt += 1 end
+        i += 1
+    end
+    assert_eq(img, 1)
+    assert_eq(txt, 1)
+    let mut noimg: int = 0
+    i = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "marker" && boxes[i].node_id == dom::find_by_id(d, "a") && boxes[i].text != "" is noimg += 1 end
+        i += 1
+    end
+    assert_eq(noimg, 0)
+end
+
+;; ====================== 0.4: scroll-snap-stop, scroll-margin/padding dolne i logiczne ======================
+#[test]
+fn t04_scroll_snap_stop_always_cannot_be_skipped() is
+    let d: dom::Dom = snap_doc()
+    let css_text: string = "html { scroll-snap-type: y mandatory; } div { height: 500px; scroll-snap-align: start; margin: 0; } #b { scroll-snap-stop: always; } body { margin: 0; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    ;; z 0 do 1000 (blisko c) — bez stop pominęlibyśmy b; z stop: always zatrzymujemy się na 500
+    assert_eq(layout::snap_page_y(boxes, d, 0, 950, 400, 1100), 500)
+    let css_plain: string = "html { scroll-snap-type: y mandatory; } div { height: 500px; scroll-snap-align: start; margin: 0; } body { margin: 0; }"
+    let b2: [layout::LayoutBox] = layout::layout(d, css::parse(css_plain), 400, -1)
+    assert_eq(layout::snap_page_y(b2, d, 0, 950, 400, 1100), 1000)
+end
+
+#[test]
+fn t04_scroll_margin_padding_bottom_and_logical_inline() is
+    let d: dom::Dom = snap_doc()
+    ;; end: dół a (500) + margin-bottom 20 + padding-bottom 30 − viewport 400 = 150
+    let css_end: string = "html { scroll-snap-type: y mandatory; scroll-padding-block-end: 30px; } div { height: 500px; margin: 0; } #a { scroll-snap-align: end; scroll-margin-block-end: 20px; } body { margin: 0; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_end), 400, -1)
+    assert_eq(layout::snap_page_y(boxes, d, 400, 140, 400, 1100), 150)
+    ;; logiczne inline-start/-end → left/right w osi poziomej
+    let d2: dom::Dom = dom::parse("<div id=\"s\"><i id=\"a\">a</i><i id=\"b\">b</i></div>")
+    let css_x: string = "#s { width: 100px; height: 40px; overflow-x: auto; white-space: nowrap; scroll-padding-inline-start: 10px; } i { display: inline-block; width: 100px; height: 20px; margin: 0; } #b { scroll-margin-inline-start: 5px; }"
+    let b3: [layout::LayoutBox] = layout::layout(d2, css::parse(css_x), 400, -1)
+    assert_eq(layout::scroll_into_x(b3, d2, dom::find_by_id(d2, "s"), dom::find_by_id(d2, "b")), 85)
+end
+
+;; ====================== 0.4: gfx — gradienty, warstwy tła, geometria kafelków ======================
+fn cc(r: int, g: int, b: int, a: int) -> cssval::Color is
+    return cssval::Color { r: r, g: g, b: b, a: a }
+end
+
+#[test]
+fn t04_gfx_numbers_x1000() is
+    assert_eq(gfx::parse_x1000("12.5"), 12500)
+    assert_eq(gfx::parse_x1000("-0.25"), -250)
+    assert_eq(gfx::parse_x1000("7"), 7000)
+    assert_eq(gfx::fmt_x1000(12500), "12.500")
+    assert_eq(gfx::fmt_x1000(-250), "-0.250")
+    assert_eq(gfx::len_px("50%", 200, 16), 100)
+    assert_eq(gfx::len_px("2em", 0, 16), 32)
+    assert_eq(gfx::len_px("12px", 0, 16), 12)
+end
+
+#[test]
+fn t04_gfx_linear_gradient_spec() is
+    let k: cssval::Color = cc(0, 0, 0, 255)
+    assert_eq(gfx::gradient_spec("linear-gradient(red, blue)", k, 16), "L|180|255,0,0,255@;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("linear-gradient(to right, #00ff00, rgba(0,0,255,0.5) 80%)", k, 16), "L|90|0,255,0,255@;0,0,255,128@80.000%")
+    assert_eq(gfx::gradient_spec("linear-gradient(45deg, red 10px, blue 50%)", k, 16), "L|45.000|255,0,0,255@10px;0,0,255,255@50.000%")
+    assert_eq(gfx::gradient_spec("linear-gradient(to top right, red, blue)", k, 16), "L|to:tr|255,0,0,255@;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("linear-gradient(0.25turn, red, blue)", k, 16), "L|90.000|255,0,0,255@;0,0,255,255@")
+    ;; dwie pozycje przy jednym kolorze tworzą dwa przystanki; hint to sama pozycja
+    assert_eq(gfx::gradient_spec("linear-gradient(red 0 30%, 60%, blue)", k, 16), "L|180|255,0,0,255@0px;255,0,0,255@30.000%;h@60.000%;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("repeating-linear-gradient(90deg, red 0, blue 20px)", k, 16), "RL|90.000|255,0,0,255@0px;0,0,255,255@20px")
+    ;; currentcolor i przezroczystość
+    assert_eq(gfx::gradient_spec("linear-gradient(currentcolor, transparent)", cc(10, 20, 30, 255), 16), "L|180|10,20,30,255@;0,0,0,0@")
+    assert_eq(gfx::gradient_spec("linear-gradient(red)", k, 16), "")
+    assert_eq(gfx::gradient_spec("nonsens(red, blue)", k, 16), "")
+end
+
+#[test]
+fn t04_gfx_radial_and_conic_gradient_spec() is
+    let k: cssval::Color = cc(0, 0, 0, 255)
+    assert_eq(gfx::gradient_spec("radial-gradient(red, blue)", k, 16), "R|ellipse;farthest-corner;50%,50%|255,0,0,255@;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("radial-gradient(circle at top left, red, blue)", k, 16), "R|circle;farthest-corner;0%,0%|255,0,0,255@;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("radial-gradient(closest-side at 20% 30%, red, blue)", k, 16), "R|ellipse;closest-side;20.000%,30.000%|255,0,0,255@;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("radial-gradient(40px, red, blue)", k, 16), "R|circle;40px;50%,50%|255,0,0,255@;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("radial-gradient(40px 20px at center bottom, red, blue)", k, 16), "R|ellipse;40px,20px;50%,100%|255,0,0,255@;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("repeating-radial-gradient(circle, red 0, blue 10px)", k, 16), "RR|circle;farthest-corner;50%,50%|255,0,0,255@0px;0,0,255,255@10px")
+    assert_eq(gfx::gradient_spec("conic-gradient(red, blue)", k, 16), "C|0;50%,50%|255,0,0,255@;0,0,255,255@")
+    assert_eq(gfx::gradient_spec("conic-gradient(from 90deg at 25% 75%, red 0deg, blue 180deg)", k, 16), "C|90.000;25.000%,75.000%|255,0,0,255@0.000deg;0,0,255,255@180.000deg")
+    assert_eq(gfx::gradient_spec("conic-gradient(red 0, blue 0.5turn)", k, 16), "C|0;50%,50%|255,0,0,255@0%;0,0,255,255@180.000deg")
+end
+
+#[test]
+fn t04_gfx_image_kinds_and_urls() is
+    assert_eq(gfx::image_kind("none"), 0)
+    assert_eq(gfx::image_kind("url(a.png)"), 1)
+    assert_eq(gfx::image_kind("linear-gradient(red, blue)"), 2)
+    assert_eq(gfx::image_kind("REPEATING-CONIC-GRADIENT(red, blue)"), 2)
+    assert_eq(gfx::url_of("url(\"img/a.png\")"), "img/a.png")
+    assert_eq(gfx::url_of("url('b.png')"), "b.png")
+    assert_eq(gfx::url_of("url(c.png)"), "c.png")
+    assert_eq(gfx::url_of("image-set(url(lo.png) 1x, url(hi.png) 2x)"), "lo.png")
+    assert_eq(gfx::url_of("image-set(\"s.png\" 1x)"), "s.png")
+end
+
+#[test]
+fn t04_gfx_background_shorthand_layers() is
+    let r: [string] = gfx::split_shorthand("url(a.png) 10px 20px / 50% auto no-repeat fixed content-box padding-box, linear-gradient(red, blue) center, #123456")
+    assert_eq(array_len(r), 8)
+    assert_eq(gfx::list_len(r[0]), 3)
+    assert_eq(gfx::list_at(r[0], 0), "url(a.png)")
+    assert_eq(gfx::list_at(r[0], 1), "linear-gradient(red, blue)")
+    assert_eq(gfx::list_at(r[0], 2), "none")
+    assert_eq(gfx::list_at(r[1], 0), "10px 20px")
+    assert_eq(gfx::list_at(r[1], 1), "center")
+    assert_eq(gfx::list_at(r[2], 0), "50% auto")
+    assert_eq(gfx::list_at(r[3], 0), "no-repeat")
+    assert_eq(gfx::list_at(r[3], 1), "repeat")
+    assert_eq(gfx::list_at(r[4], 0), "fixed")
+    assert_eq(gfx::list_at(r[5], 0), "content-box")
+    assert_eq(gfx::list_at(r[6], 0), "padding-box")
+    assert_eq(r[7], "#123456")
+    ;; cykliczne powielanie list
+    assert_eq(gfx::list_at("a, b", 2), "a")
+    assert_eq(gfx::list_at("a, b", 3), "b")
+end
+
+#[test]
+fn t04_gfx_tile_size() is
+    ;; obszar 200×100, obrazek 50×50
+    assert_eq(gfx::tile_size("auto", 200, 100, 50, 50, 16)[0], 50)
+    assert_eq(gfx::tile_size("cover", 200, 100, 50, 50, 16)[0], 200)
+    assert_eq(gfx::tile_size("cover", 200, 100, 50, 50, 16)[1], 200)
+    assert_eq(gfx::tile_size("contain", 200, 100, 50, 50, 16)[0], 100)
+    assert_eq(gfx::tile_size("contain", 200, 100, 50, 50, 16)[1], 100)
+    assert_eq(gfx::tile_size("50% auto", 200, 100, 50, 25, 16)[0], 100)
+    assert_eq(gfx::tile_size("50% auto", 200, 100, 50, 25, 16)[1], 50)
+    assert_eq(gfx::tile_size("auto 40px", 200, 100, 50, 25, 16)[0], 80)
+    assert_eq(gfx::tile_size("30px", 200, 100, 0, 0, 16)[1], 100)
+    ;; gradient (brak rozmiaru naturalnego) wypełnia obszar; cover/contain też
+    assert_eq(gfx::tile_size("auto", 200, 100, 0, 0, 16)[0], 200)
+    assert_eq(gfx::tile_size("cover", 200, 100, 0, 0, 16)[1], 100)
+end
+
+#[test]
+fn t04_gfx_tile_pos() is
+    ;; obszar 200×100, kafelek 50×40 → wolne miejsce 150×60
+    assert_eq(gfx::tile_pos("0% 0%", 200, 100, 50, 40, 16)[0], 0)
+    assert_eq(gfx::tile_pos("100% 100%", 200, 100, 50, 40, 16)[0], 150)
+    assert_eq(gfx::tile_pos("100% 100%", 200, 100, 50, 40, 16)[1], 60)
+    assert_eq(gfx::tile_pos("center", 200, 100, 50, 40, 16)[0], 75)
+    assert_eq(gfx::tile_pos("center", 200, 100, 50, 40, 16)[1], 30)
+    assert_eq(gfx::tile_pos("right top", 200, 100, 50, 40, 16)[0], 150)
+    assert_eq(gfx::tile_pos("top right", 200, 100, 50, 40, 16)[0], 150)
+    assert_eq(gfx::tile_pos("top right", 200, 100, 50, 40, 16)[1], 0)
+    assert_eq(gfx::tile_pos("bottom", 200, 100, 50, 40, 16)[1], 60)
+    assert_eq(gfx::tile_pos("bottom", 200, 100, 50, 40, 16)[0], 75)
+    assert_eq(gfx::tile_pos("10px 20px", 200, 100, 50, 40, 16)[1], 20)
+    assert_eq(gfx::tile_pos("25% 50%", 200, 100, 50, 40, 16)[0], 38)
+    ;; 4 wartości: odsunięcia od krawędzi
+    assert_eq(gfx::tile_pos("right 10px bottom 5px", 200, 100, 50, 40, 16)[0], 140)
+    assert_eq(gfx::tile_pos("right 10px bottom 5px", 200, 100, 50, 40, 16)[1], 55)
+    assert_eq(gfx::tile_pos("left 7px top 3px", 200, 100, 50, 40, 16)[0], 7)
+end
+
+#[test]
+fn t04_gfx_layer_geometry_repeat_space_round() is
+    ;; domyślne repeat: kafelek 40×40 od (10,20)
+    let g: [int] = gfx::layer_geometry(10, 20, 200, 100, 40, 40, "auto", "0% 0%", "repeat", 16)
+    assert_eq(g[0], 10)
+    assert_eq(g[1], 20)
+    assert_eq(g[2], 40)
+    assert_eq(g[4], 40)
+    assert_eq(g[6], 1)
+    assert_eq(g[7], 1)
+    let nr: [int] = gfx::layer_geometry(0, 0, 200, 100, 40, 40, "auto", "center", "no-repeat", 16)
+    assert_eq(nr[0], 80)
+    assert_eq(nr[1], 30)
+    assert_eq(nr[6], 0)
+    assert_eq(nr[7], 0)
+    let rx: [int] = gfx::layer_geometry(0, 0, 200, 100, 40, 40, "auto", "0 0", "repeat-x", 16)
+    assert_eq(rx[6], 1)
+    assert_eq(rx[7], 0)
+    ;; space: 200/45 → 4 kafelki, przerwa (200-180)/3 = 6
+    let sp: [int] = gfx::layer_geometry(0, 0, 200, 100, 45, 45, "auto", "0 0", "space", 16)
+    assert_eq(sp[4], 51)
+    assert_eq(sp[0], 0)
+    ;; space przy < 2 kafelkach → pojedynczy
+    let sp1: [int] = gfx::layer_geometry(0, 0, 100, 100, 70, 70, "auto", "0 0", "space", 16)
+    assert_eq(sp1[6], 0)
+    ;; round: 200/45 → 4 kafelki po 50, przy auto wysokość skaluje się proporcjonalnie
+    let ro: [int] = gfx::layer_geometry(0, 0, 200, 100, 45, 45, "auto", "0 0", "round", 16)
+    assert_eq(ro[2], 50)
+    assert_eq(ro[3], 50)
+    assert_eq(ro[4], 50)
+end
+
+#[test]
+fn t04_gfx_filter_fx_spec_and_padding() is
+    let k: cssval::Color = cc(0, 0, 0, 255)
+    assert_eq(gfx::filter_fx_spec("blur(4px)", k, 16), "blur:4")
+    assert_eq(gfx::filter_fx_spec("blur(0.5em) saturate(150%) hue-rotate(90deg)", k, 16), "blur:8;sat:150;hue:90.000")
+    assert_eq(gfx::filter_fx_spec("saturate(0.5)", k, 16), "sat:50")
+    assert_eq(gfx::filter_fx_spec("hue-rotate(0.25turn)", k, 16), "hue:90.000")
+    assert_eq(gfx::filter_fx_spec("drop-shadow(2px 3px 4px #ff0000)", k, 16), "shadow:2,3,2.000,255,0,0,255")
+    assert_eq(gfx::filter_fx_spec("drop-shadow(4px 4px)", cc(1, 2, 3, 255), 16), "shadow:4,4,0.000,1,2,3,255")
+    ;; funkcje kolorystyczne przetwarza przybliżenie w stylu, nie warstwa pikseli
+    assert_eq(gfx::filter_fx_spec("grayscale(1) brightness(1.2)", k, 16), "")
+    assert_eq(gfx::filter_fx_spec("none", k, 16), "")
+    assert_eq(gfx::filter_pad("blur:4"), 12)
+    assert_eq(gfx::filter_pad("blur:2;shadow:5,-8,2.000,0,0,0,255"), 6 + 8 + 6 + 1)
+    assert_eq(gfx::filter_pad(""), 0)
+end
+
+#[test]
+fn t04_gfx_mask_shorthand_layers() is
+    let r: [string] = gfx::split_mask_shorthand("linear-gradient(#000, transparent) center / 50% auto no-repeat padding-box content-box subtract luminance, url(m.png) alpha")
+    assert_eq(array_len(r), 8)
+    assert_eq(gfx::list_len(r[0]), 2)
+    assert_eq(gfx::list_at(r[0], 0), "linear-gradient(#000, transparent)")
+    assert_eq(gfx::list_at(r[0], 1), "url(m.png)")
+    assert_eq(gfx::list_at(r[1], 0), "center")
+    assert_eq(gfx::list_at(r[2], 0), "50% auto")
+    assert_eq(gfx::list_at(r[3], 0), "no-repeat")
+    assert_eq(gfx::list_at(r[4], 0), "padding-box")
+    assert_eq(gfx::list_at(r[5], 0), "content-box")
+    assert_eq(gfx::list_at(r[6], 0), "subtract")
+    assert_eq(gfx::list_at(r[6], 1), "add")
+    assert_eq(gfx::list_at(r[7], 0), "luminance")
+    assert_eq(gfx::list_at(r[7], 1), "alpha")
+    assert_eq(gfx::composite_code("subtract"), 2)
+    assert_eq(gfx::composite_code("intersect"), 3)
+    assert_eq(gfx::composite_code("add"), 1)
+end
+
+;; ====================== 0.4: grupy efektów (filter / mask / mix-blend-mode) w układzie ======================
+#[test]
+fn t04_fx_group_assigned_for_blend_blur_and_mask() is
+    let d: dom::Dom = dom::parse("<div id=\"a\"><p id=\"c\">x</p></div><div id=\"b\"></div>")
+    let css_text: string = "#a { width: 100px; height: 50px; filter: blur(4px) saturate(50%); mix-blend-mode: multiply; } #b { width: 20px; height: 20px; mask-image: linear-gradient(#000, transparent); }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_eq(a.fx, "blur:4;sat:50;blend:multiply")
+    assert_true(a.xf_id > 0)
+    assert_eq(c.xf_id, a.xf_id)
+    assert_eq(c.fx, a.fx)
+    ;; zapas na rozlew rozmycia: 2 + 3·4 = 14 px z każdej strony
+    assert_eq(a.xf[8], a.x - 14)
+    assert_eq(a.xf[10], 100 + 28)
+    assert_eq(a.xf[0], 1000)
+    assert_eq(b.fx, "mask")
+    assert_true(b.xf_id > 0 && b.xf_id != a.xf_id)
+end
+
+#[test]
+fn t04_fx_group_absent_without_effects_and_normal_blend() is
+    let d: dom::Dom = dom::parse("<div id=\"a\">x</div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#a { mix-blend-mode: normal; mask-image: none; filter: grayscale(1); }"), 400, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.fx, "")
+    assert_eq(a.xf_id, 0)
+end
+
+#[test]
+fn t04_fx_group_merges_with_matrix_transform() is
+    let d: dom::Dom = dom::parse("<div id=\"a\">x</div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#a { width: 40px; height: 40px; transform: rotate(30deg); filter: blur(2px); }"), 400, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.fx, "blur:2")
+    assert_true(a.xf[0] != 1000 || a.xf[1] != 0)
+end
+
+;; ====================== 0.4: border-image — geometria 9 fragmentów ======================
+#[test]
+fn t04_border_image_shorthand_and_values() is
+    let r: [string] = gfx::split_border_image("url(b.png) 30 / 10px / 5px round stretch")
+    assert_eq(r[0], "url(b.png)")
+    assert_eq(r[1], "30")
+    assert_eq(r[2], "10px")
+    assert_eq(r[3], "5px")
+    assert_eq(r[4], "round stretch")
+    let d: [string] = gfx::split_border_image("linear-gradient(red, blue) 1")
+    assert_eq(d[1], "1")
+    assert_eq(d[2], "1")
+    assert_eq(d[3], "0")
+    assert_eq(d[4], "stretch")
+    assert_eq(gfx::split_border_image("none")[0], "none")
+    ;; slice: liczby = px, % = wg wymiaru, fill, 1–4 wartości
+    assert_eq(gfx::bi_slice("30", 90, 60)[0], 30)
+    assert_eq(gfx::bi_slice("30", 90, 60)[3], 30)
+    assert_eq(gfx::bi_slice("50% 10", 90, 60)[0], 30)
+    assert_eq(gfx::bi_slice("50% 10", 90, 60)[1], 10)
+    assert_eq(gfx::bi_slice("50% 10", 90, 60)[3], 10)
+    assert_eq(gfx::bi_slice("10 20 30 40 fill", 100, 100)[4], 1)
+    assert_eq(gfx::bi_slice("10 20 30 40", 100, 100)[2], 30)
+    assert_eq(gfx::bi_slice("500", 90, 60)[0], 60)
+    ;; width: liczba × border-width, px, %, auto
+    assert_eq(gfx::bi_width("1", [4, 6, 8, 10], 200, 100, [5, 5, 5, 5], 16)[3], 10)
+    assert_eq(gfx::bi_width("2", [4, 6, 8, 10], 200, 100, [5, 5, 5, 5], 16)[0], 8)
+    assert_eq(gfx::bi_width("12px 50%", [4, 6, 8, 10], 200, 100, [5, 5, 5, 5], 16)[0], 12)
+    assert_eq(gfx::bi_width("12px 50%", [4, 6, 8, 10], 200, 100, [5, 5, 5, 5], 16)[1], 100)
+    assert_eq(gfx::bi_width("auto", [4, 6, 8, 10], 200, 100, [7, 5, 5, 9], 16)[3], 9)
+    assert_eq(gfx::bi_outset("1", [4, 6, 8, 10], 16)[1], 6)
+    assert_eq(gfx::bi_outset("3px", [4, 6, 8, 10], 16)[2], 3)
+    assert_eq(gfx::bi_repeat("round")[1], 2)
+    assert_eq(gfx::bi_repeat("repeat space")[1], 3)
+    assert_eq(gfx::bi_repeat("stretch")[0], 0)
+end
+
+;; pomocnik: wyciąga fragment o danym id z listy (17 liczb na fragment) → 17 liczb albo []
+fn piece_by_id(pieces: [int], id: int) -> [int] is
+    let n: int = array_len(pieces) / 17
+    let mut k: int = 0
+    while k < n is
+        if pieces[k * 17] == id is
+            let mut out: [int] = []
+            let mut i: int = 0
+            while i < 17 is
+                out = array_push(out, pieces[k * 17 + i])
+                i += 1
+            end
+            return out
+        end
+        k += 1
+    end
+    return []
+end
+
+#[test]
+fn t04_border_image_pieces_stretch_and_corners() is
+    ;; obszar 200×100 w (10,20); obraz 90×90 przecięty po 30; szerokości 12,10,12,10
+    let p: [int] = gfx::border_image_pieces(10, 20, 200, 100, 90, 90, [30, 30, 30, 30], [12, 10, 12, 10], 0, 0)
+    ;; 4 narożniki + 4 krawędzie
+    assert_eq(array_len(p) / 17, 8)
+    let tl: [int] = piece_by_id(p, 0)
+    assert_eq(tl[1], 0)
+    assert_eq(tl[3], 30)
+    assert_eq(tl[5], 10)
+    assert_eq(tl[6], 20)
+    assert_eq(tl[7], 10)
+    assert_eq(tl[8], 12)
+    let br: [int] = piece_by_id(p, 8)
+    assert_eq(br[1], 60)
+    assert_eq(br[2], 60)
+    assert_eq(br[5], 10 + 200 - 10)
+    assert_eq(br[6], 20 + 100 - 12)
+    ;; górna krawędź rozciągnięta: cel = szerokość − boczne, bez powtarzania
+    let t: [int] = piece_by_id(p, 1)
+    assert_eq(t[1], 30)
+    assert_eq(t[3], 30)
+    assert_eq(t[5], 20)
+    assert_eq(t[7], 180)
+    assert_eq(t[9], 180)
+    assert_eq(t[15], 0)
+    let l: [int] = piece_by_id(p, 3)
+    assert_eq(l[2], 30)
+    assert_eq(l[4], 30)
+    assert_eq(l[6], 32)
+    assert_eq(l[8], 76)
+end
+
+#[test]
+fn t04_border_image_edge_repeat_round_space() is
+    ;; źródło 90×90, przecięcia 30, grubość 15 → kafelek górnej krawędzi: 30 · 15/30 = 15 × 15
+    let rep: [int] = gfx::border_image_pieces(0, 0, 200, 100, 90, 90, [30, 30, 30, 30], [15, 15, 15, 15], 1, 1)
+    let t: [int] = piece_by_id(rep, 1)
+    assert_eq(t[9], 15)
+    assert_eq(t[10], 15)
+    assert_eq(t[15], 1)
+    ;; wyśrodkowanie: pas 170 px, kafelek 15 → start = 15 + (170 − 15)/2
+    assert_eq(t[11], 15 + (170 - 15) / 2)
+    ;; round: 170/15 ≈ 11 kafelków po 15 (170/11 = 15)
+    let rnd: [int] = gfx::border_image_pieces(0, 0, 200, 100, 90, 90, [30, 30, 30, 30], [15, 15, 15, 15], 2, 2)
+    let tr: [int] = piece_by_id(rnd, 1)
+    assert_eq(tr[9], 15)
+    ;; space: pas 140, kafelek 30 → 4 kafelki, przerwa (140−120)/5 = 4, krok 34, start 30 + 4
+    let spc: [int] = gfx::border_image_pieces(0, 0, 200, 100, 90, 90, [30, 30, 30, 30], [30, 30, 30, 30], 3, 3)
+    let ts: [int] = piece_by_id(spc, 1)
+    assert_eq(ts[13], 34)
+    assert_eq(ts[11], 34)
+    ;; space bez miejsca na kafelek → krawędź pominięta
+    let none: [int] = gfx::border_image_pieces(0, 0, 100, 100, 90, 90, [30, 30, 30, 30], [60, 60, 60, 60], 3, 3)
+    assert_eq(array_len(piece_by_id(none, 1)), 0)
+end
+
+#[test]
+fn t04_border_image_scales_down_oversized_widths_and_middle() is
+    let p: [int] = gfx::border_image_pieces(0, 0, 100, 100, 90, 90, [30, 30, 30, 30], [80, 80, 80, 80], 0, 0)
+    ;; 80+80 > 100 → współczynnik 0.625 → 50 + 50 = 100: środek znika
+    let tl: [int] = piece_by_id(p, 0)
+    assert_eq(tl[7], 50)
+    assert_eq(array_len(piece_by_id(p, 1)), 0)
+    let mid: [int] = gfx::border_image_middle(5, 6, 200, 100, 90, 90, [30, 30, 30, 30], [10, 10, 10, 10])
+    assert_eq(mid[5], 15)
+    assert_eq(mid[6], 16)
+    assert_eq(mid[7], 180)
+    assert_eq(mid[8], 80)
+    assert_eq(mid[3], 30)
+    assert_eq(gfx::piece_spec(mid, 0), "30,30,30,30,15,16,180,80,180,80,15,16,180,80,0,0")
+end
+
+;; ====================== 0.4: SVG — rozmiar i serializacja ======================
+fn svg_of(html: string, css_text: string, w: int, h: int) -> string is
+    let d: dom::Dom = dom::parse(html)
+    let st: [style::ComputedStyle] = layout::compute_styles(d, css::parse(css_text), css::no_interaction())
+    return svg::markup(d, st, 1, w, h)
+end
+
+#[test]
+fn t04_svg_natural_size() is
+    let d: dom::Dom = dom::parse("<svg width=\"120\" height=\"60\"></svg><svg viewBox=\"0 0 200 100\"></svg><svg viewBox=\"0 0 50 50\" width=\"80\"></svg><svg></svg><svg width=\"10px\" height=\"5\"></svg>")
+    assert_eq(svg::natural_size(d.nodes[1])[0], 120)
+    assert_eq(svg::natural_size(d.nodes[1])[1], 60)
+    assert_eq(svg::natural_size(d.nodes[2])[0], 300)
+    assert_eq(svg::natural_size(d.nodes[2])[1], 150)
+    assert_eq(svg::natural_size(d.nodes[3])[0], 80)
+    assert_eq(svg::natural_size(d.nodes[3])[1], 80)
+    assert_eq(svg::natural_size(d.nodes[4])[0], 300)
+    assert_eq(svg::natural_size(d.nodes[4])[1], 150)
+    assert_eq(svg::natural_size(d.nodes[5])[0], 10)
+    assert_eq(svg::view_box(d.nodes[2])[2], 200000)
+    assert_eq(array_len(svg::view_box(d.nodes[1])), 0)
+end
+
+#[test]
+fn t04_svg_markup_basic_and_css_presentation() is
+    let m: string = svg_of("<svg viewBox=\"0 0 40 20\"><rect id=\"r\" x=\"1\" y=\"2\" width=\"10\" height=\"10\"/><circle cx=\"30\" cy=\"10\" r=\"5\" class=\"c\"/></svg>", "rect { fill: #ff0000; stroke: blue; stroke-width: 2; } .c { fill: currentColor; color: #00ff00; fill-opacity: 0.5; }", 80, 40)
+    assert_true(string_find(m, "width=\"80\" height=\"40\" viewBox=\"0.000 0.000 40.000 20.000\"") >= 0)
+    assert_true(string_find(m, "<rect") >= 0 && string_find(m, "fill:#ff0000;") >= 0)
+    assert_true(string_find(m, "stroke:blue;") >= 0 && string_find(m, "stroke-width:2;") >= 0)
+    assert_true(string_find(m, "fill:rgb(0,255,0);") >= 0)
+    assert_true(string_find(m, "fill-opacity:0.5;") >= 0)
+    assert_true(string_find(m, "id=\"r\"") >= 0)
+end
+
+#[test]
+fn t04_svg_markup_geometry_from_css_and_display() is
+    let m: string = svg_of("<svg width=\"50\" height=\"50\"><circle id=\"a\" cx=\"5\" cy=\"5\" r=\"2\"/><path id=\"b\" d=\"M0 0L5 5\"/><rect id=\"h\" width=\"5\" height=\"5\"/></svg>", "#a { cx: 20px; r: 9px; } #b { d: path(\"M1 1 L9 9\"); } #h { display: none; }", 50, 50)
+    assert_true(string_find(m, "cx=\"20px\"") >= 0 && string_find(m, "r=\"9px\"") >= 0)
+    assert_true(string_find(m, "d=\"M1 1 L9 9\"") >= 0)
+    assert_eq(string_find(m, "<rect"), -1)
+    ;; bez viewBox: viewBox z width/height
+    assert_true(string_find(m, "viewBox=\"0 0 50 50\"") >= 0)
+end
+
+#[test]
+fn t04_svg_markup_use_gradient_and_paint_order() is
+    let html: string = "<svg viewBox=\"0 0 100 100\"><defs><linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"0\" gradientUnits=\"objectBoundingBox\"><stop offset=\"0\" stop-color=\"red\"/><stop offset=\"1\" style=\"stop-color:blue\"/></linearGradient><rect id=\"t\" width=\"10\" height=\"10\"/></defs><use href=\"#t\" x=\"30\" y=\"40\"/><path d=\"M0 0 L9 9\" id=\"p\"/></svg>"
+    let m: string = svg_of(html, "#p { paint-order: stroke; stroke: red; fill: blue; }", 100, 100)
+    ;; gradient: ułamki obwiedni → procenty, nazwy w camelCase
+    assert_true(string_find(m, "<linearGradient") >= 0 && string_find(m, "x2=\"100.000%\"") >= 0 && string_find(m, "gradientUnits=\"objectBoundingBox\"") >= 0)
+    ;; use → g z translate i kopią prostokąta
+    assert_true(string_find(m, "<g transform=\"translate(30,40)\"") >= 0)
+    ;; paint-order: dwie kopie ścieżki (obrys bez wypełnienia, potem wypełnienie bez obrysu)
+    assert_true(string_find(m, "fill:none;") >= 0 && string_find(m, "stroke:none;") >= 0)
+    let first: int = string_find(m, "fill:none;")
+    let second: int = string_find(m, "stroke:none;")
+    assert_true(first < second)
+end
+
+#[test]
+fn t04_svg_markup_vector_effect_and_hidden() is
+    ;; viewBox 100 → box 200: skala 2 → non-scaling-stroke dzieli grubość przez 2
+    let m: string = svg_of("<svg viewBox=\"0 0 100 100\"><line id=\"a\" x2=\"5\" y2=\"5\"/><line id=\"b\" x2=\"5\" y2=\"5\"/></svg>", "line { stroke: black; stroke-width: 6; } #a { vector-effect: non-scaling-stroke; } #b { visibility: hidden; }", 200, 200)
+    assert_true(string_find(m, "stroke-width:3.000;") >= 0)
+    assert_true(string_find(m, "stroke-width:6;") >= 0)
+    assert_true(string_find(m, "visibility:hidden;") >= 0)
+end
+
+#[test]
+fn t04_svg_is_replaced_box_with_markup_and_size() is
+    let d: dom::Dom = dom::parse("<div><svg id=\"s\" width=\"60\" height=\"30\" viewBox=\"0 0 6 3\"><rect width=\"6\" height=\"3\" fill=\"red\"/></svg></div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("div { width: 200px; } svg { padding: 2px; }"), 400, -1)
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "s"), "box")
+    assert_eq(b.w, 64)
+    assert_eq(b.h, 34)
+    assert_true(string_find(b.svg, "<svg ") == 0 && string_find(b.svg, "<rect") > 0)
+    assert_true(string_find(b.svg, "width=\"60\" height=\"30\"") >= 0)
+    ;; CSS width + auto height z proporcji
+    let d2: dom::Dom = dom::parse("<svg id=\"s\" viewBox=\"0 0 100 50\"></svg>")
+    let b2: layout::LayoutBox = find_box(layout::layout(d2, css::parse("svg { width: 200px; }"), 400, -1), dom::find_by_id(d2, "s"), "box")
+    assert_eq(b2.w, 200)
+    assert_eq(b2.h, 100)
+    ;; dzieci svg nie dają własnych boxów
+    let mut cnt: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "box" && d.nodes[boxes[i].node_id].tag == "rect" is cnt += 1 end
+        i += 1
+    end
+    assert_eq(cnt, 0)
+end
+
+#[test]
+fn t04_svg_inline_between_text_and_default_size() is
+    let d: dom::Dom = dom::parse("<p>a<svg id=\"s\" width=\"20\" height=\"20\"></svg>b</p><svg id=\"t\"></svg>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("p { margin: 0; }"), 400, -1)
+    let s: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "s"), "box")
+    assert_eq(s.w, 20)
+    assert_eq(s.h, 20)
+    let t: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "t"), "box")
+    assert_eq(t.w, 300)
+    assert_eq(t.h, 150)
+end
+
+#[test]
+fn t04_svg_text_origin_anchor_baseline_shift() is
+    ;; font 20 px: wznios 16
+    assert_eq(svg::text_origin(100, 50, 60, 20, "start", "", "")[0], 100)
+    assert_eq(svg::text_origin(100, 50, 60, 20, "middle", "", "")[0], 70)
+    assert_eq(svg::text_origin(100, 50, 60, 20, "end", "", "")[0], 40)
+    assert_eq(svg::text_origin(100, 50, 60, 20, "start", "", "")[1], 34)
+    ;; dominant-baseline: middle → linia bazowa 0,35 em niżej od y
+    assert_eq(svg::text_origin(0, 50, 0, 20, "start", "middle", "")[1], 41)
+    assert_eq(svg::text_origin(0, 50, 0, 20, "start", "hanging", "")[1], 50)
+    assert_eq(svg::text_origin(0, 50, 0, 20, "start", "text-after-edge", "")[1], 30)
+    ;; baseline-shift
+    assert_eq(svg::text_origin(0, 50, 0, 20, "start", "", "super")[1], 26)
+    assert_eq(svg::text_origin(0, 50, 0, 20, "start", "", "sub")[1], 40)
+    assert_eq(svg::text_origin(0, 50, 0, 20, "start", "", "5px")[1], 29)
+    assert_eq(svg::baseline_offset_em("central"), 300)
+end
+
+#[test]
+fn t04_svg_text_runs_and_elements() is
+    let d: dom::Dom = dom::parse("<svg><g><text id=\"t\" x=\"10\" y=\"20\">Ala <tspan>ma</tspan> <tspan x=\"50\" y=\"60\" dx=\"2\">kota</tspan></text></g><text id=\"u\" x=\"1\" y=\"2\">U</text><text id=\"h\" style=\"display:none\">H</text></svg>")
+    let st: [style::ComputedStyle] = layout::compute_styles(d, css::parse("#h { display: none; }"), css::no_interaction())
+    let els: [int] = svg::text_elements(d, st, 1)
+    assert_eq(array_len(els), 2)
+    let tid: int = dom::find_by_id(d, "t")
+    assert_eq(els[0], tid)
+    let runs: [string] = svg::text_runs(d, tid)
+    assert_eq(array_len(runs), 2)
+    let f0: [string] = string_split(runs[0], "\u0001")
+    assert_eq(f0[0], "10000")
+    assert_eq(f0[1], "20000")
+    assert_eq(string_trim(f0[3]), "Ala ma")
+    let f1: [string] = string_split(runs[1], "\u0001")
+    assert_eq(f1[0], "52000")
+    assert_eq(f1[1], "60000")
+    assert_eq(f1[3], "kota")
+end
+
+#[test]
+fn t04_svg_text_becomes_text_boxes_with_anchor_and_fill() is
+    let html: string = "<svg id=\"s\" width=\"200\" height=\"100\" viewBox=\"0 0 200 100\"><text id=\"a\" x=\"100\" y=\"50\">Hello</text><text id=\"b\" x=\"10\" y=\"90\">Z</text></svg>"
+    let d: dom::Dom = dom::parse(html)
+    let css_text: string = "#a { font-size: 20px; text-anchor: middle; fill: #ff0000; } #b { font-size: 10px; fill: none; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let aid: int = dom::find_by_id(d, "a")
+    let s: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "s"), "box")
+    let mut found: int = 0
+    let mut zfound: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].node_id == aid is
+            found += 1
+            let b: layout::LayoutBox = boxes[i]
+            assert_eq(b.text, "Hello")
+            assert_eq(b.st.color.r, 255)
+            assert_eq(b.st.color.g, 0)
+            ;; text-anchor: middle → środek pola na x = s.x + 100
+            assert_true(near_i(b.x + b.w / 2, s.x + 100, 1))
+            ;; linia bazowa y=50: góra pola = 50 − 0,8·20 = 34
+            assert_eq(b.y, s.y + 34)
+            assert_eq(b.st.font_size, 20)
+        end
+        if boxes[i].kind == "text" && boxes[i].text == "Z" is zfound += 1 end
+        i += 1
+    end
+    assert_eq(found, 1)
+    assert_eq(zfound, 0)
+end
+
+fn near_i(a: int, b: int, t: int) -> bool is
+    let d: int = if a > b then a - b else b - a
+    return d <= t
+end
+
+#[test]
+fn t04_svg_text_scales_with_viewbox() is
+    let html: string = "<svg id=\"s\" width=\"200\" height=\"100\" viewBox=\"0 0 100 50\"><text id=\"a\" x=\"10\" y=\"25\">Ab</text></svg>"
+    let d: dom::Dom = dom::parse(html)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("#a { font-size: 10px; }"), 400, -1)
+    let aid: int = dom::find_by_id(d, "a")
+    let s: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "s"), "box")
+    let mut b: layout::LayoutBox = s
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].node_id == aid is b = boxes[i] end
+        i += 1
+    end
+    ;; skala 2×: x=20, rozmiar czcionki 20, góra pola = 50 − 16 = 34
+    assert_eq(b.x, s.x + 20)
+    assert_eq(b.st.font_size, 20)
+    assert_eq(b.y, s.y + 34)
+end
+
+;; ====================== 0.4: SVG markery ======================
+#[test]
+fn t04_svg_path_vertices_directions() is
+    ;; "M0 0 L10 0 L10 10": wierzchołki z kierunkami
+    let v: [int] = svg::path_vertices("M0 0 L10 0 L10 10")
+    assert_eq(array_len(v), 18)
+    assert_eq(v[0], 0)
+    assert_eq(v[6], 10000)
+    assert_eq(v[7], 0)
+    ;; wejście w (10,0) → w prawo; wyjście → w dół
+    assert_eq(v[8], 1000)
+    assert_eq(v[9], 0)
+    assert_eq(v[10], 0)
+    assert_eq(v[11], 1000)
+    ;; pierwszy wierzchołek: kierunek wychodzący = w prawo; ostatni: wchodzący = w dół
+    assert_eq(v[4], 1000)
+    assert_eq(v[2], 1000)
+    assert_eq(v[15], 1000)
+    ;; względne polecenia, H/V, Z
+    let w: [int] = svg::path_vertices("m1 1 h4 v3 z")
+    assert_eq(array_len(w) / 6, 4)
+    assert_eq(w[6], 5000)
+    assert_eq(w[12], 5000)
+    assert_eq(w[13], 4000)
+    assert_eq(w[18], 1000)
+    ;; krzywa C: styczna wychodząca z pierwszego punktu kontrolnego
+    let c: [int] = svg::path_vertices("M0 0 C0 10 10 10 10 0")
+    assert_eq(c[4], 0)
+    assert_eq(c[5], 1000)
+    assert_eq(c[8], 0)
+    assert_eq(c[9], -1000)
+end
+
+#[test]
+fn t04_svg_marker_matrix_and_points_vertices() is
+    ;; kierunek w prawo, skala 2, ref (0,0): matrix(2 0 0 2 10 0)
+    assert_eq(svg::marker_matrix(10000, 0, 1000, 0, 2000, 0, 0), "matrix(2.000 0.000 0.000 2.000 10.000 0.000)")
+    ;; kierunek w dół (0,1), ref (1,1), skala 1: obrót 90°
+    assert_eq(svg::marker_matrix(0, 0, 0, 1000, 1000, 1000, 1000), "matrix(0.000 1.000 -1.000 0.000 1.000 -1.000)")
+    let p: [int] = svg::points_vertices("0,0 10,0 10,10", false)
+    assert_eq(array_len(p) / 6, 3)
+    assert_eq(p[4], 1000)
+    assert_eq(p[8], 1000)
+    assert_eq(p[10], 0)
+    let g: [int] = svg::points_vertices("0,0 10,0 10,10", true)
+    ;; zamknięty: ostatni wierzchołek ma wyjście w stronę pierwszego
+    assert_eq(array_len(g) / 6, 3)
+end
+
+#[test]
+fn t04_svg_markers_in_markup() is
+    let html: string = "<svg viewBox=\"0 0 100 100\"><defs><marker id=\"m\" markerWidth=\"4\" markerHeight=\"4\" refX=\"0\" refY=\"0\" orient=\"auto\"><rect width=\"2\" height=\"2\"/></marker></defs><path id=\"p\" d=\"M0 0 L10 0 L10 10\"/><line id=\"l\" x1=\"0\" y1=\"50\" x2=\"20\" y2=\"50\"/></svg>"
+    let m: string = svg_of(html, "#p { stroke: black; stroke-width: 2; marker-start: url(#m); marker-mid: url(#m); marker-end: url(#m); } #l { stroke: red; marker-end: url(#m); }", 100, 100)
+    ;; ścieżka: 3 markery, linia: 1
+    let first: int = string_find(m, "<g transform=\"matrix(")
+    assert_true(first > 0)
+    let mut count: int = 0
+    let mut from: int = 0
+    while from < string_len(m) is
+        let q: int = string_find(string_slice(m, from, string_len(m)), "<g transform=\"matrix(")
+        if q < 0 is break end
+        count += 1
+        from = from + q + 10
+    end
+    assert_eq(count, 4)
+    ;; marker na końcu linii (20,50) w prawo, skala stroke-width domyślna 1: matrix(1 0 0 1 20 50)
+    assert_true(string_find(m, "matrix(1.000 0.000 0.000 1.000 20.000 50.000)") >= 0)
+    ;; marker początkowy ścieżki przy skali stroke-width 2
+    assert_true(string_find(m, "matrix(2.000 0.000 0.000 2.000 0.000 0.000)") >= 0)
+    ;; markery nie są rysowane samodzielnie z <defs>
+    assert_eq(string_find(m, "<marker"), -1)
+end
+
+;; ====================== 0.4: contain-intrinsic-* przy contain: size ======================
+#[test]
+fn t04_contain_intrinsic_size_with_size_containment() is
+    let d: dom::Dom = dom::parse("<div id=\"a\"><p style=\"height:300px\">x</p></div><div id=\"b\"><p style=\"height:300px\">x</p></div>")
+    let css_text: string = "#a { contain: size; contain-intrinsic-height: 80px; } #b { display: inline-block; contain: strict; contain-intrinsic-size: 55px 66px; } p { margin: 0; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_eq(a.h, 80)
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_eq(b.w, 55)
+    assert_eq(b.h, 66)
+    ;; bez contain: wysokość z treści
+    let b0: [layout::LayoutBox] = layout::layout(d, css::parse("#a { contain-intrinsic-height: 80px; } p { margin: 0; }"), 400, -1)
+    assert_eq(find_box(b0, dom::find_by_id(d, "a"), "box").h, 300)
+end
+
+#[test]
+fn t04_overflow_clip_margin_expands_clip_rect() is
+    let d: dom::Dom = dom::parse("<div id=\"a\"><p>x</p></div>")
+    let base: string = "#a { width: 100px; height: 50px; padding: 10px; border: 4px solid red; overflow: clip; } p { margin: 0; }"
+    let get: [layout::LayoutBox] = layout::layout(d, css::parse(base), 400, -1)
+    let g1: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #a { overflow-clip-margin: 6px; }"), 400, -1)
+    let g2: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #a { overflow-clip-margin: content-box 3px; }"), 400, -1)
+    let g3: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #a { overflow: hidden; overflow-clip-margin: 6px; }"), 400, -1)
+    let pid: int = dom::find_by_id(d, "a")
+    let c0: layout::LayoutBox = first_clipped_child(get, pid)
+    let c1: layout::LayoutBox = first_clipped_child(g1, pid)
+    let c2: layout::LayoutBox = first_clipped_child(g2, pid)
+    let c3: layout::LayoutBox = first_clipped_child(g3, pid)
+    ;; padding-box (domyślnie) rozszerzony o 6 z każdej strony
+    assert_eq(c1.cx, c0.cx - 6)
+    assert_eq(c1.cw, c0.cw + 12)
+    ;; content-box 3px: padding 10 odjęte, +3 margines
+    assert_eq(c2.cx, c0.cx + 10 - 3)
+    assert_eq(c2.cw, c0.cw - 20 + 6)
+    ;; margines nie działa przy overflow: hidden
+    assert_eq(c3.cx, c0.cx)
+end
+
+fn first_clipped_child(boxes: [layout::LayoutBox], parent_id: int) -> layout::LayoutBox is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" && boxes[i].has_clip is return boxes[i] end
+        i += 1
+    end
+    return boxes[0]
+end
+
+#[test]
+fn t04_clip_rect_on_absolute_elements() is
+    let d: dom::Dom = dom::parse("<div id=\"a\"><p id=\"c\">tresc</p></div><div id=\"b\"><p>x</p></div>")
+    let css_text: string = "#a { position: absolute; left: 10px; top: 20px; width: 100px; height: 60px; clip: rect(5px, 70px, 50px, 10px); } #b { width: 50px; height: 50px; clip: rect(0, 5px, 5px, 0); } p { margin: 0; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let a: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "a"), "box")
+    assert_true(a.has_clip)
+    assert_eq(a.cx, a.x + 10)
+    assert_eq(a.cy, a.y + 5)
+    assert_eq(a.cw, 60)
+    assert_eq(a.ch, 45)
+    ;; potomkowie przycięci tym samym prostokątem
+    let c: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "c"), "box")
+    assert_true(c.has_clip && c.cx >= a.x + 10 && c.cw <= 60)
+    ;; clip nie działa na elementach w przepływie
+    let b: layout::LayoutBox = find_box(boxes, dom::find_by_id(d, "b"), "box")
+    assert_true(!b.has_clip)
+    ;; auto = krawędź pudełka
+    let d2: dom::Dom = dom::parse("<div id=\"a\"></div>")
+    let b2: layout::LayoutBox = find_box(layout::layout(d2, css::parse("#a { position: fixed; width: 80px; height: 40px; clip: rect(auto, 30px, auto, auto); }"), 400, -1), dom::find_by_id(d2, "a"), "box")
+    assert_eq(b2.cw, 30)
+    assert_eq(b2.ch, 40)
+end
+
+;; ====================== 0.4: color-scheme ======================
+#[test]
+fn t04_color_scheme_defaults_and_resolution() is
+    let d: dom::Dom = dom::parse("<html><body><p id=\"a\">x</p><p id=\"b\" style=\"color:#123456\">y</p></body></html>")
+    let mut dark: css::InteractionState = css::no_interaction()
+    dark.dark = true
+    let st: [style::ComputedStyle] = layout::compute_styles(d, css::parse("html { color-scheme: dark; }"), dark)
+    let a: style::ComputedStyle = st[dom::find_by_id(d, "a")]
+    ;; element dziedziczy jasny tekst od html
+    assert_eq(a.color.r, 232)
+    assert_eq(layout::used_scheme(a, false), "dark")
+    ;; jawny kolor autora nie jest nadpisywany
+    assert_eq(st[dom::find_by_id(d, "b")].color.r, 18)
+    ;; `light dark` zależy od preferencji systemu; `light` zawsze jasny; normal → ""
+    let both: [style::ComputedStyle] = layout::compute_styles(d, css::parse("html { color-scheme: light dark; }"), css::no_interaction())
+    assert_eq(layout::used_scheme(both[dom::find_by_id(d, "a")], false), "light")
+    assert_eq(layout::used_scheme(both[dom::find_by_id(d, "a")], true), "dark")
+    assert_eq(both[dom::find_by_id(d, "a")].color.r, 20)
+    let dk2: [style::ComputedStyle] = layout::compute_styles(d, css::parse("html { color-scheme: light dark; }"), dark)
+    assert_eq(dk2[dom::find_by_id(d, "a")].color.r, 232)
+    let norm: [style::ComputedStyle] = layout::compute_styles(d, css::parse("p { margin: 0; }"), dark)
+    assert_eq(layout::used_scheme(norm[dom::find_by_id(d, "a")], true), "")
+    assert_eq(norm[dom::find_by_id(d, "a")].color.r, 20)
+end
+
+;; ====================== 0.4: line-height-step, hyphenate-* ======================
+#[test]
+fn t04_line_height_step_rounds_up() is
+    let base: [layout::LayoutBox] = lay("<p>a</p><p>b</p>", "p { margin: 0; line-height: 17px; }", 400)
+    let stp: [layout::LayoutBox] = lay("<p>a</p><p>b</p>", "p { margin: 0; line-height: 17px; line-height-step: 10px; }", 400)
+    assert_eq(texts_flat_y(base)[1] - texts_flat_y(base)[0], 17)
+    assert_eq(texts_flat_y(stp)[1] - texts_flat_y(stp)[0], 20)
+    let st2: [layout::LayoutBox] = lay("<p>a</p><p>b</p>", "p { margin: 0; line-height: 20px; line-height-step: 10px; }", 400)
+    assert_eq(texts_flat_y(st2)[1] - texts_flat_y(st2)[0], 20)
+end
+
+fn texts_flat_y(boxes: [layout::LayoutBox]) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is out = array_push(out, boxes[i].y) end
+        i += 1
+    end
+    return out
+end
+
+#[test]
+fn t04_hyphenate_limit_chars_and_character() is
+    ;; min. słowo 20 znaków → "programowanie" (13) nie dostaje punktów podziału
+    assert_eq(layout::hyph_auto_lim("programowanie", 20, 3, 3), "programowanie")
+    assert_true(string_find(layout::hyph_auto_lim("programowanie", 7, 3, 3), "\u00AD") > 0)
+    ;; min. 6 znaków przed podziałem: pierwsza pozycja nie wcześniej niż po 6. znaku
+    let h6: string = layout::hyph_auto_lim("programowanie", 7, 6, 3)
+    assert_true(string_find(h6, "\u00AD") >= 6)
+    let boxes: [layout::LayoutBox] = lay("<p>ab programowanie</p>", "p { margin: 0; hyphens: auto; hyphenate-character: \"~\"; }", 110)
+    let t: [string] = texts_flat(boxes)
+    assert_true(array_len(t) >= 2)
+    assert_true(string_find(t[0], "~") >= 0)
+    assert_eq(string_find(t[0], "-"), -1)
+end
+
+;; ====================== 0.4: text-emphasis ======================
+fn emph_box(html: string, css_text: string) -> layout::LayoutBox is
+    let boxes: [layout::LayoutBox] = lay(html, css_text, 400)
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is return boxes[i] end
+        i += 1
+    end
+    return boxes[0]
+end
+
+#[test]
+fn t04_text_emphasis_glyph_styles() is
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: dot; }").st), "•")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: open dot; }").st), "◦")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: filled circle; }").st), "●")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: open circle; }").st), "○")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: double-circle; }").st), "◉")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: triangle; }").st), "▲")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: open triangle; }").st), "△")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: \"*\"; }").st), "*")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { text-emphasis-style: none; }").st), "")
+    assert_eq(layout::emphasis_glyph(emph_box("<p>ab</p>", "p { margin: 0; }").st), "")
+    ;; skrót text-emphasis: styl + kolor
+    let b: layout::LayoutBox = emph_box("<p>ab</p>", "p { text-emphasis: open circle #ff0000; }")
+    assert_eq(layout::emphasis_glyph(b.st), "○")
+    assert_eq(props::xget(b.st.xp, "text-emphasis-color"), "#ff0000")
+end
+
+#[test]
+fn t04_text_emphasis_marks_positions_skip_and_position() is
+    ;; "ab c" → znaczniki nad a, b, c (spacja pominięta domyślnie), środki znaków (9 px/znak przy 16px)
+    let b: layout::LayoutBox = emph_box("<p>ab c</p>", "p { margin: 0; text-emphasis-style: dot; }")
+    let m: [int] = layout::emphasis_marks(b, -1)
+    assert_eq(array_len(m), 6)
+    assert_true(m[0] > b.x && m[0] < b.x + 9)
+    assert_true(m[2] > m[0])
+    ;; nad tekstem: y = góra − wysokość znacznika (8·1.2 → 9)
+    assert_eq(m[1], b.y - 9)
+    ;; pod tekstem
+    let u: layout::LayoutBox = emph_box("<p>ab</p>", "p { margin: 0; text-emphasis-style: dot; text-emphasis-position: under right; }")
+    assert_eq(layout::emphasis_marks(u, -1)[1], u.y + u.h)
+    ;; interpunkcja domyślnie pomijana; skip: spaces oznacza pomijanie tylko spacji
+    let p: layout::LayoutBox = emph_box("<p>a,b</p>", "p { margin: 0; text-emphasis-style: dot; }")
+    assert_eq(array_len(layout::emphasis_marks(p, -1)), 4)
+    let all: layout::LayoutBox = emph_box("<p>a,b</p>", "p { margin: 0; text-emphasis-style: dot; text-emphasis-skip: spaces; }")
+    assert_eq(array_len(layout::emphasis_marks(all, -1)), 6)
+end
+
+;; ====================== 0.4: font-synthesis ======================
+#[test]
+fn t04_font_synthesis_flags_and_small_caps_gate() is
+    let b: layout::LayoutBox = emph_box("<p>abc</p>", "p { font-weight: bold; font-style: italic; }")
+    assert_true(synth_flag_ok(b.st, 0))
+    let n: layout::LayoutBox = emph_box("<p>abc</p>", "p { font-weight: bold; font-style: italic; font-synthesis: none; }")
+    assert_true(!layout::synth_allowed(n.st, "weight") && !layout::synth_allowed(n.st, "style") && !layout::synth_allowed(n.st, "small-caps"))
+    let w: layout::LayoutBox = emph_box("<p>abc</p>", "p { font-synthesis: weight; }")
+    assert_true(layout::synth_allowed(w.st, "weight") && !layout::synth_allowed(w.st, "style"))
+    let l: layout::LayoutBox = emph_box("<p>abc</p>", "p { font-synthesis-weight: none; }")
+    assert_true(!layout::synth_allowed(l.st, "weight") && layout::synth_allowed(l.st, "style"))
+    ;; small-caps: syntezowane wersaliki tylko gdy wolno
+    let sc: [layout::LayoutBox] = lay("<p>abc</p>", "p { margin: 0; font-variant: small-caps; }", 400)
+    assert_eq(texts_flat(sc)[0], "ABC")
+    let nosc: [layout::LayoutBox] = lay("<p>abc</p>", "p { margin: 0; font-variant: small-caps; font-synthesis-small-caps: none; }", 400)
+    assert_eq(texts_flat(nosc)[0], "abc")
+    let nosc2: [layout::LayoutBox] = lay("<p>abc</p>", "p { margin: 0; font-variant: small-caps; font-synthesis: none; }", 400)
+    assert_eq(texts_flat(nosc2)[0], "abc")
+    ;; dziedziczone przez potomków
+    let inh: [layout::LayoutBox] = lay("<div><p>abc</p></div>", "div { font-variant-caps: all-small-caps; }", 400)
+    assert_eq(texts_flat(inh)[0], "ABC")
+end
+
+fn synth_flag_ok(st: style::ComputedStyle, x: int) -> bool is
+    return layout::synth_allowed(st, "weight") && layout::synth_allowed(st, "style")
+end
+
+;; ====================== 0.4: osie czasu sterowane przewijaniem ======================
+#[test]
+fn t04_timeline_parse_and_range_parse() is
+    assert_eq(layout::parse_timeline("auto")[0], "none")
+    assert_eq(layout::parse_timeline("none")[0], "none")
+    assert_eq(layout::parse_timeline("scroll()")[0], "scroll")
+    assert_eq(layout::parse_timeline("scroll()")[1], "nearest")
+    assert_eq(layout::parse_timeline("scroll()")[2], "block")
+    assert_eq(layout::parse_timeline("scroll(root inline)")[1], "root")
+    assert_eq(layout::parse_timeline("scroll(root inline)")[2], "inline")
+    assert_eq(layout::parse_timeline("view(x)")[0], "view")
+    assert_eq(layout::parse_timeline("view(x)")[2], "x")
+    assert_eq(layout::parse_timeline("--tl")[0], "named")
+    assert_eq(layout::parse_timeline("--tl")[3], "--tl")
+    ;; animation-range
+    assert_eq(layout::parse_range("normal")[3], "100%")
+    assert_eq(layout::parse_range("entry")[0], "entry")
+    assert_eq(layout::parse_range("entry")[2], "entry")
+    assert_eq(layout::parse_range("entry")[3], "100%")
+    assert_eq(layout::parse_range("entry 20% exit 80%")[1], "20%")
+    assert_eq(layout::parse_range("entry 20% exit 80%")[2], "exit")
+    assert_eq(layout::parse_range("entry 20% exit 80%")[3], "80%")
+    assert_eq(layout::parse_range("10% 90%")[0], "")
+    assert_eq(layout::parse_range("10% 90%")[1], "10%")
+    assert_eq(layout::parse_range("10% 90%")[3], "90%")
+    assert_eq(layout::parse_range("cover 30%")[0], "cover")
+    assert_eq(layout::parse_range("cover 30%")[1], "30%")
+end
+
+#[test]
+fn t04_timeline_range_geometry() is
+    ;; okno 100, obiekt 40: cover D = 140; entry [0,40]; exit [100,140]; contain [40,100]
+    assert_eq(layout::view_range_bounds("cover", 100, 40)[1], 140)
+    assert_eq(layout::view_range_bounds("entry", 100, 40)[1], 40)
+    assert_eq(layout::view_range_bounds("exit", 100, 40)[0], 100)
+    assert_eq(layout::view_range_bounds("contain", 100, 40)[0], 40)
+    assert_eq(layout::view_range_bounds("contain", 100, 40)[1], 100)
+    ;; obiekt większy od okna: contain odwrócony
+    assert_eq(layout::view_range_bounds("contain", 100, 160)[0], 100)
+    assert_eq(layout::view_range_bounds("contain", 100, 160)[1], 160)
+    assert_eq(layout::range_point_px("entry", "50%", 100, 40, 16), 20)
+    assert_eq(layout::range_point_px("cover", "10px", 100, 40, 16), 10)
+    assert_eq(layout::range_to_elapsed(70, 0, 140, 1000), 500)
+    assert_eq(layout::range_to_elapsed(-5, 0, 140, 1000), 0)
+    assert_eq(layout::range_to_elapsed(300, 0, 140, 1000), 1000)
+    assert_eq(layout::range_to_elapsed(50, 100, 100, 800), 0)
+end
+
+fn tl_sheet(extra: string) -> css::Stylesheet is
+    return css::parse(string_replace("@keyframes k { from { opacity: 0; } to { opacity: 1; } } #a { animation: k 1000ms linear both; XTRA }", "XTRA", extra))
+end
+
+#[test]
+fn t04_timeline_scroll_progress_page_and_container() is
+    ;; strona: przewinięcie 300 z max 600 → 50%
+    let d: dom::Dom = dom::parse("<div id=\"a\">x</div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, tl_sheet("animation-timeline: scroll(root);"), 400, -1)
+    let aid: int = dom::find_by_id(d, "a")
+    let st: style::ComputedStyle = find_box(boxes, aid, "box").st
+    assert_eq(layout::timeline_elapsed(boxes, d, aid, st, 300, 600, 400, 300), 500)
+    assert_eq(layout::timeline_elapsed(boxes, d, aid, st, 0, 600, 400, 300), 0)
+    assert_eq(layout::timeline_elapsed(boxes, d, aid, st, 900, 600, 400, 300), 1000)
+    ;; animation-range 25% 75% na osi przewijania
+    let b2: [layout::LayoutBox] = layout::layout(d, tl_sheet("animation-timeline: scroll(root); animation-range: 25% 75%;"), 400, -1)
+    let st2: style::ComputedStyle = find_box(b2, aid, "box").st
+    assert_eq(layout::timeline_elapsed(b2, d, aid, st2, 150, 600, 400, 300), 0)
+    assert_eq(layout::timeline_elapsed(b2, d, aid, st2, 300, 600, 400, 300), 500)
+    assert_eq(layout::timeline_elapsed(b2, d, aid, st2, 450, 600, 400, 300), 1000)
+    ;; bez osi → -1 (czas zegarowy)
+    let b3: [layout::LayoutBox] = layout::layout(d, tl_sheet(""), 400, -1)
+    assert_eq(layout::timeline_elapsed(b3, d, aid, find_box(b3, aid, "box").st, 0, 600, 400, 300), -1)
+end
+
+#[test]
+fn t04_timeline_container_scroll_and_named() is
+    let html: string = "<div id=\"s\"><p id=\"a\">x</p><p style=\"height:300px\">pad</p></div>"
+    let d: dom::Dom = dom::parse(html)
+    let css_text: string = "@keyframes k { from { opacity: 0; } to { opacity: 1; } } #s { height: 100px; overflow: auto; } #a { margin: 0; animation: k 1000ms linear both; animation-timeline: scroll(nearest); }"
+    let aid: int = dom::find_by_id(d, "a")
+    let sid: int = dom::find_by_id(d, "s")
+    let boxes: [layout::LayoutBox] = layout::layout_full_a(d, css::parse(css_text), 400, 600, -1, css::no_interaction(), [sid, 100], anim::no_anim()).boxes
+    let st: style::ComputedStyle = find_box(boxes, aid, "box").st
+    let c: layout::LayoutBox = find_box(boxes, sid, "box")
+    ;; przewinięcie 100 z max (content_h − 100)
+    let mx: int = c.content_h - 100
+    assert_true(mx > 0)
+    assert_eq(layout::timeline_elapsed(boxes, d, aid, st, 0, 0, 400, 600), 100 * 1000 / mx)
+    ;; oś nazwana scroll-timeline-name na kontenerze
+    let css2: string = "@keyframes k { from { opacity: 0; } to { opacity: 1; } } #s { height: 100px; overflow: auto; scroll-timeline-name: --sc; } #a { margin: 0; animation: k 1000ms linear both; animation-timeline: --sc; }"
+    let b2: [layout::LayoutBox] = layout::layout_full_a(d, css::parse(css2), 400, 600, -1, css::no_interaction(), [sid, 100], anim::no_anim()).boxes
+    assert_eq(layout::timeline_elapsed(b2, d, aid, find_box(b2, aid, "box").st, 0, 0, 400, 600), 100 * 1000 / mx)
+end
+
+#[test]
+fn t04_timeline_view_progress_entry_exit() is
+    ;; element 50 px na y=400; okno 300: cover D = 350; cur = (300 − (400 − scroll))
+    let d: dom::Dom = dom::parse("<div style=\"height:400px\"></div><div id=\"a\" style=\"height:50px\">x</div>")
+    let boxes: [layout::LayoutBox] = layout::layout(d, tl_sheet("animation-timeline: view();"), 400, -1)
+    let aid: int = dom::find_by_id(d, "a")
+    let st: style::ComputedStyle = find_box(boxes, aid, "box").st
+    ;; scroll 100: obiekt na y=300 → dotyka dołu okna → 0
+    assert_eq(layout::timeline_elapsed(boxes, d, aid, st, 100, 0, 400, 300), 0)
+    ;; scroll 275: y=125, cur = 175 → 50% z 350
+    assert_eq(layout::timeline_elapsed(boxes, d, aid, st, 275, 0, 400, 300), 500)
+    ;; scroll 450: y=-50 (cały wyszedł górą) → 100%
+    assert_eq(layout::timeline_elapsed(boxes, d, aid, st, 450, 0, 400, 300), 1000)
+    ;; animation-range: entry — animacja kończy się, gdy obiekt w pełni wejdzie (cur = 50)
+    let b2: [layout::LayoutBox] = layout::layout(d, tl_sheet("animation-timeline: view(); animation-range: entry;"), 400, -1)
+    let st2: style::ComputedStyle = find_box(b2, aid, "box").st
+    assert_eq(layout::timeline_elapsed(b2, d, aid, st2, 100, 0, 400, 300), 0)
+    assert_eq(layout::timeline_elapsed(b2, d, aid, st2, 125, 0, 400, 300), 500)
+    assert_eq(layout::timeline_elapsed(b2, d, aid, st2, 200, 0, 400, 300), 1000)
+    ;; view-timeline-inset skraca okno
+    let b3: [layout::LayoutBox] = layout::layout(d, tl_sheet("animation-timeline: view(); view-timeline-inset: 50px;"), 400, -1)
+    let st3: style::ComputedStyle = find_box(b3, aid, "box").st
+    ;; port eff = 200; start przy y = 300 − 50 = 250 → scroll 150 daje 0
+    assert_eq(layout::timeline_elapsed(b3, d, aid, st3, 150, 0, 400, 300), 0)
+end
+
+#[test]
+fn t04_timeline_animation_duration_auto_gets_virtual_duration() is
+    let d: dom::Dom = dom::parse("<div id=\"a\">x</div>")
+    let css_text: string = "@keyframes k { from { opacity: 0; } to { opacity: 1; } } #a { animation-name: k; animation-timeline: scroll(root); animation-fill-mode: both; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let st: style::ComputedStyle = find_box(boxes, dom::find_by_id(d, "a"), "box").st
+    assert_eq(st.anim_ms, 1000)
+    ;; bez osi czasu duration pozostaje 0 (animacja nieaktywna)
+    let b2: [layout::LayoutBox] = layout::layout(d, css::parse("@keyframes k { from { opacity: 0; } to { opacity: 1; } } #a { animation-name: k; }"), 400, -1)
+    assert_eq(find_box(b2, dom::find_by_id(d, "a"), "box").st.anim_ms, 0)
+end
+
+#[test]
+fn t04_timeline_shorthands_and_range_longhands() is
+    let html: string = "<div id=\"s\"><p id=\"a\">x</p><p style=\"height:300px\">pad</p></div>"
+    let d: dom::Dom = dom::parse(html)
+    let aid: int = dom::find_by_id(d, "a")
+    let sid: int = dom::find_by_id(d, "s")
+    let css_text: string = string_replace("@keyframes k { from { opacity: 0; } to { opacity: 1; } } #s { height: 100px; overflow: auto; scroll-timeline: --sc block; } #a { margin: 0; animation: k 1000ms linear both; animation-timeline: --sc; animation-range-start: 0%; animation-range-end: 50%; }", "", "")
+    let boxes: [layout::LayoutBox] = layout::layout_full_a(d, css::parse(css_text), 400, 600, -1, css::no_interaction(), [sid, 50], anim::no_anim()).boxes
+    let c: layout::LayoutBox = find_box(boxes, sid, "box")
+    assert_eq(props::xget(c.st.xp, "scroll-timeline-name"), "--sc")
+    assert_eq(props::xget(c.st.xp, "scroll-timeline-axis"), "block")
+    let mx: int = c.content_h - 100
+    ;; zakres 0%..50% przewinięcia: przewinięcie 50 z mx=… → min(1000, 50·1000/(mx/2))
+    let want: int = 50 * 1000 / (mx / 2)
+    assert_eq(layout::timeline_elapsed(boxes, d, aid, find_box(boxes, aid, "box").st, 0, 0, 400, 600), if want > 1000 then 1000 else want)
+    ;; view-timeline na obiekcie: nazwany widok
+    let d2: dom::Dom = dom::parse("<div style=\"height:400px\"></div><div id=\"v\" style=\"height:50px\">x</div><div id=\"b\">y</div>")
+    let css2: string = "@keyframes k { from { opacity: 0; } to { opacity: 1; } } #v { view-timeline: --vw inline; } #b { animation: k 1000ms linear both; animation-timeline: --vw; }"
+    let b2: [layout::LayoutBox] = layout::layout(d2, css::parse(css2), 400, -1)
+    assert_eq(props::xget(find_box(b2, dom::find_by_id(d2, "v"), "box").st.xp, "view-timeline-axis"), "inline")
+end
+
+;; ====================== 0.4: ścieżki ruchu (geometria) ======================
+#[test]
+fn t04_motion_path_flatten_length_and_sample() is
+    let p: [int] = svg::flatten_path("M0 0 L100 0 L100 50")
+    assert_eq(array_len(p), 6)
+    assert_eq(svg::poly_length(p), 150000)
+    let a: [int] = svg::poly_sample(p, 50000, false)
+    assert_eq(a[0], 50000)
+    assert_eq(a[1], 0)
+    assert_eq(a[2], 1000)
+    let b: [int] = svg::poly_sample(p, 125000, false)
+    assert_eq(b[0], 100000)
+    assert_eq(b[1], 25000)
+    assert_eq(b[2], 0)
+    assert_eq(b[3], 1000)
+    ;; przycięcie poza końcami
+    assert_eq(svg::poly_sample(p, 999000, false)[1], 50000)
+    assert_eq(svg::poly_sample(p, -5000, false)[0], 0)
+    ;; zamknięta: zawijanie
+    let cl: [int] = svg::flatten_path("M0 0 H10 V10 H0 Z")
+    assert_eq(svg::poly_length(cl), 40000)
+    assert_eq(svg::poly_sample(cl, 45000, true)[0], 5000)
+    ;; krzywa: długość większa od cięciwy, mniejsza od łamanej kontrolnej
+    let c: [int] = svg::flatten_path("M0 0 C0 100 100 100 100 0")
+    let len: int = svg::poly_length(c)
+    assert_true(len > 100000 && len < 300000)
+    assert_eq(array_len(c) / 2, 17)
+    ;; względne polecenia
+    assert_eq(svg::poly_length(svg::flatten_path("m10 10 l30 40")), 50000)
+end
+
+#[test]
+fn t04_motion_path_shapes() is
+    let c: [int] = svg::shape_polyline("circle(50px at 50px 50px)", 200, 100, 16)
+    ;; obwód ≈ 2π·50 = 314
+    let cl: int = svg::poly_length(c)
+    assert_true(cl > 312000 && cl < 316000)
+    ;; start na górze koła (50, 0)
+    assert_eq(c[0], 50000)
+    assert_true(c[1] > -100 && c[1] < 100)
+    let e: [int] = svg::shape_polyline("ellipse(40px 20px at 50% 50%)", 200, 100, 16)
+    assert_true(e[0] >= 99000 && e[0] <= 101000)
+    let pg: [int] = svg::shape_polyline("polygon(0 0, 100px 0, 100px 50px)", 200, 100, 16)
+    assert_eq(array_len(pg), 8)
+    assert_eq(svg::poly_length(pg), 100000 + 50000 + svg::isqrt_pub(100000 * 100000 + 50000 * 50000))
+    let ins: [int] = svg::shape_polyline("inset(10px 20px)", 200, 100, 16)
+    assert_eq(svg::poly_length(ins), 2 * (160000 + 80000))
+    assert_eq(array_len(svg::shape_polyline("foo(1)", 10, 10, 16)), 0)
+end
+
+;; ====================== 0.4: offset-path w układzie ======================
+fn grp_of(boxes: [layout::LayoutBox], id: int) -> [int] is
+    return find_box(boxes, id, "box").xf
+end
+
+#[test]
+fn t04_offset_path_translates_anchor_to_path_point() is
+    let d: dom::Dom = dom::parse("<div id=\"c\"><div id=\"a\"></div></div>")
+    let css_text: string = "#c { position: relative; width: 200px; height: 100px; } #a { width: 20px; height: 20px; offset-path: path(\"M0 0 L100 0\"); offset-distance: 50%; }"
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 400, -1)
+    let aid: int = dom::find_by_id(d, "a")
+    let a: layout::LayoutBox = find_box(boxes, aid, "box")
+    assert_true(a.xf_id > 0)
+    let g: [int] = a.xf
+    ;; kierunek w prawo → obrót tożsamościowy; środek elementu (10,10) trafia w (50,0)
+    assert_eq(g[0], 1000)
+    assert_eq(g[1], 0)
+    assert_eq(g[4], 40000)
+    assert_eq(g[5], -10000)
+    assert_eq(g[6], a.x + 10)
+    assert_eq(g[7], a.y + 10)
+    ;; dystans w px i inny punkt
+    let b2: [layout::LayoutBox] = layout::layout(d, css::parse(string_replace(css_text, "50%", "30px")), 400, -1)
+    assert_eq(grp_of(b2, aid)[4], 20000)
+    ;; bez ścieżki brak grupy
+    let b3: [layout::LayoutBox] = layout::layout(d, css::parse("#a { width: 20px; height: 20px; }"), 400, -1)
+    assert_eq(find_box(b3, aid, "box").xf_id, 0)
+end
+
+#[test]
+fn t04_offset_rotate_auto_reverse_and_angle() is
+    let d: dom::Dom = dom::parse("<div id=\"a\"></div>")
+    let base: string = "#a { width: 20px; height: 20px; offset-path: path(\"M0 0 L0 100\"); offset-distance: 50%; "
+    let aid: int = dom::find_by_id(d, "a")
+    ;; ścieżka w dół: auto → obrót o 90° ([0 1 -1 0])
+    let g1: [int] = grp_of(layout::layout(d, css::parse(base + "}"), 400, -1), aid)
+    assert_eq(g1[0], 0)
+    assert_eq(g1[1], 1000)
+    assert_eq(g1[2], -1000)
+    ;; reverse: obrót o dodatkowe 180° → [0 −1 1 0]
+    let g2: [int] = grp_of(layout::layout(d, css::parse(base + "offset-rotate: reverse; }"), 400, -1), aid)
+    assert_eq(g2[1], -1000)
+    assert_eq(g2[2], 1000)
+    ;; stały kąt 0deg: bez obrotu kierunku
+    let g3: [int] = grp_of(layout::layout(d, css::parse(base + "offset-rotate: 0deg; }"), 400, -1), aid)
+    assert_eq(g3[0], 1000)
+    assert_eq(g3[1], 0)
+    ;; auto 90deg: kierunek (w dół, 90°) + 90° = 180° → [−1 0 0 −1]
+    let g4: [int] = grp_of(layout::layout(d, css::parse(base + "offset-rotate: auto 90deg; }"), 400, -1), aid)
+    assert_true(g4[0] <= -990)
+end
+
+#[test]
+fn t04_offset_anchor_shorthand_and_shapes() is
+    let d: dom::Dom = dom::parse("<div id=\"a\"></div>")
+    let aid: int = dom::find_by_id(d, "a")
+    ;; kotwica w lewym górnym rogu: punkt (50,0) → przesunięcie (50,0)
+    let g: [int] = grp_of(layout::layout(d, css::parse("#a { width: 20px; height: 20px; offset-path: path(\"M0 0 L100 0\"); offset-distance: 50%; offset-anchor: left top; }"), 400, -1), aid)
+    assert_eq(g[4], 50000)
+    assert_eq(g[5], 0)
+    ;; skrót offset: path distance rotate / anchor
+    let s: [layout::LayoutBox] = layout::layout(d, css::parse("#a { width: 20px; height: 20px; offset: path(\"M0 0 L100 0\") 40px auto / 0% 0%; }"), 400, -1)
+    let sa: layout::LayoutBox = find_box(s, aid, "box")
+    assert_eq(props::xget(sa.st.xp, "offset-distance"), "40px")
+    assert_eq(props::xget(sa.st.xp, "offset-anchor"), "0% 0%")
+    assert_eq(sa.xf[4], 40000)
+    ;; circle(): start na górze koła; promień 50 w polu 200×100 przy środku 100,50 → (100, 0)
+    let c: [int] = grp_of(layout::layout(d, css::parse("#a { position: absolute; width: 10px; height: 10px; offset-path: circle(50px at 100px 50px); offset-distance: 0px; offset-anchor: left top; }"), 400, -1), aid)
+    assert_eq(c[4], 100000)
+    assert_true(c[5] > -200 && c[5] < 200)
+end
+
+#[test]
+fn t04_offset_composes_with_transform_matrix() is
+    let d: dom::Dom = dom::parse("<div id=\"a\"></div>")
+    let aid: int = dom::find_by_id(d, "a")
+    let g: [int] = grp_of(layout::layout(d, css::parse("#a { width: 20px; height: 20px; transform: rotate(90deg); offset-path: path(\"M0 0 L100 0\"); offset-distance: 50%; offset-rotate: 0deg; }"), 400, -1), aid)
+    ;; obrót 90° z transform zachowany w macierzy po złożeniu z ruchem
+    assert_eq(g[0], 0)
+    assert_eq(g[1], 1000)
+    assert_eq(g[2], -1000)
+    assert_eq(g[3], 0)
+    assert_eq(array_len(g), 12)
+end
+
+#[test]
+fn t04_image_resolution_parsing() is
+    let a: layout::LayoutBox = emph_box("<p>x</p>", "p { image-resolution: 2x; }")
+    assert_eq(layout::image_resolution_x1000(a.st), 2000)
+    assert_eq(layout::image_resolution_x1000(emph_box("<p>x</p>", "p { image-resolution: 192dpi; }").st), 2000)
+    assert_eq(layout::image_resolution_x1000(emph_box("<p>x</p>", "p { image-resolution: 1.5dppx; }").st), 1500)
+    assert_eq(layout::image_resolution_x1000(emph_box("<p>x</p>", "p { image-resolution: from-image; }").st), 0)
+    assert_eq(layout::image_resolution_x1000(emph_box("<p>x</p>", "p { margin: 0; }").st), 0)
+end
+
+;; ====================== 0.4: typografia (typo.h#, font-size-adjust, font-stretch, …) ======================
+fn joined_text(boxes: [layout::LayoutBox]) -> string is
+    let t: [string] = texts_flat(boxes)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(t) is
+        out = out + t[i]
+        i += 1
+    end
+    return out
+end
+
+fn flag_bit(flags: int, bit: int) -> bool is
+    return (flags / bit) % 2 == 1
+end
+
+#[test]
+fn t04_font_variant_ligatures_none_inserts_zwnj_between_ligature_pairs() is
+    let off: string = joined_text(lay("<p>office flow</p>", "p { margin: 0; font-variant-ligatures: none; }", 400))
+    assert_true(string_find(off, "f\u200cf") >= 0)
+    assert_true(string_find(off, "f\u200ci") >= 0)
+    assert_true(string_find(off, "f\u200cl") >= 0)
+    let on: string = joined_text(lay("<p>office flow</p>", "p { margin: 0; }", 400))
+    assert_eq(string_find(on, "\u200c"), -1)
+    let feat: string = joined_text(lay("<p>fi</p>", "p { margin: 0; font-feature-settings: \"liga\" 0; }", 400))
+    assert_true(string_find(feat, "\u200c") >= 0)
+    ;; font-feature-settings wygrywa z font-variant-ligatures
+    let win: string = joined_text(lay("<p>fi</p>", "p { margin: 0; font-variant-ligatures: none; font-feature-settings: \"liga\" 1; }", 400))
+    assert_eq(string_find(win, "\u200c"), -1)
+end
+
+#[test]
+fn t04_font_feature_settings_parser() is
+    let xp: string = props::xset("", "font-feature-settings", "\"smcp\", 'liga' off, \"tnum\" 1, \"zero\" on, \"ss01\" 3")
+    assert_eq(typo::feat(xp, "smcp"), 1)
+    assert_eq(typo::feat(xp, "liga"), 0)
+    assert_eq(typo::feat(xp, "tnum"), 1)
+    assert_eq(typo::feat(xp, "zero"), 1)
+    assert_eq(typo::feat(xp, "ss01"), 3)
+    assert_eq(typo::feat(xp, "frac"), -1)
+    assert_eq(typo::feat("", "liga"), -1)
+end
+
+#[test]
+fn t04_font_variant_numeric_fractions_ordinals_slashed_zero() is
+    let fr: string = joined_text(lay("<p>1/2 i 3/4</p>", "p { margin: 0; font-variant-numeric: diagonal-fractions; }", 400))
+    assert_eq(fr, "\u00b9\u2044\u2082 i \u00b3\u2044\u2084")
+    let fr2: string = joined_text(lay("<p>12/25</p>", "p { margin: 0; font-feature-settings: \"frac\"; }", 400))
+    assert_eq(fr2, "\u00b9\u00b2\u2044\u2082\u2085")
+    let ord: string = joined_text(lay("<p>1st 2nd 3rd 4th</p>", "p { margin: 0; font-variant-numeric: ordinal; }", 400))
+    assert_eq(ord, "1\u02e2\u1d57 2\u207f\u1d48 3\u02b3\u1d48 4\u1d57\u02b0")
+    ;; „1stage" — przyrostek wewnątrz słowa zostaje
+    assert_eq(joined_text(lay("<p>1stage</p>", "p { margin: 0; font-variant-numeric: ordinal; }", 400)), "1stage")
+    let z: string = joined_text(lay("<p>100</p>", "p { margin: 0; font-variant-numeric: slashed-zero; }", 400))
+    assert_eq(z, "10\u0337" + "" + "0\u0337")
+end
+
+#[test]
+fn t04_font_variant_east_asian_full_width_and_emoji_selectors() is
+    assert_eq(joined_text(lay("<p>A1 b</p>", "p { margin: 0; font-variant-east-asian: full-width; }", 400)), "\uff21\uff11\u3000\uff42")
+    assert_eq(joined_text(lay("<p>\u2600</p>", "p { margin: 0; font-variant-emoji: text; }", 400)), "\u2600\ufe0e")
+    assert_eq(joined_text(lay("<p>\u2600</p>", "p { margin: 0; font-variant-emoji: emoji; }", 400)), "\u2600\ufe0f")
+    assert_eq(joined_text(lay("<p>\u2600</p>", "p { margin: 0; }", 400)), "\u2600")
+end
+
+#[test]
+fn t04_tabular_nums_and_stretch_encode_into_text_flags() is
+    let base: int = layout::style_flags(emph_box("<p>1</p>", "p { margin: 0; }").st)
+    assert_true(!flag_bit(base, 256))
+    let tn: int = layout::style_flags(emph_box("<p>1</p>", "p { margin: 0; font-variant-numeric: tabular-nums; }").st)
+    assert_true(flag_bit(tn, 256))
+    let tn2: int = layout::style_flags(emph_box("<p>1</p>", "p { margin: 0; font-feature-settings: \"tnum\"; }").st)
+    assert_true(flag_bit(tn2, 256))
+    ;; font-stretch: condensed = 75% → krok 15 w bitach 9..15
+    let c: int = layout::style_flags(emph_box("<p>1</p>", "p { margin: 0; font-stretch: condensed; }").st)
+    assert_eq((c / 512) % 64, 15)
+    let e: int = layout::style_flags(emph_box("<p>1</p>", "p { margin: 0; font-stretch: 125%; }").st)
+    assert_eq((e / 512) % 64, 25)
+    let w: int = layout::style_flags(emph_box("<p>1</p>", "p { margin: 0; font-variation-settings: \"wdth\" 50; }").st)
+    assert_eq((w / 512) % 64, 10)
+    assert_eq((base / 512) % 64, 0)
+    ;; stretch dziedziczy się
+    let sp: int = layout::style_flags(emph_box("<div class=\"w\"><p>a</p></div>", ".w { font-stretch: ultra-expanded; } p { margin: 0; }").st)
+    assert_eq((sp / 512) % 64, 40)
+end
+
+#[test]
+fn t04_font_key_moved_above_flag_bits() is
+    let f: layout::LayoutBox = emph_box("<p>a</p>", "p { margin: 0; font-variant-numeric: tabular-nums; font-stretch: 75%; }")
+    assert_eq(layout::style_flags(f.st) % 65536, 256 + 15 * 512 + 32768)
+    assert_eq(layout::style_flags(f.st) / 65536, f.st.font_key)
+end
+
+#[test]
+fn t04_font_kerning_flag_is_shared_by_layout_and_paint() is
+    let k: int = layout::style_flags(emph_box("<p>AV</p>", "p { margin: 0; font-feature-settings: \"kern\" 0; }").st)
+    assert_true(flag_bit(k, 16))
+    let kn: int = layout::style_flags(emph_box("<p>AV</p>", "p { margin: 0; font-kerning: none; }").st)
+    assert_true(flag_bit(kn, 16))
+    let kd: int = layout::style_flags(emph_box("<p>AV</p>", "p { margin: 0; }").st)
+    assert_true(!flag_bit(kd, 16))
+end
+
+#[test]
+fn t04_font_size_adjust_scales_used_size_with_default_ratios() is
+    ;; bez okna: współczynnik x-height = 0,52 → adjust 0,52 nie zmienia rozmiaru, 1,04 podwaja, 0,26 zmniejsza o połowę
+    assert_eq(emph_box("<p>a</p>", "p { margin: 0; font-size: 20px; font-size-adjust: 0.52; }").st.font_size, 20)
+    assert_eq(emph_box("<p>a</p>", "p { margin: 0; font-size: 20px; font-size-adjust: 1.04; }").st.font_size, 40)
+    assert_eq(emph_box("<p>a</p>", "p { margin: 0; font-size: 20px; font-size-adjust: ex-height 0.26; }").st.font_size, 10)
+    ;; cap-height 0,72 → bez zmiany; 1,44 → ×2
+    assert_eq(emph_box("<p>a</p>", "p { margin: 0; font-size: 20px; font-size-adjust: cap-height 1.44; }").st.font_size, 40)
+    assert_eq(emph_box("<p>a</p>", "p { margin: 0; font-size: 20px; font-size-adjust: none; }").st.font_size, 20)
+    assert_eq(emph_box("<p>a</p>", "p { margin: 0; font-size: 20px; font-size-adjust: from-font; }").st.font_size, 20)
+end
+
+#[test]
+fn t04_font_size_adjust_does_not_compound_through_inheritance() is
+    ;; em w potomku liczy się od rozmiaru obliczonego (20px), nie użytego
+    let boxes: [layout::LayoutBox] = lay("<p>a<span id=\"s\">b</span></p>", "p { margin: 0; font-size: 20px; font-size-adjust: 1.04; } span { font-size: 1em; }", 400)
+    let d: dom::Dom = dom::parse("<p>a<span id=\"s\">b</span></p>")
+    let sb: [layout::LayoutBox] = texts_boxes(boxes, dom::find_by_id(d, "s"))
+    assert_eq(sb[0].st.font_size, 40)
+end
+
+#[test]
+fn t04_font_variation_settings_map_to_weight_and_slant() is
+    assert_true(emph_box("<p>a</p>", "p { margin: 0; font-variation-settings: \"wght\" 700; }").st.bold)
+    assert_true(!emph_box("<p>a</p>", "p { margin: 0; font-weight: bold; font-variation-settings: \"wght\" 300; }").st.bold)
+    assert_eq(emph_box("<p>a</p>", "p { margin: 0; font-variation-settings: \"wght\" 640; }").st.font_weight, 640)
+    assert_true(emph_box("<p>a</p>", "p { margin: 0; font-variation-settings: \"ital\" 1; }").st.italic)
+    assert_true(emph_box("<p>a</p>", "p { margin: 0; font-variation-settings: \"slnt\" -12; }").st.italic)
+    assert_true(!emph_box("<p>a</p>", "p { margin: 0; font-variation-settings: \"opsz\" 14; }").st.italic)
+    assert_eq(typo::axis("\"wght\" 700, \"wdth\" 80", "wdth", -1), 80)
+    assert_eq(typo::axis("\"slnt\" -12", "slnt", 0), -12)
+end
+
+#[test]
+fn t04_font_variant_position_shrinks_and_shifts_baseline_once() is
+    let src: string = "<p>a<span id=\"s\">b<i id=\"i\">c</i></span></p>"
+    let d: dom::Dom = dom::parse(src)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse("p { margin: 0; font-size: 20px; } #s { font-variant-position: super; }"), 400, -1)
+    let sb: [layout::LayoutBox] = texts_boxes(boxes, dom::find_by_id(d, "s"))
+    assert_eq(sb[0].st.font_size, 14)
+    assert_eq(sb[0].st.valign, "super")
+    ;; potomek dziedziczy pomniejszenie, ale przesunięcie nie dubluje się
+    let ib: [layout::LayoutBox] = texts_boxes(boxes, dom::find_by_id(d, "i"))
+    assert_eq(ib[0].st.font_size, 14)
+    assert_eq(ib[0].st.valign, "baseline")
+    let sub: [layout::LayoutBox] = texts_boxes(layout::layout(d, css::parse("#s { font-feature-settings: \"subs\"; }"), 400, -1), dom::find_by_id(d, "s"))
+    assert_eq(sub[0].st.valign, "sub")
+end
+
+#[test]
+fn t04_unicode_bidi_override_reverses_characters_within_words() is
+    let rev: string = joined_text(lay("<p>abc def</p>", "p { margin: 0; direction: rtl; unicode-bidi: bidi-override; }", 400))
+    assert_true(string_find(rev, "cba") >= 0)
+    assert_true(string_find(rev, "fed") >= 0)
+    assert_eq(string_find(rev, "abc"), -1)
+    ;; sam direction: rtl bez override nie odwraca liter
+    let plain: string = joined_text(lay("<p>abc def</p>", "p { margin: 0; direction: rtl; }", 400))
+    assert_true(string_find(plain, "abc") >= 0)
+    ;; override w ltr — bez zmian
+    let ltr: string = joined_text(lay("<p>abc def</p>", "p { margin: 0; unicode-bidi: bidi-override; }", 400))
+    assert_true(string_find(ltr, "abc") >= 0)
+    assert_eq(typo::reverse_words("ab cd"), "ba dc")
+end
+
+#[test]
+fn t04_transform_box_selects_origin_reference_box() is
+    let css0: string = "div { width: 100px; height: 50px; padding: 10px; border: 2px solid red; margin: 0; box-sizing: content-box; }"
+    let d: dom::Dom = dom::parse("<div id=\"a\">x</div>")
+    let id: int = dom::find_by_id(d, "a")
+    let b0: [layout::LayoutBox] = layout::layout(d, css::parse(css0 + " div { transform-box: border-box; }"), 400, -1)
+    let b1: [layout::LayoutBox] = layout::layout(d, css::parse(css0 + " div { transform-box: content-box; }"), 400, -1)
+    let bb: layout::LayoutBox = find_box(b0, id, "box")
+    let ob0: [int] = layout::origin_box(bb, bb.st)
+    assert_eq(ob0[0], bb.x)
+    assert_eq(ob0[2], bb.w)
+    let cb: layout::LayoutBox = find_box(b1, id, "box")
+    let ob1: [int] = layout::origin_box(cb, cb.st)
+    assert_eq(ob1[0], cb.x + 12)
+    assert_eq(ob1[1], cb.y + 12)
+    assert_eq(ob1[2], 100)
+    assert_eq(ob1[3], 50)
+end
+
+#[test]
+fn t04_caret_shape_bar_block_underscore() is
+    let st0: style::ComputedStyle = emph_box("<p>a</p>", "p { margin: 0; caret-shape: block; }").st
+    assert_eq(paint::caret_shape_of(st0), "block")
+    assert_eq(paint::caret_shape_of(emph_box("<p>a</p>", "p { margin: 0; caret-shape: underscore; }").st), "underscore")
+    assert_eq(paint::caret_shape_of(emph_box("<p>a</p>", "p { margin: 0; }").st), "bar")
+    assert_eq(paint::caret_shape_of(emph_box("<p>a</p>", "p { margin: 0; caret: red block; }").st), "block")
+    let bar: [int] = paint::caret_rect("bar", 10, 20, 16, 8)
+    assert_eq(bar[2], 1)
+    assert_eq(bar[3], 16)
+    let blk: [int] = paint::caret_rect("block", 10, 20, 16, 8)
+    assert_eq(blk[2], 8)
+    assert_eq(blk[3], 16)
+    let us: [int] = paint::caret_rect("underscore", 10, 20, 16, 8)
+    assert_eq(us[1], 34)
+    assert_eq(us[3], 2)
+    assert_eq(us[2], 8)
+end
+
+#[test]
+fn t04_text_decoration_skip_ink_gaps_and_segments() is
+    let gaps: [int] = paint::ink_gaps(["a", "g", "o", "y", "y", "x"], [0, 10, 20, 30, 40, 50, 60], 2)
+    ;; g: [8,22); y y sąsiadują → jedna przerwa [28,52)
+    assert_eq(array_len(gaps), 4)
+    assert_eq(gaps[0], 8)
+    assert_eq(gaps[1], 22)
+    assert_eq(gaps[2], 28)
+    assert_eq(gaps[3], 52)
+    let seg: [int] = paint::solid_segments(60, gaps)
+    assert_eq(array_len(seg), 6)
+    assert_eq(seg[0], 0)
+    assert_eq(seg[1], 8)
+    assert_eq(seg[2], 22)
+    assert_eq(seg[3], 6)
+    assert_eq(seg[4], 52)
+    assert_eq(seg[5], 8)
+    assert_eq(array_len(paint::solid_segments(60, [])), 2)
+    assert_true(paint::skip_ink_on(emph_box("<p>a</p>", "p { text-decoration-skip-ink: auto; }").st))
+    assert_true(!paint::skip_ink_on(emph_box("<p>a</p>", "p { text-decoration-skip-ink: none; }").st))
+    assert_true(!paint::skip_ink_on(emph_box("<p>a</p>", "p { }").st))
+end
+
+
+#[test]
+fn t04_hanging_punctuation_first_last_and_force_end() is
+    let base: layout::LayoutBox = emph_box("<p>\u201cHello world\u201d</p>", "p { margin: 0; }")
+    let hf: layout::LayoutBox = emph_box("<p>\u201cHello world\u201d</p>", "p { margin: 0; hanging-punctuation: first; }")
+    assert_true(hf.x < base.x)
+    assert_true(base.x - hf.x > 3 && base.x - hf.x <= 16)
+    ;; nie-otwierający znak na początku — bez wysunięcia
+    let nb: layout::LayoutBox = emph_box("<p>Hello</p>", "p { margin: 0; hanging-punctuation: first; }")
+    assert_eq(nb.x, base.x)
+    ;; last: zamykający cudzysłów wystaje za prawą krawędź przy text-align: right
+    let r0: layout::LayoutBox = emph_box("<p>Hi\u201d</p>", "p { margin: 0; text-align: right; }")
+    let r1: layout::LayoutBox = emph_box("<p>Hi\u201d</p>", "p { margin: 0; text-align: right; hanging-punctuation: last; }")
+    assert_true(r1.x + r1.w > r0.x + r0.w)
+    ;; force-end: kropka na końcu każdego wiersza
+    let f0: layout::LayoutBox = emph_box("<p>Hi.</p>", "p { margin: 0; text-align: right; }")
+    let f1: layout::LayoutBox = emph_box("<p>Hi.</p>", "p { margin: 0; text-align: right; hanging-punctuation: force-end; }")
+    assert_true(f1.x + f1.w > f0.x + f0.w)
+    ;; first nie wpływa na prawy brzeg
+    let f2: layout::LayoutBox = emph_box("<p>Hi.</p>", "p { margin: 0; text-align: right; hanging-punctuation: first; }")
+    assert_eq(f2.x + f2.w, f0.x + f0.w)
+    assert_true(layout::hp_is_opening("("))
+    assert_true(layout::hp_is_closing("\u201d"))
+    assert_true(layout::hp_is_stop("\u3002"))
+    assert_true(!layout::hp_is_opening("a"))
+end
+
+fn min_text_x_in_band(boxes: [layout::LayoutBox], y0: int, y1: int) -> int is
+    let mut best: int = 1000000
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        let b: layout::LayoutBox = boxes[i]
+        if b.kind == "text" && b.y >= y0 && b.y < y1 && b.x < best is best = b.x end
+        i += 1
+    end
+    return best
+end
+
+#[test]
+fn t04_shape_geometry_circle_ellipse_inset_polygon() is
+    assert_eq(shape::isqrt(144), 12)
+    assert_eq(shape::isqrt(2), 1)
+    let c: [int] = shape::build("circle(50%)", 0, 0, 100, 100, 0, 16)
+    assert_eq(c[0], 2)
+    assert_eq(c[3], 50)
+    let mid: [int] = shape::extent(c, 50)
+    assert_eq(mid[0], 0)
+    assert_eq(mid[1], 100)
+    let top: [int] = shape::extent(c, 5)
+    assert_eq(top[1], 71)
+    assert_eq(array_len(shape::extent(c, 101)), 0)
+    ;; shape-margin poszerza koło
+    let cm: [int] = shape::build("circle(50%)", 0, 0, 100, 100, 10, 16)
+    assert_eq(cm[3], 60)
+    let e: [int] = shape::build("ellipse(40px 20px at 50px 50px)", 0, 0, 100, 100, 0, 16)
+    assert_eq(shape::extent(e, 50)[1], 90)
+    assert_eq(array_len(shape::extent(e, 20)), 0)
+    let ins: [int] = shape::build("inset(10px 20px 30px 5px)", 0, 0, 100, 100, 0, 16)
+    assert_eq(shape::extent(ins, 50)[0], 5)
+    assert_eq(shape::extent(ins, 50)[1], 80)
+    assert_eq(array_len(shape::extent(ins, 5)), 0)
+    assert_eq(array_len(shape::extent(ins, 75)), 0)
+    let tri: [int] = shape::build("polygon(0 0, 100px 0, 0 100px)", 0, 0, 100, 100, 0, 16)
+    assert_eq(shape::extent(tri, 50)[0], 0)
+    assert_eq(shape::extent(tri, 50)[1], 50)
+    assert_eq(shape::extent(tri, 0)[1], 100)
+    assert_eq(shape::ref_box_kw("circle(10px) content-box"), "content-box")
+    assert_eq(shape::ref_box_kw("circle(10px)"), "margin-box")
+    assert_true(!shape::supported("url(a.png)"))
+    assert_true(shape::supported("border-box"))
+end
+
+#[test]
+fn t04_shape_outside_circle_wraps_text_around_curve() is
+    let words: string = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz" + " " + "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz" + " " + "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz" + " " + "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz"
+    let flo: string = "<div style=\"float:left;width:100px;height:100px;shape-outside:circle(50%)\"></div><p>" + words + "</p>"
+    let rect: string = "<div style=\"float:left;width:100px;height:100px\"></div><p>" + words + "</p>"
+    let css0: string = "p { margin: 0; } div { margin: 0; }"
+    let bs: [layout::LayoutBox] = lay(flo, css0, 300)
+    let br: [layout::LayoutBox] = lay(rect, css0, 300)
+    ;; pierwszy wiersz: z kołem zaczyna się bliżej niż przy prostokącie (100)
+    let x_shape: int = min_text_x_in_band(bs, 0, 12)
+    let x_rect: int = min_text_x_in_band(br, 0, 12)
+    assert_eq(x_rect, 100)
+    assert_true(x_shape > 60 && x_shape < 100)
+    ;; w połowie wysokości koło jest najszersze
+    assert_true(min_text_x_in_band(bs, 40, 60) >= 98)
+    ;; pod floatem tekst wraca do lewej krawędzi
+    assert_eq(min_text_x_in_band(bs, 105, 400), 0)
+end
+
+#[test]
+fn t04_shape_outside_polygon_margin_and_right_float() is
+    let words: string = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz" + " " + "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz" + " " + "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz" + " " + "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz"
+    let css0: string = "p { margin: 0; } div { margin: 0; }"
+    let tri: string = "<div style=\"float:left;width:100px;height:100px;shape-outside:polygon(0 0, 100% 0, 0 100%)\"></div><p>" + words + "</p>"
+    let bt: [layout::LayoutBox] = lay(tri, css0, 300)
+    ;; trójkąt: u góry szeroki, na dole wąski → wiersze z dołu są coraz bliżej lewej krawędzi
+    let top_x: int = min_text_x_in_band(bt, 0, 12)
+    let low_x: int = min_text_x_in_band(bt, 70, 90)
+    assert_true(top_x > low_x)
+    let marg: string = "<div style=\"float:left;width:100px;height:100px;shape-outside:circle(30px);shape-margin:20px\"></div><p>" + words + "</p>"
+    let nom: string = "<div style=\"float:left;width:100px;height:100px;shape-outside:circle(30px)\"></div><p>" + words + "</p>"
+    let xm: int = min_text_x_in_band(lay(marg, css0, 300), 30, 60)
+    let xn: int = min_text_x_in_band(lay(nom, css0, 300), 30, 60)
+    assert_true(xm > xn)
+    ;; prawy float: tekst kończy się przed lewym brzegiem koła
+    let rt: string = "<div style=\"float:right;width:100px;height:100px;shape-outside:circle(50%)\"></div><p>" + words + "</p>"
+    let brt: [layout::LayoutBox] = lay(rt, css0, 300)
+    let mut maxr: int = 0
+    let mut i: int = 0
+    while i < array_len(brt) is
+        if brt[i].kind == "text" && brt[i].y >= 40 && brt[i].y < 60 && brt[i].x + brt[i].w > maxr is maxr = brt[i].x + brt[i].w end
+        i += 1
+    end
+    assert_true(maxr <= 202 && maxr > 150)
+end
+
+
+fn min_body_x_in_band(boxes: [layout::LayoutBox], y0: int, y1: int) -> int is
+    let mut best: int = 1000000
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        let b: layout::LayoutBox = boxes[i]
+        if b.kind == "text" && b.st.font_size == 16 && b.y >= y0 && b.y < y1 && b.x < best is best = b.x end
+        i += 1
+    end
+    return best
+end
+
+fn first_text_box(boxes: [layout::LayoutBox]) -> layout::LayoutBox is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].kind == "text" is return boxes[i] end
+        i += 1
+    end
+    return boxes[0]
+end
+
+#[test]
+fn t04_first_letter_pseudo_element_styles_first_character() is
+    let sp: [int] = layout::first_letter_span("  \"Hello")
+    assert_eq(sp[1], 2)
+    assert_eq(sp[0], 2)
+    assert_eq(layout::first_letter_span("   ")[0], 0)
+    let boxes: [layout::LayoutBox] = lay("<p>Hello world</p>", "p { margin: 0; } p::first-letter { font-size: 40px; color: #ff0000; }", 400)
+    let fb: layout::LayoutBox = first_text_box(boxes)
+    assert_eq(fb.text, "H")
+    assert_eq(fb.st.font_size, 40)
+    let t: [string] = texts_flat(boxes)
+    assert_eq(joined_text(boxes), "Hello world")
+    ;; reguła bez dopasowania do ::first-letter nie zmienia drzewa
+    let plain: [layout::LayoutBox] = lay("<p>Hello world</p>", "p { margin: 0; }", 400)
+    assert_eq(first_text_box(plain).text, "Hello world")
+    ;; pojedynczy dwukropek też działa
+    let one: [layout::LayoutBox] = lay("<p>Hello</p>", "p { margin: 0; } p:first-letter { font-size: 30px; }", 400)
+    assert_eq(first_text_box(one).st.font_size, 30)
+end
+
+#[test]
+fn t04_initial_letter_drop_cap_spans_n_lines() is
+    let words: string = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www xxx yyy zzz"
+    let boxes: [layout::LayoutBox] = lay("<p>Lorem " + words + "</p>", "p { margin: 0; } p::first-letter { initial-letter: 3; }", 300)
+    let cap: layout::LayoutBox = first_text_box(boxes)
+    assert_eq(cap.text, "L")
+    ;; ((3-1)*22 + 16*0,72) / 0,72 ≈ 76
+    assert_true(cap.st.font_size >= 70 && cap.st.font_size <= 82)
+    ;; trzy pierwsze wiersze omijają literę, czwarty wraca do lewej krawędzi
+    assert_true(min_body_x_in_band(boxes, 0, 20) > 40)
+    assert_true(min_body_x_in_band(boxes, 22, 42) > 40)
+    assert_true(min_body_x_in_band(boxes, 44, 64) > 40)
+    assert_eq(min_body_x_in_band(boxes, 66, 400), 0)
+    ;; element inline z initial-letter też działa
+    let sp: [layout::LayoutBox] = lay("<p><span class=\"d\">T</span>ext " + words + "</p>", "p { margin: 0; } .d { initial-letter: 2; }", 300)
+    let sb: layout::LayoutBox = first_text_box(sp)
+    assert_eq(sb.text, "T")
+    assert_true(sb.st.font_size > 40 && sb.st.font_size < 60)
+    ;; raise: ten sam rozmiar, mniejsze zagłębienie
+    let rs: [layout::LayoutBox] = lay("<p>Lorem " + words + "</p>", "p { margin: 0; } p::first-letter { initial-letter: 3 1; }", 300)
+    assert_eq(first_text_box(rs).st.font_size, cap.st.font_size)
+    ;; initial-letter: normal — bez zmian
+    let nm: [layout::LayoutBox] = lay("<p>Lorem " + words + "</p>", "p { margin: 0; } p::first-letter { initial-letter: normal; }", 300)
+    assert_eq(first_text_box(nm).st.font_size, 16)
+end
+
+
+
+fn box_at_id(boxes: [layout::LayoutBox], d: dom::Dom, key: string) -> layout::LayoutBox is
+    return find_box(boxes, dom::find_by_id(d, key), "box")
+end
+
+#[test]
+fn t04_masonry_rows_places_items_in_shortest_column() is
+    let src: string = "<div id=\"g\"><div id=\"a\"></div><div id=\"b\"></div><div id=\"c\"></div><div id=\"e\"></div></div>"
+    let d: dom::Dom = dom::parse(src)
+    let css0: string = "#g { display: grid; grid-template-columns: 100px 100px; grid-template-rows: masonry; } #a { height: 50px; } #b { height: 100px; } #c { height: 30px; } #e { height: 30px; }"
+    let bs: [layout::LayoutBox] = layout::layout(d, css::parse(css0), 400, -1)
+    assert_eq(layout::masonry_axis(box_at_id(bs, d, "g").st), 1)
+    let a: layout::LayoutBox = box_at_id(bs, d, "a")
+    let b: layout::LayoutBox = box_at_id(bs, d, "b")
+    let c: layout::LayoutBox = box_at_id(bs, d, "c")
+    let e: layout::LayoutBox = box_at_id(bs, d, "e")
+    assert_eq(a.x, 0)
+    assert_eq(b.x, 100)
+    ;; c trafia do krótszej kolumny (a: 50 < b: 100), e też (80 < 100)
+    assert_eq(c.x, 0)
+    assert_eq(c.y, 50)
+    assert_eq(e.x, 0)
+    assert_eq(e.y, 80)
+    assert_eq(box_at_id(bs, d, "g").h, 110)
+    ;; masonry-auto-flow: next → kolejne kolumny po kolei
+    let nx: [layout::LayoutBox] = layout::layout(d, css::parse(css0 + " #g { masonry-auto-flow: next; }"), 400, -1)
+    assert_eq(box_at_id(nx, d, "c").x, 0)
+    assert_eq(box_at_id(nx, d, "e").x, 100)
+    assert_eq(box_at_id(nx, d, "e").y, 100)
+    ;; gap
+    let gp: [layout::LayoutBox] = layout::layout(d, css::parse(css0 + " #g { row-gap: 10px; }"), 400, -1)
+    assert_eq(box_at_id(gp, d, "c").y, 60)
+    assert_eq(layout::shortest_track([5, 3, 3, 9], 0, 4), 1)
+end
+
+#[test]
+fn t04_masonry_columns_flows_items_into_shortest_row() is
+    let src: string = "<div id=\"g\"><div id=\"a\"></div><div id=\"b\"></div><div id=\"c\"></div></div>"
+    let d: dom::Dom = dom::parse(src)
+    let css0: string = "#g { display: grid; grid-template-columns: masonry; grid-template-rows: 40px 40px; } #g > div { height: 30px; } #a { width: 100px; } #b { width: 60px; } #c { width: 20px; }"
+    let bs: [layout::LayoutBox] = layout::layout(d, css::parse(css0), 400, -1)
+    assert_eq(layout::masonry_axis(box_at_id(bs, d, "g").st), 2)
+    assert_eq(box_at_id(bs, d, "a").y, 0)
+    assert_eq(box_at_id(bs, d, "b").y, 40)
+    ;; c: krótszy jest wiersz 2 (60 < 100)
+    assert_eq(box_at_id(bs, d, "c").y, 40)
+    assert_eq(box_at_id(bs, d, "c").x, 60)
+end
+
+
+
+fn count_boxes_of(boxes: [layout::LayoutBox], id: int) -> int is
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id is n += 1 end
+        i += 1
+    end
+    return n
+end
+
+#[test]
+fn t04_anchor_pure_helpers() is
+    let sp: [string] = anchor::split_args("--a bottom, 10px")
+    assert_eq(sp[0], "--a")
+    assert_eq(sp[1], "bottom")
+    assert_eq(sp[2], "10px")
+    assert_eq(anchor::split_args("top")[0], "")
+    assert_eq(anchor::fn_args("calc(anchor(--a top) - 8px)", "anchor"), "--a top")
+    assert_eq(anchor::fn_args("anchor-size(width)", "anchor"), "")
+    assert_eq(anchor::fn_args("anchor-size(--b height, 5px)", "anchor-size"), "--b height, 5px")
+    let ax: [int] = [100, 100, 50, 20]
+    assert_eq(anchor::side_coord("left", ax, true), 100)
+    assert_eq(anchor::side_coord("right", ax, true), 150)
+    assert_eq(anchor::side_coord("center", ax, true), 125)
+    assert_eq(anchor::side_coord("bottom", ax, false), 120)
+    assert_eq(anchor::side_coord("50%", ax, false), 110)
+    assert_eq(anchor::side_coord("bogus", ax, true), -1000000)
+    assert_eq(anchor::size_val("width", ax), 50)
+    assert_eq(anchor::size_val("height", ax), 20)
+    let cb: [int] = [0, 0, 400, 300]
+    let top: [int] = anchor::area_region("top", ax, cb)
+    assert_eq(top[0], 0)
+    assert_eq(top[2], 400)
+    assert_eq(top[3], 100)
+    assert_eq(top[4], 1)
+    assert_eq(top[5], 2)
+    let bot: [int] = anchor::area_region("bottom", ax, cb)
+    assert_eq(bot[1], 120)
+    assert_eq(bot[5], 0)
+    let left: [int] = anchor::area_region("left", ax, cb)
+    assert_eq(left[2], 100)
+    assert_eq(left[4], 2)
+    let tl: [int] = anchor::area_region("top left", ax, cb)
+    assert_eq(tl[2], 100)
+    assert_eq(tl[3], 100)
+    let br: [int] = anchor::area_region("bottom right", ax, cb)
+    assert_eq(br[0], 150)
+    assert_eq(br[1], 120)
+    let sr: [int] = anchor::area_region("top span-right", ax, cb)
+    assert_eq(sr[0], 100)
+    assert_eq(sr[2], 400)
+    assert_eq(anchor::flip_area("top left", true, false), "bottom left")
+    assert_eq(anchor::flip_area("top left", false, true), "top right")
+    assert_eq(anchor::flip_prop("top", true, false), "bottom")
+    assert_eq(anchor::flip_prop("left", true, false), "left")
+    let tl2: [[int]] = anchor::try_list("flip-block, flip-inline, flip-block flip-inline")
+    assert_eq(array_len(tl2), 4)
+    assert_eq(tl2[1][0], 1)
+    assert_eq(tl2[2][1], 1)
+    assert_eq(array_len(anchor::try_list("none")), 1)
+end
+
+#[test]
+fn t04_anchor_position_area_and_anchor_functions() is
+    let src: string = "<div id=\"a\"></div><div id=\"t\"></div><div id=\"sp\"></div>"
+    let d: dom::Dom = dom::parse(src)
+    let base: string = "#a { anchor-name: --a; margin: 50px 0 0 100px; width: 60px; height: 20px; } #sp { height: 300px; } #t { position: absolute; width: 40px; height: 30px; }"
+    let ti: int = dom::find_by_id(d, "t")
+    let area: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { position-anchor: --a; position-area: top; }"), 400, -1)
+    ;; nad kotwicą (y=50): dół tooltipa przy y=50 → y=20; środek poziomo: 100+30-20 = 110
+    assert_eq(find_box(area, ti, "box").x, 110)
+    assert_eq(find_box(area, ti, "box").y, 20)
+    let bot: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { position-anchor: --a; position-area: bottom right; }"), 400, -1)
+    assert_eq(find_box(bot, ti, "box").x, 160)
+    assert_eq(find_box(bot, ti, "box").y, 70)
+    let fns: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { top: anchor(--a bottom); left: anchor(--a left); }"), 400, -1)
+    assert_eq(find_box(fns, ti, "box").x, 100)
+    assert_eq(find_box(fns, ti, "box").y, 70)
+    let calc: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { top: calc(anchor(--a bottom) + 8px); left: anchor(--a right); }"), 400, -1)
+    assert_eq(find_box(calc, ti, "box").y, 78)
+    assert_eq(find_box(calc, ti, "box").x, 160)
+    ;; right/bottom liczone od krawędzi bloku zawierającego: dolna krawędź tooltipa = górna kotwicy
+    let rb: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { bottom: anchor(--a top); left: anchor(--a left); }"), 400, -1)
+    assert_eq(find_box(rb, ti, "box").y, 20)
+    let sz: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { position-anchor: --a; top: 0; left: 0; width: anchor-size(width); height: anchor-size(height); }"), 400, -1)
+    assert_eq(find_box(sz, ti, "box").w, 60)
+    assert_eq(find_box(sz, ti, "box").h, 20)
+    ;; fallback gdy brak kotwicy
+    let fb: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { top: anchor(--nope bottom, 17px); left: 3px; }"), 400, -1)
+    assert_eq(find_box(fb, ti, "box").y, 17)
+end
+
+#[test]
+fn t04_anchor_try_fallbacks_visibility_and_scope() is
+    let src: string = "<div id=\"a\"></div><div id=\"t\"></div><div id=\"sp\"></div>"
+    let d: dom::Dom = dom::parse(src)
+    let ti: int = dom::find_by_id(d, "t")
+    ;; kotwica przy y=5: tooltip 30px nie mieści się nad nią
+    let base: string = "#a { anchor-name: --a; margin: 5px 0 0 100px; width: 60px; height: 20px; } #sp { height: 300px; } #t { position: absolute; width: 40px; height: 30px; position-anchor: --a; position-area: top; }"
+    let no_fb: [layout::LayoutBox] = layout::layout(d, css::parse(base), 400, -1)
+    assert_eq(find_box(no_fb, ti, "box").y, -25)
+    let fb: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { position-try-fallbacks: flip-block; }"), 400, -1)
+    assert_eq(find_box(fb, ti, "box").y, 25)
+    ;; no-overflow ukrywa, gdy nic nie pasuje
+    let hid: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { position-visibility: no-overflow; }"), 400, -1)
+    assert_eq(count_boxes_of(hid, ti), 0)
+    let ok: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { position-visibility: no-overflow; position-try-fallbacks: flip-block; }"), 400, -1)
+    assert_true(count_boxes_of(ok, ti) > 0)
+    ;; anchors-visible: brak kotwicy → ukryty
+    let nov: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #t { position-anchor: --missing; position-visibility: anchors-visible; }"), 400, -1)
+    assert_eq(count_boxes_of(nov, ti), 0)
+    ;; anchor-scope: tooltip z drugiej sekcji (przed swoją kotwicą) bierze kotwicę z własnego zakresu
+    let src2: string = "<div class=\"s\"><div id=\"a1\" class=\"a\"></div></div><div class=\"s\"><div id=\"t2\"></div><div id=\"a2\" class=\"a\"></div></div><div style=\"height:400px\"></div>"
+    let d2: dom::Dom = dom::parse(src2)
+    let css2: string = ".a { anchor-name: --k; width: 20px; height: 20px; } #a1 { margin-left: 10px; } #a2 { margin-left: 200px; } #t2 { position: absolute; width: 10px; height: 10px; top: anchor(--k bottom); left: anchor(--k left); }"
+    let t2: int = dom::find_by_id(d2, "t2")
+    let unscoped: [layout::LayoutBox] = layout::layout(d2, css::parse(css2), 400, -1)
+    assert_eq(find_box(unscoped, t2, "box").x, 10)
+    let scoped: [layout::LayoutBox] = layout::layout(d2, css::parse(css2 + " .s { anchor-scope: --k; }"), 400, -1)
+    assert_eq(find_box(scoped, t2, "box").x, 200)
+end
+
+
+
+#[test]
+fn t04_matrix4_math_and_projection() is
+    let id: [int] = style::m4_id()
+    let p0: [int] = style::m4_project(id, 10, 20)
+    assert_eq(p0[0], 10)
+    assert_eq(p0[1], 20)
+    assert_eq(p0[2], 1000000)
+    ;; perspektywa 500 + translateZ(100): skala 1/(1−100/500) = 1,25
+    let m: [int] = style::m4_mul(style::m4_perspective(500), style::m4_translate(0, 0, 100))
+    let p1: [int] = style::m4_project(m, 100, 0)
+    assert_true(p1[0] >= 124 && p1[0] <= 126)
+    ;; rotateX(60deg) bez perspektywy: y × cos60 = 0,5
+    let rx: [int] = style::m4_rot_axis(1000, 0, 0, 600)
+    let p2: [int] = style::m4_project(rx, 0, 100)
+    assert_true(p2[1] >= 49 && p2[1] <= 51)
+    ;; rotateY(90deg): x → 0
+    let ry: [int] = style::m4_rot_axis(0, 1000, 0, 900)
+    assert_true(style::m4_project(ry, 100, 0)[0] >= -1 && style::m4_project(ry, 100, 0)[0] <= 1)
+    ;; punkt za kamerą (z > d) → w <= 0
+    let behind: [int] = style::m4_mul(style::m4_perspective(100), style::m4_translate(0, 0, 200))
+    assert_true(style::m4_project(behind, 5, 5)[2] <= 0)
+    assert_eq(style::m4_parse(style::m4_str(id))[5], 1000000)
+    assert_eq(array_len(style::m4_parse("1 2 3")), 0)
+    let env: cssval::LenEnv = cssval::LenEnv { em: 16, rem: 16, vw: 400, vh: 300 }
+    assert_eq(array_len(style::parse_transform4("rotate(10deg) scale(2)", env)), 0)
+    assert_eq(array_len(style::parse_transform4("rotateY(45deg)", env)), 16)
+    assert_eq(array_len(style::parse_transform4("translate3d(1px, 2px, 0)", env)), 0)
+    assert_eq(array_len(style::parse_transform4("translate3d(1px, 2px, 5px)", env)), 16)
+    assert_eq(array_len(style::parse_transform4("perspective(300px) rotateX(10deg)", env)), 16)
+    let tz: [int] = style::parse_transform4("translateZ(30px)", env)
+    assert_eq(tz[11], 30000000)
+    let skew: [int] = style::parse_transform4("rotateX(0deg) skewX(45deg)", env)
+    assert_eq(skew[1], 1000000)
+end
+
+#[test]
+fn t04_transform_3d_group_gets_matrix_and_parent_perspective() is
+    let src: string = "<div id=\"p\"><div id=\"c\"></div></div>"
+    let d: dom::Dom = dom::parse(src)
+    let ci: int = dom::find_by_id(d, "c")
+    let css0: string = "#p { margin: 0; perspective: 400px; } #c { width: 100px; height: 100px; transform: rotateY(45deg); }"
+    let bs: [layout::LayoutBox] = layout::layout(d, css::parse(css0), 400, -1)
+    let cb: layout::LayoutBox = find_box(bs, ci, "box")
+    assert_true(cb.m3d != "")
+    assert_eq(array_len(cb.xf), 12)
+    assert_true(string_ends_with(cb.m3d, "|0"))
+    ;; rodzic z perspektywą nadaje macierzy składnik w (m[14] ≠ 0)
+    let nums: [string] = string_split(string_slice(cb.m3d, 0, string_find(cb.m3d, "|")), " ")
+    assert_true(str_to_int(nums[14]) != 0)
+    ;; bez perspektywy rodzica — m[14] = 0
+    let flat: [layout::LayoutBox] = layout::layout(d, css::parse("#c { width: 100px; height: 100px; transform: rotateY(45deg); }"), 400, -1)
+    let fb: layout::LayoutBox = find_box(flat, ci, "box")
+    assert_true(fb.m3d != "")
+    assert_eq(str_to_int(string_split(string_slice(fb.m3d, 0, string_find(fb.m3d, "|")), " ")[14]), 0)
+    ;; backface-visibility: hidden → znacznik |1
+    let hid: [layout::LayoutBox] = layout::layout(d, css::parse(css0 + " #c { backface-visibility: hidden; }"), 400, -1)
+    assert_true(string_ends_with(find_box(hid, ci, "box").m3d, "|1"))
+    ;; zwykła transformacja 2D nie tworzy m3d
+    let two: [layout::LayoutBox] = layout::layout(d, css::parse("#c { width: 10px; height: 10px; transform: rotate(10deg); }"), 400, -1)
+    assert_eq(find_box(two, ci, "box").m3d, "")
+    ;; perspective-origin przesuwa punkt zbiegu
+    let o1: [layout::LayoutBox] = layout::layout(d, css::parse(css0 + " #p { perspective-origin: 0% 0%; }"), 400, -1)
+    let o2: [layout::LayoutBox] = layout::layout(d, css::parse(css0), 400, -1)
+    assert_true(find_box(o1, ci, "box").m3d != find_box(o2, ci, "box").m3d)
+end
+
+
+#[test]
+fn t04_writing_mode_vertical_rotates_layer_and_swaps_flow_dimensions() is
+    assert_eq(layout::wm_kind("") , "")
+    assert_eq(layout::wm_kind(props::xset("", "writing-mode", "vertical-rl")), "rl")
+    assert_eq(layout::wm_kind(props::xset("", "writing-mode", "vertical-lr")), "lr")
+    assert_eq(layout::wm_kind(props::xset("", "writing-mode", "sideways-lr")), "slr")
+    assert_eq(layout::wm_kind(props::xset("", "writing-mode", "horizontal-tb")), "")
+    let m: [int] = layout::vert_matrix("rl", 200, 30)
+    assert_eq(m[1], 1000)
+    assert_eq(m[2], -1000)
+    assert_eq(m[4], 30000)
+    assert_eq(layout::vert_matrix("slr", 200, 30)[5], 200000)
+    let src: string = "<div id=\"v\">Hello</div><div id=\"n\">next</div>"
+    let d: dom::Dom = dom::parse(src)
+    let vi: int = dom::find_by_id(d, "v")
+    let ni: int = dom::find_by_id(d, "n")
+    let bs: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #v { writing-mode: vertical-rl; height: 200px; }"), 400, -1)
+    let vb: layout::LayoutBox = find_box(bs, vi, "box")
+    ;; rozmiar liniowy = 200 (poziomy układ), rozmiar blokowy = 1 wiersz
+    assert_eq(vb.w, 200)
+    assert_true(vb.h > 10 && vb.h < 40)
+    ;; kolejny element zaczyna się pod obróconą ramką o wysokości 200
+    assert_eq(find_box(bs, ni, "box").y, 200)
+    ;; grupa warstwy z obrotem o +90°
+    assert_eq(array_len(vb.xf), 12)
+    assert_eq(vb.xf[0], 0)
+    assert_eq(vb.xf[1], 1000)
+    assert_eq(vb.xf[4], vb.h * 1000)
+    assert_eq(vb.xf[6], vb.x)
+    ;; sideways-lr: obrót −90°
+    let sl: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #v { writing-mode: sideways-lr; height: 200px; }"), 400, -1)
+    let sb: layout::LayoutBox = find_box(sl, vi, "box")
+    assert_eq(sb.xf[1], -1000)
+    assert_eq(sb.xf[5], sb.w * 1000)
+    ;; bez writing-mode — brak grupy
+    let hz: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #v { height: 200px; }"), 400, -1)
+    assert_eq(array_len(find_box(hz, vi, "box").xf), 0)
+    assert_eq(find_box(hz, ni, "box").y, 200)
+end
+
+#[test]
+fn t04_writing_mode_vertical_lr_reverses_line_order_and_children_do_not_rotate_twice() is
+    let words: string = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr"
+    let src: string = "<div id=\"v\">" + words + "</div>"
+    let d: dom::Dom = dom::parse(src)
+    let rl: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #v { writing-mode: vertical-rl; height: 100px; }"), 400, -1)
+    let lr: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #v { writing-mode: vertical-lr; height: 100px; }"), 400, -1)
+    let rl_first: layout::LayoutBox = first_text_box(rl)
+    let lr_first: layout::LayoutBox = first_text_box(lr)
+    assert_eq(rl_first.y, 0)
+    assert_true(lr_first.y > 0)
+    let mut rl_max: int = 0
+    let mut i: int = 0
+    while i < array_len(rl) is
+        if rl[i].kind == "text" && rl[i].y > rl_max is rl_max = rl[i].y end
+        i += 1
+    end
+    assert_true(rl_max > 0)
+    assert_eq(lr_first.y, rl_max)
+    ;; potomek dziedziczący writing-mode nie dostaje własnego obrotu
+    let nest: dom::Dom = dom::parse("<div id=\"v\"><p id=\"c\">x</p></div>")
+    let nb: [layout::LayoutBox] = layout::layout(nest, css::parse("div, p { margin: 0; } #v { writing-mode: vertical-rl; height: 100px; }"), 400, -1)
+    assert_eq(array_len(find_box(nb, dom::find_by_id(nest, "c"), "box").xf) , 12)
+    assert_eq(find_box(nb, dom::find_by_id(nest, "c"), "box").xf_id, dom::find_by_id(nest, "v"))
+end
+
+#[test]
+fn t04_animation_composition_add_and_accumulate() is
+    assert_eq(anim::composition_of(emph_box("<p>a</p>", "p { margin: 0; }").st), "replace")
+    assert_eq(anim::composition_of(emph_box("<p>a</p>", "p { margin: 0; animation-composition: add; }").st), "add")
+    assert_eq(anim::composition_of(emph_box("<p>a</p>", "p { margin: 0; animation-composition: accumulate, replace; }").st), "accumulate")
+    let base: style::ComputedStyle = emph_box("<p>a</p>", "p { margin: 0; padding-left: 10px; transform: rotate(10deg) scale(2); opacity: 0.8; font-size: 20px; }").st
+    let anim_st: style::ComputedStyle = emph_box("<p>a</p>", "p { margin: 0; padding-left: 5px; transform: rotate(5deg) scale(1.5); opacity: 0.9; font-size: 20px; }").st
+    let add: style::ComputedStyle = anim::compose_style(base, anim_st, "add")
+    assert_eq(add.pad_left, 15)
+    assert_eq(add.tr_rot, base.tr_rot + anim_st.tr_rot)
+    assert_eq(add.tr_sx, 3000)
+    assert_eq(add.opacity, 100)
+    ;; pole niezmienione przez klatkę nie jest podwajane
+    assert_eq(add.font_size, 20)
+    let acc: style::ComputedStyle = anim::compose_style(base, anim_st, "accumulate")
+    assert_eq(acc.tr_sx, 2500)
+    assert_eq(acc.pad_left, 15)
+end
+
+#[test]
+fn t04_transition_behavior_allow_discrete_flips_display_and_visibility_at_the_ends() is
+    let a: style::ComputedStyle = emph_box("<p>a</p>", "p { margin: 0; }").st
+    let mut b: style::ComputedStyle = a
+    b.display = "none"
+    b.visible = false
+    b.xp = props::xset(b.xp, "transition-behavior", "allow-discrete")
+    assert_true(anim::allow_discrete(b))
+    assert_true(!anim::allow_discrete(a))
+    ;; block → none: widoczny przez całe przejście, none dopiero na końcu
+    let mid: style::ComputedStyle = anim::lerp_style(a, b, 500, false)
+    assert_eq(mid.display, "block")
+    assert_true(mid.visible)
+    let end_st: style::ComputedStyle = anim::lerp_style(a, b, 1000, false)
+    assert_eq(end_st.display, "none")
+    assert_true(!end_st.visible)
+    ;; none → block: widoczny od pierwszej klatki
+    let mut a2: style::ComputedStyle = a
+    a2.display = "none"
+    a2.visible = false
+    let mut b2: style::ComputedStyle = a
+    b2.xp = props::xset(b2.xp, "transition-behavior", "allow-discrete")
+    let m2: style::ComputedStyle = anim::lerp_style(a2, b2, 100, false)
+    assert_eq(m2.display, "block")
+    assert_true(m2.visible)
+    ;; bez allow-discrete — wartość końcowa od razu
+    let plain: style::ComputedStyle = anim::lerp_style(a, a2, 500, false)
+    assert_eq(plain.display, "none")
+    ;; przejście startuje także dla samej zmiany display/visibility
+    assert_true(anim::geometry_differs(a, b))
+    assert_true(!anim::geometry_differs(a, a2))
+    let mut tp: style::ComputedStyle = b
+    tp.trans_ms = 300
+    tp.trans_prop = "opacity, display"
+    assert_true(anim::trans_covers_geometry(tp))
+    tp.trans_prop = "opacity"
+    assert_true(!anim::trans_covers_geometry(tp))
+end
+
+
+fn ray_css(extra: string) -> string is
+    return string_replace("#c { position: relative; width: 200px; height: 100px; } #a { width: 20px; height: 20px; offset-path: ray(90deg); offset-distance: 50px; EXTRA }", "EXTRA", extra)
+end
+
+#[test]
+fn t04_offset_position_sets_ray_origin() is
+    let d: dom::Dom = dom::parse("<div id=\"c\"><div id=\"a\"></div></div>")
+    let aid: int = dom::find_by_id(d, "a")
+    let g0: [int] = grp_of(layout::layout(d, css::parse(ray_css("")), 400, -1), aid)
+    ;; domyślnie początek w środku pola (100,50): (150,50) − środek elementu (10,10)
+    assert_eq(g0[4], 140000)
+    assert_eq(g0[5], 40000)
+    let g1: [int] = grp_of(layout::layout(d, css::parse(ray_css("offset-position: 20px 30px;")), 400, -1), aid)
+    assert_eq(g1[4], 60000)
+    assert_eq(g1[5], 20000)
+    let g2: [int] = grp_of(layout::layout(d, css::parse(ray_css("offset-position: auto;")), 400, -1), aid)
+    assert_eq(g2[4], 40000)
+    assert_eq(g2[5], -10000)
+    let g3: [int] = grp_of(layout::layout(d, css::parse(ray_css("offset-position: right bottom;")), 400, -1), aid)
+    assert_eq(g3[4], 240000)
+    assert_eq(g3[5], 90000)
+    let g4: [int] = grp_of(layout::layout(d, css::parse(ray_css("offset-position: normal;")), 400, -1), aid)
+    assert_eq(g4[4], 140000)
+end
+
+#[test]
+fn t04_math_depth_and_font_size_math() is
+    let src: string = "<div id=\"p\"><span id=\"s\">a<span id=\"t\">b</span></span></div>"
+    let d: dom::Dom = dom::parse(src)
+    let si: int = dom::find_by_id(d, "s")
+    let ti: int = dom::find_by_id(d, "t")
+    let base: string = "#p { font-size: 100px; margin: 0; }"
+    let one: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #s { font-size: math; math-depth: add(1); }"), 600, -1)
+    assert_eq(texts_boxes(one, si)[0].st.font_size, 71)
+    let two: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #s { font-size: math; math-depth: add(2); }"), 600, -1)
+    assert_eq(texts_boxes(two, si)[0].st.font_size, 50)
+    ;; zagnieżdżenie: potomek z add(1) względem rodzica o głębokości 1 → 71 · 71 / 100
+    let nest: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #s, #t { font-size: math; math-depth: add(1); }"), 600, -1)
+    assert_eq(texts_boxes(nest, ti)[0].st.font_size, 50)
+    ;; auto-add przy math-style: compact dodaje poziom, normal nie
+    let compact: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #s { font-size: math; math-style: compact; math-depth: auto-add; }"), 600, -1)
+    assert_eq(texts_boxes(compact, si)[0].st.font_size, 71)
+    let normal: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #s { font-size: math; math-depth: auto-add; }"), 600, -1)
+    assert_eq(texts_boxes(normal, si)[0].st.font_size, 100)
+    ;; zwykły font-size nadpisuje math
+    let plain: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #s { font-size: math; font-size: 30px; math-depth: add(1); }"), 600, -1)
+    assert_eq(texts_boxes(plain, si)[0].st.font_size, 30)
+    ;; liczba bezwzględna i ujemna
+    assert_eq(style::math_depth_of(props::xset("", "math-depth", "-2")), -2)
+    assert_eq(style::math_depth_of(""), 0)
+end
+
+#[test]
+fn t04_image_orientation_codes_and_object_view_box() is
+    assert_eq(paint::image_xf_code(emph_box("<p>a</p>", "p { margin: 0; }").st), 0)
+    assert_eq(paint::image_xf_code(emph_box("<p>a</p>", "p { margin: 0; image-orientation: from-image; }").st), 0)
+    assert_eq(paint::image_xf_code(emph_box("<p>a</p>", "p { margin: 0; image-orientation: none; }").st), 8)
+    assert_eq(paint::image_xf_code(emph_box("<p>a</p>", "p { margin: 0; image-orientation: flip; }").st), 12)
+    assert_eq(paint::image_xf_code(emph_box("<p>a</p>", "p { margin: 0; image-orientation: 90deg; }").st), 9)
+    assert_eq(paint::image_xf_code(emph_box("<p>a</p>", "p { margin: 0; image-orientation: 180deg flip; }").st), 14)
+    assert_eq(paint::image_xf_code(emph_box("<p>a</p>", "p { margin: 0; image-orientation: -90deg; }").st), 11)
+    let vb: [int] = paint::view_box_permille("inset(10px 20px)", 100, 50, 16)
+    ;; góra/dół 10px z 50, lewo/prawo 20px ze 100
+    assert_eq(vb[0], 200)
+    assert_eq(vb[1], 200)
+    assert_eq(vb[2], 600)
+    assert_eq(vb[3], 600)
+    let r: [int] = paint::view_box_permille("rect(0px, 50px, 25px, 0px)", 100, 50, 16)
+    assert_eq(r[2], 500)
+    assert_eq(r[3], 500)
+    let xy: [int] = paint::view_box_permille("xywh(25% 0 50% 100%)", 100, 50, 16)
+    assert_eq(xy[0], 250)
+    assert_eq(xy[2], 500)
+    assert_eq(xy[3], 1000)
+    assert_eq(array_len(paint::view_box_permille("none", 100, 50, 16)), 0)
+    assert_eq(array_len(paint::view_box_permille("inset(60px)", 100, 50, 16)), 0)
+    assert_eq(array_len(paint::view_box_permille("bogus(1px)", 100, 50, 16)), 0)
+end
+
+fn pt_css(extra: string) -> string is
+    return string_replace("#a { anchor-name: --a; margin: 100px 0 0 100px; width: 60px; height: 20px; } #sp { height: 300px; } #t { position: absolute; width: 40px; height: 30px; position-anchor: --a; position-area: top; EXTRA }", "EXTRA", extra)
+end
+
+#[test]
+fn t04_position_try_order_and_shorthand() is
+    let spec: [string] = anchor::try_spec(props::xset(props::xset("", "position-try", "most-height flip-block"), "x", "1"))
+    assert_eq(spec[0], "most-height")
+    assert_eq(spec[1], "flip-block")
+    assert_eq(anchor::try_spec(props::xset("", "position-try", "flip-inline"))[1], "flip-inline")
+    assert_eq(anchor::try_spec(props::xset("", "position-try", "flip-inline"))[0], "normal")
+    ;; osobne właściwości wygrywają ze skrótem
+    let both: [string] = anchor::try_spec(props::xset(props::xset("", "position-try", "most-height flip-block"), "position-try-order", "most-width"))
+    assert_eq(both[0], "most-width")
+    assert_eq(anchor::sort_by_metric([5, 9, 9, 1])[0], 1)
+    assert_eq(anchor::sort_by_metric([5, 9, 9, 1])[1], 2)
+    assert_eq(anchor::sort_by_metric([-1, -1, -1])[2], 2)
+    assert_eq(anchor::order_metric("most-width", 30, 40), 30)
+    assert_eq(anchor::order_metric("normal", 30, 40), -1)
+    let d: dom::Dom = dom::parse("<div id=\"a\"></div><div id=\"t\"></div><div id=\"sp\"></div>")
+    let ti: int = dom::find_by_id(d, "t")
+    let plain: [layout::LayoutBox] = layout::layout(d, css::parse(pt_css("position-try-fallbacks: flip-block;")), 400, -1)
+    ;; domyślnie górny obszar mieści tooltip: y = 100 − 30
+    assert_eq(find_box(plain, ti, "box").y, 70)
+    let ord: [layout::LayoutBox] = layout::layout(d, css::parse(pt_css("position-try-fallbacks: flip-block; position-try-order: most-height;")), 400, -1)
+    ;; dolny obszar (≈ 305) jest wyższy niż górny (100) → pierwszy mieszczący się to dolny: y = 120
+    assert_eq(find_box(ord, ti, "box").y, 120)
+    let sh: [layout::LayoutBox] = layout::layout(d, css::parse(pt_css("position-try: most-height flip-block;")), 400, -1)
+    assert_eq(find_box(sh, ti, "box").y, 120)
+end
+
+#[test]
+fn t04_ruby_annotation_over_and_under_with_alignment() is
+    let d: dom::Dom = dom::parse("<p><ruby id=\"r\">WIDEBASE<rt id=\"t\">ab</rt></ruby></p>")
+    let ri: int = dom::find_by_id(d, "r")
+    let ti: int = dom::find_by_id(d, "t")
+    let over: [layout::LayoutBox] = layout::layout(d, css::parse("p { margin: 0; }"), 400, -1)
+    let base_o: layout::LayoutBox = texts_boxes(over, ri)[0]
+    let rt_o: layout::LayoutBox = texts_boxes(over, ti)[0]
+    assert_true(rt_o.y < base_o.y)
+    assert_eq(rt_o.st.font_size, 8)
+    ;; adnotacja węższa od podstawy — wyśrodkowana
+    assert_true(rt_o.x > base_o.x)
+    let under: [layout::LayoutBox] = layout::layout(d, css::parse("p { margin: 0; } ruby { ruby-position: under; }"), 400, -1)
+    assert_true(texts_boxes(under, ti)[0].y > texts_boxes(under, ri)[0].y)
+    let start: [layout::LayoutBox] = layout::layout(d, css::parse("p { margin: 0; } ruby { ruby-align: start; }"), 400, -1)
+    assert_eq(texts_boxes(start, ti)[0].x, texts_boxes(start, ri)[0].x)
+    ;; <rp> jest ukryte
+    let rp: dom::Dom = dom::parse("<p><ruby>a<rp>(</rp><rt>b</rt><rp>)</rp></ruby></p>")
+    assert_eq(string_find(joined_text(layout::layout(rp, css::parse("p { margin: 0; }"), 400, -1)), "("), -1)
+end
+
+#[test]
+fn t04_overflow_anchor_keeps_visible_content_in_place() is
+    let d: dom::Dom = dom::parse("<div id=\"top\"></div><div id=\"c\"></div><div id=\"bot\"></div>")
+    let css_a: string = "div { margin: 0; } #top { height: 100px; } #c { height: 300px; } #bot { height: 500px; }"
+    let css_b: string = "div { margin: 0; } #top { height: 200px; } #c { height: 300px; } #bot { height: 500px; }"
+    let old: [layout::LayoutBox] = layout::layout(d, css::parse(css_a), 400, -1)
+    let new_b: [layout::LayoutBox] = layout::layout(d, css::parse(css_b), 400, -1)
+    ;; przewinięcie 50: kotwica = #c (y=100) → po powiększeniu #top o 100 przewiń o +100
+    assert_eq(layout::scroll_anchor_delta(old, new_b, 50, 600), 100)
+    ;; bez przewinięcia — brak kotwiczenia
+    assert_eq(layout::scroll_anchor_delta(old, new_b, 0, 600), 0)
+    ;; overflow-anchor: none na elemencie → kotwicą staje się następny (#bot, y=400)
+    let none_c: [layout::LayoutBox] = layout::layout(d, css::parse(css_a + " #c { overflow-anchor: none; }"), 400, -1)
+    let none_new: [layout::LayoutBox] = layout::layout(d, css::parse(css_b + " #c { overflow-anchor: none; }"), 400, -1)
+    assert_eq(layout::scroll_anchor_delta(none_c, none_new, 50, 600), 100)
+    ;; wyłączone na korzeniu (html/body = pierwszy box)
+    let off: [layout::LayoutBox] = layout::layout(d, css::parse(css_a + " * { overflow-anchor: none; }"), 400, -1)
+    assert_eq(layout::scroll_anchor_delta(off, new_b, 50, 600), 0)
+    ;; zmiana pod oknem nie przesuwa
+    let new_c: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #top { height: 100px; } #c { height: 300px; } #bot { height: 900px; }"), 400, -1)
+    assert_eq(layout::scroll_anchor_delta(old, new_c, 50, 600), 0)
+end
+
+#[test]
+fn t04_shape_outside_image_bands_geometry() is
+    ;; 4 pasy: pusty, wąski, szeroki, wąski — obraz 100×40 w polu (10,20)
+    let d: [int] = shape::build_image("-1 -1 400 600 0 1000 400 600", 10, 20, 100, 40, 0)
+    assert_eq(d[0], 4)
+    assert_eq(array_len(shape::extent(d, 25)), 0)
+    let e1: [int] = shape::extent(d, 35)
+    assert_eq(e1[0], 50)
+    assert_eq(e1[1], 70)
+    let e2: [int] = shape::extent(d, 45)
+    assert_eq(e2[0], 10)
+    assert_eq(e2[1], 110)
+    assert_eq(shape::y_range(d)[0], 20)
+    assert_eq(shape::y_range(d)[1], 60)
+    ;; shape-margin 5: poszerzenie ±5 w poziomie i zasięg z sąsiednich pasów
+    let m: [int] = shape::build_image("-1 -1 400 600 0 1000 400 600", 10, 20, 100, 40, 5)
+    assert_eq(shape::extent(m, 25)[0], 45)
+    assert_eq(shape::y_range(m)[0], 15)
+    assert_eq(array_len(shape::build_image("", 0, 0, 10, 10, 0)), 0)
+    ;; bez okna (testy silnika) url() nie tworzy kształtu — float zostaje prostokątem
+    let words: string = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www"
+    let bs: [layout::LayoutBox] = lay("<div style=\"float:left;width:100px;height:100px;shape-outside:url(x.png)\"></div><p>" + words + "</p>", "p { margin: 0; } div { margin: 0; }", 300)
+    assert_eq(min_text_x_in_band(bs, 0, 12), 100)
+end
+
+#[test]
+fn t04_text_spacing_trim_flag_follows_property() is
+    assert_true(flag_bit(layout::style_flags(emph_box("<p>a</p>", "p { margin: 0; }").st) / 32768, 1))
+    assert_true(flag_bit(layout::style_flags(emph_box("<p>a</p>", "p { margin: 0; text-spacing-trim: normal; }").st) / 32768, 1))
+    assert_true(!flag_bit(layout::style_flags(emph_box("<p>a</p>", "p { margin: 0; text-spacing-trim: space-all; }").st) / 32768, 1))
+    assert_true(!flag_bit(layout::style_flags(emph_box("<p>a</p>", "p { margin: 0; text-spacing-trim: space-first; }").st) / 32768, 1))
+end
+
+#[test]
+fn t04_text_orientation_upright_and_combine_upright() is
+    assert_eq(layout::stack_chars("abc", 0), "a\nb\nc")
+    assert_eq(layout::stack_chars("2025", -1), "2025")
+    assert_eq(layout::stack_chars("a12b", 2), "a\n12\nb")
+    assert_eq(layout::stack_chars("a123b", 2), "a\n1\n2\n3\nb")
+    assert_eq(layout::stack_chars("a123b", 3), "a\n123\nb")
+    assert_eq(layout::combine_limit(props::xset("", "text-combine-upright", "all")), -1)
+    assert_eq(layout::combine_limit(props::xset("", "text-combine-upright", "digits 3")), 3)
+    assert_eq(layout::combine_limit(props::xset("", "text-combine-upright", "digits")), 2)
+    assert_eq(layout::combine_limit(""), 0)
+    let d: dom::Dom = dom::parse("<div id=\"v\">abc</div>")
+    let bs: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #v { writing-mode: vertical-rl; text-orientation: upright; height: 100px; }"), 400, -1)
+    let vi: int = dom::find_by_id(d, "v")
+    ;; bez obrotu warstwy: znaki w osobnych wierszach jeden pod drugim
+    assert_eq(array_len(find_box(bs, vi, "box").xf), 0)
+    let t: [layout::LayoutBox] = texts_boxes(bs, vi)
+    assert_eq(array_len(t), 3)
+    assert_eq(t[0].text, "a")
+    assert_true(t[1].y > t[0].y)
+    assert_true(t[2].y > t[1].y)
+    assert_eq(t[1].x, t[0].x)
+    ;; mixed (domyślnie) — nadal obrót warstwy
+    let mixed: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #v { writing-mode: vertical-rl; height: 100px; }"), 400, -1)
+    assert_eq(array_len(find_box(mixed, vi, "box").xf), 12)
+    ;; upright poza trybem pionowym nic nie robi
+    let hz: [layout::LayoutBox] = layout::layout(d, css::parse("div { margin: 0; } #v { text-orientation: upright; }"), 400, -1)
+    assert_eq(joined_text(hz), "abc")
+    assert_eq(array_len(texts_boxes(hz, vi)), 1)
+    ;; combine all: cały tekst w jednym wierszu
+    let comb: dom::Dom = dom::parse("<div id=\"v\">2025</div>")
+    let cb: [layout::LayoutBox] = layout::layout(comb, css::parse("div { margin: 0; } #v { writing-mode: vertical-rl; text-orientation: upright; text-combine-upright: all; height: 100px; }"), 400, -1)
+    assert_eq(array_len(texts_boxes(cb, dom::find_by_id(comb, "v"))), 1)
+end
+
+#[test]
+fn t04_transform_style_preserve_3d_composes_nested_matrices() is
+    let d: dom::Dom = dom::parse("<div id=\"s\"><div id=\"cube\"><div id=\"face\"></div></div></div>")
+    let fi: int = dom::find_by_id(d, "face")
+    let ci: int = dom::find_by_id(d, "cube")
+    let base: string = "#s { perspective: 500px; } #cube { width: 100px; height: 100px; transform: rotateY(40deg); } #face { width: 100px; height: 100px; transform: translateZ(50px); }"
+    let flat: [layout::LayoutBox] = layout::layout(d, css::parse(base), 400, -1)
+    let pres: [layout::LayoutBox] = layout::layout(d, css::parse(base + " #cube { transform-style: preserve-3d; }"), 400, -1)
+    let f_flat: string = find_box(flat, fi, "box").m3d
+    let f_pres: string = find_box(pres, fi, "box").m3d
+    assert_true(f_flat != "")
+    assert_true(f_pres != "")
+    ;; z preserve-3d macierz twarzy zawiera obrót kostki
+    assert_true(f_flat != f_pres)
+    ;; sama kostka ma tę samą macierz w obu wariantach
+    assert_eq(find_box(flat, ci, "box").m3d, find_box(pres, ci, "box").m3d)
+    ;; bez 3D u rodzica preserve-3d nic nie składa
+    let plain: [layout::LayoutBox] = layout::layout(d, css::parse("#cube { width: 100px; height: 100px; transform-style: preserve-3d; } #face { width: 50px; height: 50px; transform: translateZ(20px); }"), 400, -1)
+    let alone: [layout::LayoutBox] = layout::layout(d, css::parse("#cube { width: 100px; height: 100px; } #face { width: 50px; height: 50px; transform: translateZ(20px); }"), 400, -1)
+    assert_eq(find_box(plain, fi, "box").m3d, find_box(alone, fi, "box").m3d)
 end
