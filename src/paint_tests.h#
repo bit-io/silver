@@ -9,6 +9,9 @@ mod anim
 mod layout
 mod gfx
 mod paint
+mod paged
+use "std -> fs" from "fs"
+use "std -> process" from "process"
 
 ;; Testy end-to-end rysowania: H# (layout + paint) → prawdziwy shim SDL (renderer programowy) → odczyt pikseli.
 ;; Uruchamianie: tools/run_paint_tests.sh (Xvfb + HRUN_SHIM=libsilvershim.so)
@@ -834,4 +837,616 @@ fn e2e_transform_style_preserve_3d_nested_face_faces_camera() is
     let flat: int = shot(d0, base, 220, 130)
     assert_true(red_of(ffi_shim::silver_pixel(flat, 150, 50)) > 200)
     ffi_shim::silver_window_close(flat)
+end
+
+
+;; ====================== 0.4: efekty SVG — clip-rule, mask-type, filtry (flood-*, lighting-color, color-interpolation-filters) ======================
+fn svg_px(html: string, css_text: string, x: int, y: int) -> int is
+    let win: int = shot(html, css_text, 200, 100)
+    let p: int = ffi_shim::silver_pixel(win, x, y)
+    ffi_shim::silver_window_close(win)
+    return p
+end
+
+fn is_white(p: int) -> bool is
+    return red_of(p) > 250 && green_of(p) > 250 && blue_of(p) > 250
+end
+
+#[test]
+fn e2e_svg_clip_rule_evenodd_and_nonzero() is
+    let html: string = "<svg width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><defs><clipPath id=\"c\"><path d=\"M0 0H100V50H0Z M30 10H70V40H30Z\" clip-rule=\"evenodd\"/></clipPath></defs><rect width=\"100\" height=\"50\" fill=\"#ff0000\" clip-path=\"url(#c)\"/></svg>"
+    let a: int = svg_px(html, "", 10, 25)
+    assert_true(red_of(a) > 250 && green_of(a) < 5)
+    assert_true(is_white(svg_px(html, "", 50, 25)))
+    ;; własność CSS wygrywa z atrybutem: nonzero wypełnia środek
+    let b: int = svg_px(html, "path { clip-rule: nonzero; }", 50, 25)
+    assert_true(red_of(b) > 250 && green_of(b) < 5)
+end
+
+#[test]
+fn e2e_svg_mask_type_luminance_and_alpha() is
+    let html: string = "<svg width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><defs><mask id=\"m\"><rect width=\"50\" height=\"50\" fill=\"#000000\"/></mask></defs><rect width=\"100\" height=\"50\" fill=\"#00ff00\" mask=\"url(#m)\"/></svg>"
+    ;; domyślnie luminance: czarna maska ukrywa
+    assert_true(is_white(svg_px(html, "", 25, 25)))
+    ;; mask-type: alpha — liczy się tylko krycie maski
+    let a: int = svg_px(html, "mask { mask-type: alpha; }", 25, 25)
+    assert_true(green_of(a) > 250 && red_of(a) < 5)
+    assert_true(is_white(svg_px(html, "mask { mask-type: alpha; }", 75, 25)))
+end
+
+#[test]
+fn e2e_svg_flood_color_and_opacity() is
+    let html: string = "<svg width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><defs><filter id=\"f\"><feFlood id=\"fl\" flood-color=\"#0000ff\"/></filter></defs><rect x=\"20\" y=\"10\" width=\"60\" height=\"30\" fill=\"#00ff00\" filter=\"url(#f)\"/></svg>"
+    let a: int = svg_px(html, "", 50, 25)
+    assert_true(blue_of(a) > 250 && green_of(a) < 5 && red_of(a) < 5)
+    assert_true(is_white(svg_px(html, "", 5, 25)))
+    let b: int = svg_px(html, "#fl { flood-color: #ff0000; }", 50, 25)
+    assert_true(red_of(b) > 250 && green_of(b) < 5 && blue_of(b) < 5)
+    ;; flood-opacity: 0.5 nad białym tłem
+    let c: int = svg_px(html, "#fl { flood-color: #000000; flood-opacity: 0.5; }", 50, 25)
+    assert_true(red_of(c) > 120 && red_of(c) < 135)
+end
+
+#[test]
+fn e2e_svg_color_interpolation_filters() is
+    let pre: string = "<svg width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><defs><filter id=\"f\"><feFlood flood-color=\"#ffffff\" result=\"w\"/><feFlood flood-color=\"#000000\" result=\"k\"/><feComposite id=\"cp\" in=\"w\" in2=\"k\" operator=\"arithmetic\" k2=\"0.5\" k3=\"0.5\"/></filter></defs><rect x=\"20\" y=\"10\" width=\"60\" height=\"30\" fill=\"#00ff00\" filter=\"url(#f)\"/></svg>"
+    ;; domyślnie linearRGB: połowa w przestrzeni liniowej ≈ 188 w sRGB
+    let a: int = svg_px(pre, "", 50, 25)
+    assert_true(red_of(a) > 185 && red_of(a) < 192)
+    ;; sRGB: 128
+    let b: int = svg_px(pre, "#cp { color-interpolation-filters: sRGB; }", 50, 25)
+    assert_true(red_of(b) > 125 && red_of(b) < 131)
+end
+
+#[test]
+fn e2e_svg_lighting_color() is
+    let html: string = "<svg width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><defs><filter id=\"f\"><feDiffuseLighting id=\"dl\" lighting-color=\"#ff0000\"><feDistantLight azimuth=\"0\" elevation=\"90\"/></feDiffuseLighting></filter></defs><rect x=\"20\" y=\"10\" width=\"60\" height=\"30\" fill=\"#00ff00\" filter=\"url(#f)\"/></svg>"
+    let a: int = svg_px(html, "", 50, 25)
+    assert_true(red_of(a) > 250 && green_of(a) < 5 && blue_of(a) < 5)
+    let b: int = svg_px(html, "#dl { lighting-color: #0000ff; }", 50, 25)
+    assert_true(blue_of(b) > 250 && red_of(b) < 5)
+end
+
+#[test]
+fn e2e_svg_effects_respect_ancestor_transform_and_order() is
+    ;; clip w układzie elementu: <g translate(20,0)> przesuwa też przycięcie
+    let html: string = "<svg width=\"100\" height=\"50\" viewBox=\"0 0 100 50\"><defs><clipPath id=\"c\"><rect x=\"0\" y=\"0\" width=\"20\" height=\"50\"/></clipPath></defs><rect width=\"100\" height=\"50\" fill=\"#0000ff\"/><g transform=\"translate(20,0)\"><rect width=\"60\" height=\"50\" fill=\"#ff0000\" clip-path=\"url(#c)\"/></g></svg>"
+    let inside: int = svg_px(html, "", 30, 25)
+    assert_true(red_of(inside) > 250 && blue_of(inside) < 5)
+    ;; poza przycięciem widać niebieskie tło narysowane wcześniej (kolejność malowania zachowana)
+    let outside: int = svg_px(html, "", 60, 25)
+    assert_true(blue_of(outside) > 250 && red_of(outside) < 5)
+end
+
+
+;; ====================== 0.4: font-variant-alternates / font-language-override / font-palette (HarfBuzz + FreeType) ======================
+;; Czcionki testowe: native/tests/fonts (python3 native/tests/gen_test_fonts.py). Uruchamiać z katalogu głównego repozytorium.
+fn shot_font(html: string, css_text: string, w: int, h: int, font_path: string) -> int is
+    let win: int = ffi_shim::silver_window_create("paint-test", w, h)
+    ffi_shim::silver_load_font(win, font_path, 100)
+    let d: dom::Dom = dom::parse(html)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), w, win)
+    paint::render(win, boxes, d, paint::plain_state(0), style::Color { r: 255, g: 255, b: 255, a: 255 })
+    return win
+end
+
+fn text_w(css_text: string, text: string) -> int is
+    return text_w_font("native/tests/fonts/silver-alt.ttf", css_text, text)
+end
+
+fn text_w_font(font_path: string, css_text: string, text: string) -> int is
+    let html: string = "<div style=\"font-size:100px;line-height:100px\"><span id=\"s\" style=\"display:inline-block\">" + text + "</span></div>"
+    let win: int = ffi_shim::silver_window_create("paint-test", 600, 200)
+    ffi_shim::silver_load_font(win, font_path, 100)
+    let d: dom::Dom = dom::parse(html)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), 600, win)
+    let w: int = pbox(boxes, dom::find_by_id(d, "s")).w
+    ffi_shim::silver_window_close(win)
+    return w
+end
+
+#[test]
+fn e2e_font_variant_alternates_selects_opentype_alternates() is
+    assert_eq(text_w("", "a"), 60)
+    assert_eq(text_w("#s { font-variant-alternates: stylistic(1); }", "a"), 100)           ;; salt
+    assert_eq(text_w("#s { font-variant-alternates: swash(1); }", "a"), 80)                ;; swsh
+    assert_eq(text_w("#s { font-variant-alternates: ornaments(1); }", "a"), 140)           ;; ornm
+    assert_eq(text_w("#s { font-variant-alternates: annotation(1); }", "a"), 130)          ;; nalt
+    assert_eq(text_w("#s { font-variant-alternates: historical-forms; }", "a"), 120)       ;; hist
+    assert_eq(text_w("#s { font-variant-alternates: styleset(1); }", "a"), 70)             ;; ss01
+    assert_eq(text_w("#s { font-variant-alternates: character-variant(1); }", "b"), 110)   ;; cv01
+    assert_eq(text_w("#s { font-variant-alternates: normal; }", "a"), 60)
+end
+
+#[test]
+fn e2e_font_variant_alternates_resolves_feature_value_names() is
+    let fv: string = "@font-feature-values SilverAlt { @swash { fancy: 1; } @styleset { nice: 1; other: 5; } } #s { font-family: SilverAlt; }"
+    assert_eq(text_w(fv + " #s { font-variant-alternates: swash(fancy); }", "a"), 80)
+    assert_eq(text_w(fv + " #s { font-variant-alternates: styleset(nice); }", "a"), 70)
+    ;; nieznana nazwa jest ignorowana
+    assert_eq(text_w(fv + " #s { font-variant-alternates: swash(missing); }", "a"), 60)
+    ;; inna rodzina: wartości z @font-feature-values innej rodziny nie obowiązują
+    assert_eq(text_w("@font-feature-values Other { @swash { fancy: 1; } } #s { font-family: SilverAlt; font-variant-alternates: swash(fancy); }", "a"), 60)
+end
+
+#[test]
+fn e2e_font_language_override_selects_language_system() is
+    assert_eq(text_w("#s { font-language-override: \"TRK\"; }", "a"), 90)
+    assert_eq(text_w("#s { font-language-override: \"ROM\"; }", "a"), 60)
+    assert_eq(text_w("#s { font-language-override: normal; }", "a"), 60)
+    ;; razem z alternatywami: obie cechy trafiają do HarfBuzza; kolejność wynika z indeksów lookupów w foncie
+    ;; testowym (swsh przed locl), więc a → a.swsh, a reguła locl dla TRK już nie pasuje
+    assert_eq(text_w("#s { font-language-override: \"TRK\"; font-variant-alternates: swash(1); }", "a"), 80)
+end
+
+fn color_px(css_text: string, x: int, y: int) -> int is
+    let html: string = "<div style=\"font-size:100px;line-height:100px;color:#000000\">a</div>"
+    let win: int = shot_font(html, css_text, 200, 200, "native/tests/fonts/silver-color.ttf")
+    let p: int = ffi_shim::silver_pixel(win, x, y)
+    ffi_shim::silver_window_close(win)
+    return p
+end
+
+#[test]
+fn e2e_font_palette_selects_cpal_palette_and_overrides() is
+    ;; domyślnie paleta 0: lewa połowa glifu czerwona, prawa zielona
+    let a: int = color_px("", 10, 60)
+    assert_true(red_of(a) > 250 && green_of(a) < 5 && blue_of(a) < 5)
+    let b: int = color_px("", 40, 60)
+    assert_true(green_of(b) > 250 && red_of(b) < 5)
+    ;; font-palette: dark → paleta oznaczona dla ciemnego tła (niebieski + żółty)
+    let c: int = color_px("div { font-palette: dark; }", 10, 60)
+    assert_true(blue_of(c) > 250 && red_of(c) < 5)
+    let d: int = color_px("div { font-palette: dark; }", 40, 60)
+    assert_true(red_of(d) > 250 && green_of(d) > 250 && blue_of(d) < 5)
+    ;; light → paleta 0
+    assert_true(red_of(color_px("div { font-palette: light; }", 10, 60)) > 250)
+    ;; @font-palette-values: base-palette + override-colors
+    let o: string = "@font-palette-values --Mix { base-palette: 1; override-colors: 0 #ff00ff; } div { font-palette: --Mix; }"
+    let e: int = color_px(o, 10, 60)
+    assert_true(red_of(e) > 250 && blue_of(e) > 250 && green_of(e) < 5)
+    let f: int = color_px(o, 40, 60)
+    assert_true(red_of(f) > 250 && green_of(f) > 250 && blue_of(f) < 5)
+end
+
+#[test]
+fn e2e_font_optical_sizing_drives_opsz_axis() is
+    let f: string = "native/tests/fonts/silver-opsz.ttf"
+    ;; auto (domyślnie): opsz = rozmiar fontu w px — przy 100 px najszersza instancja
+    assert_eq(text_w_font(f, "", "a"), 80)
+    assert_eq(text_w_font(f, "#s { font-size: 55px; }", "a"), 39)
+    ;; none: domyślna instancja czcionki zmiennej
+    assert_eq(text_w_font(f, "#s { font-optical-sizing: none; }", "a"), 60)
+    assert_eq(text_w_font(f, "#s { font-optical-sizing: auto; }", "a"), 80)
+    ;; czcionka bez osi opsz nie jest dotykana
+    assert_eq(text_w_font("native/tests/fonts/silver-alt.ttf", "", "a"), 60)
+end
+
+;; ====================== 0.4: zdarzenia dotykowe w shimie ======================
+#[test]
+fn e2e_touch_events_flow_through_shim() is
+    let win: int = shot("<p>x</p>", "", 200, 100)
+    ;; palec 7: down (40,30) → move (40,60) → up
+    assert_eq(ffi_shim::silver_inject_touch(win, 0, 7, 40, 30), 1)
+    assert_eq(ffi_shim::silver_poll_event(win), 18)
+    assert_eq(ffi_shim::silver_event_payload(win), "7|40|30")
+    assert_eq(ffi_shim::silver_inject_touch(win, 1, 7, 40, 60), 1)
+    assert_eq(ffi_shim::silver_poll_event(win), 19)
+    assert_eq(ffi_shim::silver_event_payload(win), "7|40|60")
+    assert_eq(ffi_shim::silver_inject_touch(win, 2, 7, 40, 60), 1)
+    assert_eq(ffi_shim::silver_poll_event(win), 20)
+    ffi_shim::silver_window_close(win)
+end
+
+;; ====================== 0.4: druk do PDF ======================
+#[test]
+fn e2e_print_pdf_writes_paged_document() is
+    let html: string = "<div style=\"height:250px;background:#ff0000;break-inside:avoid\">a</div><div style=\"height:250px;break-inside:avoid\">b</div><div style=\"height:250px;break-inside:avoid\">c</div>"
+    let css_text: string = "body { margin: 0; } @page { size: A5 landscape; margin: 0; } @page { size: 300px 400px; margin: 0; }"
+    let win: int = ffi_shim::silver_window_create("print-test", 300, 400)
+    let d: dom::Dom = dom::parse(html)
+    let path: string = "/tmp/silver-print-test.pdf"
+    let pages: int = paged::print_pdf(win, d, css::parse(css_text), false, path)
+    ffi_shim::silver_window_close(win)
+    assert_eq(pages, 3)
+    ;; strumienie PDF są binarne, więc zawartość sprawdzamy grepem (fs::read ucina napis na bajcie zerowym)
+    assert_true(fs::exists(path))
+    assert_true(fs::size(path) > 500)
+    assert_true(string_starts_with(fs::read(path), "%PDF-1.4"))
+    assert_eq(string_trim(process::run("grep -a -c '/Type /Page ' " + path)), "3")
+    assert_eq(string_trim(process::run("grep -a -c '/Type /Pages /Count 3' " + path)), "1")
+    assert_eq(string_trim(process::run("grep -a -c '/MediaBox \\[0 0 225.00 300.00\\]' " + path)), "3")
+    assert_eq(string_trim(process::run("grep -a -c 'Producer (Silver 0.4)' " + path)), "1")
+    assert_eq(string_trim(process::run("grep -a -c '%%EOF' " + path)), "1")
+end
+
+#[test]
+fn e2e_corner_shape_bevel_and_notch() is
+    ;; bevel: róg ścięty po przekątnej (piksel (2,2) pusty), środek krawędzi pełny
+    let css_bevel: string = "body { margin: 0; } #a { width: 100px; height: 100px; border-radius: 30px; corner-shape: bevel; background-color: #0000ff; }"
+    let w1: int = shot("<div id=\"a\"></div>", css_bevel, 200, 150)
+    assert_eq(red_of(ffi_shim::silver_pixel(w1, 2, 2)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(w1, 2, 2)), 255)
+    assert_eq(blue_of(ffi_shim::silver_pixel(w1, 50, 1)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(w1, 50, 1)), 0)
+    ffi_shim::silver_window_close(w1)
+    ;; notch: wycięty kwadrat w rogu, piksel (20,20) pusty, (40,40) pełny
+    let css_notch: string = "body { margin: 0; } #a { width: 100px; height: 100px; border-radius: 30px; corner-shape: notch; background-color: #0000ff; }"
+    let w2: int = shot("<div id=\"a\"></div>", css_notch, 200, 150)
+    assert_eq(red_of(ffi_shim::silver_pixel(w2, 20, 20)), 255)
+    assert_eq(blue_of(ffi_shim::silver_pixel(w2, 40, 40)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(w2, 40, 40)), 0)
+    ffi_shim::silver_window_close(w2)
+end
+
+;; ====================== sesja 2: corner-*-shape per narożnik (fizyczne i logiczne) ======================
+fn corner_is_cut(decl: string, px: int, py: int) -> bool is
+    let css_t: string = "body { margin: 0; } #a { width: 100px; height: 100px; border-radius: 30px; background-color: #0000ff; " + decl + " }"
+    let w: int = shot("<div id=\"a\"></div>", css_t, 200, 150)
+    let cut: bool = red_of(ffi_shim::silver_pixel(w, px, py)) == 255
+    ffi_shim::silver_window_close(w)
+    return cut
+end
+
+#[test]
+fn e2e_corner_shape_longhands_physical_and_logical_cut_only_their_corner() is
+    ;; (10,10) leży wewnątrz zaokrąglenia r=30, ale poza ścięciem bevel (x+y < 30)
+    assert_true(!corner_is_cut("", 10, 10))
+    assert_true(corner_is_cut("corner-top-left-shape: bevel;", 10, 10))
+    assert_true(!corner_is_cut("corner-top-left-shape: bevel;", 89, 10))
+    assert_true(corner_is_cut("corner-top-right-shape: bevel;", 89, 10))
+    assert_true(corner_is_cut("corner-bottom-right-shape: bevel;", 89, 89))
+    assert_true(corner_is_cut("corner-bottom-left-shape: bevel;", 10, 89))
+    assert_true(!corner_is_cut("corner-bottom-left-shape: bevel;", 10, 10))
+    ;; odpowiedniki logiczne (poziomy LTR)
+    assert_true(corner_is_cut("corner-start-start-shape: bevel;", 10, 10))
+    assert_true(corner_is_cut("corner-start-end-shape: bevel;", 89, 10))
+    assert_true(corner_is_cut("corner-end-end-shape: bevel;", 89, 89))
+    assert_true(corner_is_cut("corner-end-start-shape: bevel;", 10, 89))
+    assert_true(!corner_is_cut("corner-end-start-shape: bevel;", 89, 89))
+end
+
+;; ====================== sesja 3: longhandy obrazów ramek/masek, tekst, kontrolki ======================
+fn cnt_px(win: int, x0: int, y0: int, x1: int, y1: int, kind: int) -> int is
+    let mut n: int = 0
+    let mut y: int = y0
+    while y < y1 is
+        let mut x: int = x0
+        while x < x1 is
+            let p: int = ffi_shim::silver_pixel(win, x, y)
+            let r: int = red_of(p)
+            let g: int = green_of(p)
+            let b: int = blue_of(p)
+            if kind == 0 && r > 180 && g < 90 && b < 90 is n += 1 end
+            if kind == 1 && g > 120 && r < 90 && b < 90 is n += 1 end
+            if kind == 2 && b > 180 && r < 90 && g < 90 is n += 1 end
+            if kind == 3 && (r < 200 || g < 200 || b < 200) is n += 1 end
+            x += 1
+        end
+        y += 1
+    end
+    return n
+end
+
+fn rows_with_red(win: int, x0: int, x1: int, y0: int, y1: int, minpx: int) -> int is
+    let mut y: int = y0
+    while y < y1 is
+        if cnt_px(win, x0, y, x1, y + 1, 0) >= minpx is return y end
+        y += 1
+    end
+    return -1
+end
+
+#[test]
+fn e2e_border_image_longhands_source_slice_width_outset() is
+    let css_text: string = "#a { margin: 20px; width: 60px; height: 60px; border: 10px solid #00ff00; border-image-source: linear-gradient(#0000ff, #0000ff); border-image-slice: 10 fill; border-image-width: 10px; border-image-outset: 6px; border-image-repeat: stretch; }"
+    let win: int = shot("<div id=\"a\"></div>", css_text, 200, 150)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 50, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 50, 50)), 0)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 16, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 10, 50)), 255)
+    ffi_shim::silver_window_close(win)
+    ;; bez border-image-source ramka zostaje zwykła (zielona)
+    let w2: int = shot("<div id=\"a\"></div>", "#a { margin: 20px; width: 60px; height: 60px; border: 10px solid #00ff00; border-image-slice: 10; }", 200, 150)
+    assert_eq(green_of(ffi_shim::silver_pixel(w2, 24, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(w2, 24, 50)), 0)
+    ffi_shim::silver_window_close(w2)
+    ;; border-image-repeat zmienia sposób wypełnienia krawędzi (repeat vs stretch dla małego wycinka)
+    let base: string = "#a { margin: 10px; width: 150px; height: 40px; border: 20px solid #00ff00; border-image-source: linear-gradient(to right, #ff0000, #0000ff); border-image-slice: 40; border-image-width: 20px; "
+    let ws: int = shot("<div id=\"a\"></div>", base + "border-image-repeat: stretch; }", 260, 120)
+    let wr: int = shot("<div id=\"a\"></div>", base + "border-image-repeat: repeat; }", 260, 120)
+    let mut diff: int = 0
+    let mut x: int = 12
+    while x < 190 is
+        if red_of(ffi_shim::silver_pixel(ws, x, 15)) != red_of(ffi_shim::silver_pixel(wr, x, 15)) is diff += 1 end
+        x += 1
+    end
+    assert_true(diff > 5)
+    ffi_shim::silver_window_close(ws)
+    ffi_shim::silver_window_close(wr)
+end
+
+#[test]
+fn e2e_mask_border_longhands_and_mode_luminance() is
+    let base: string = "#a { margin: 20px; width: 60px; height: 60px; background: #0000ff; mask-border-source: linear-gradient(#000000, #000000); mask-border-slice: 10; mask-border-width: 10px; mask-border-outset: 0; mask-border-repeat: stretch; "
+    let win: int = shot("<div id=\"a\"></div>", base + "}", 200, 150)
+    assert_eq(blue_of(ffi_shim::silver_pixel(win, 24, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 24, 50)), 0)
+    assert_eq(red_of(ffi_shim::silver_pixel(win, 50, 50)), 255)
+    ffi_shim::silver_window_close(win)
+    ;; tryb luminance: czarna maska ma luminancję 0, więc ramka znika
+    let wl: int = shot("<div id=\"a\"></div>", base + "mask-border-mode: luminance; }", 200, 150)
+    assert_eq(red_of(ffi_shim::silver_pixel(wl, 24, 50)), 255)
+    assert_eq(green_of(ffi_shim::silver_pixel(wl, 24, 50)), 255)
+    ffi_shim::silver_window_close(wl)
+end
+
+#[test]
+fn e2e_mask_clip_and_mask_origin_limit_the_masked_area() is
+    let base: string = "#a { margin: 20px; width: 40px; height: 40px; padding: 10px; background: #0000ff; mask-image: linear-gradient(#000000, #000000); "
+    let bb: int = shot("<div id=\"a\"></div>", base + "mask-clip: border-box; }", 200, 150)
+    assert_eq(blue_of(ffi_shim::silver_pixel(bb, 25, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(bb, 25, 50)), 0)
+    ffi_shim::silver_window_close(bb)
+    let cb: int = shot("<div id=\"a\"></div>", base + "mask-clip: content-box; }", 200, 150)
+    assert_eq(red_of(ffi_shim::silver_pixel(cb, 25, 50)), 255)
+    assert_eq(blue_of(ffi_shim::silver_pixel(cb, 50, 50)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(cb, 50, 50)), 0)
+    ffi_shim::silver_window_close(cb)
+    ;; mask-origin: maska 20×20 bez powtarzania zaczyna się w rogu wskazanego pola
+    let om: string = base + "mask-size: 20px 20px; mask-repeat: no-repeat; mask-position: 0 0; "
+    let ob: int = shot("<div id=\"a\"></div>", om + "mask-origin: border-box; }", 200, 150)
+    assert_eq(blue_of(ffi_shim::silver_pixel(ob, 25, 25)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(ob, 25, 25)), 0)
+    assert_eq(red_of(ffi_shim::silver_pixel(ob, 45, 45)), 255)
+    ffi_shim::silver_window_close(ob)
+    let oc: int = shot("<div id=\"a\"></div>", om + "mask-origin: content-box; }", 200, 150)
+    assert_eq(red_of(ffi_shim::silver_pixel(oc, 25, 25)), 255)
+    assert_eq(blue_of(ffi_shim::silver_pixel(oc, 45, 45)), 255)
+    assert_eq(red_of(ffi_shim::silver_pixel(oc, 45, 45)), 0)
+    ffi_shim::silver_window_close(oc)
+end
+
+#[test]
+fn e2e_scrollbar_color_appearance_none_and_backdrop_filter() is
+    ;; scrollbar-color: kciuk w podanym kolorze
+    let box_css: string = "#a { margin: 0; width: 100px; height: 100px; overflow: auto; } #a div { width: 50px; height: 400px; }"
+    let sc: int = shot("<div id=\"a\"><div></div></div>", box_css + " #a { scrollbar-color: #ff0000 #00ff00; }", 200, 150)
+    assert_true(cnt_px(sc, 84, 0, 100, 100, 0) > 20)
+    ffi_shim::silver_window_close(sc)
+    let sd: int = shot("<div id=\"a\"><div></div></div>", box_css, 200, 150)
+    assert_eq(cnt_px(sd, 84, 0, 100, 100, 0), 0)
+    ffi_shim::silver_window_close(sd)
+    ;; appearance: none — pole wyboru nie rysuje natywnego znacznika
+    let on: int = shot("<input type=\"checkbox\" checked>", "input { margin: 0; accent-color: #ff0000; }", 60, 40)
+    let off: int = shot("<input type=\"checkbox\" checked>", "input { margin: 0; accent-color: #ff0000; appearance: none; }", 60, 40)
+    assert_true(cnt_px(on, 0, 0, 40, 30, 0) > 20)
+    assert_eq(cnt_px(off, 0, 0, 40, 30, 0), 0)
+    ffi_shim::silver_window_close(on)
+    ffi_shim::silver_window_close(off)
+    ;; backdrop-filter: blur — ostra krawędź tła pod elementem jest rozmyta
+    let html: string = "<div id=\"l\"></div><div id=\"r\"></div><div id=\"o\"></div>"
+    let base: string = "body { margin: 0; } #l { position: absolute; left: 0; top: 0; width: 50px; height: 100px; background: #ff0000; } #r { position: absolute; left: 50px; top: 0; width: 50px; height: 100px; background: #0000ff; } #o { position: absolute; left: 20px; top: 20px; width: 60px; height: 60px; "
+    let sharp: int = shot(html, base + "}", 100, 100)
+    let blur: int = shot(html, base + "backdrop-filter: blur(8px); }", 100, 100)
+    assert_eq(red_of(ffi_shim::silver_pixel(sharp, 46, 50)), 255)
+    let rb: int = red_of(ffi_shim::silver_pixel(blur, 46, 50))
+    assert_true(rb < 240 && rb > 20)
+    ;; poza elementem tło pozostaje ostre
+    assert_eq(red_of(ffi_shim::silver_pixel(blur, 46, 10)), 255)
+    ffi_shim::silver_window_close(sharp)
+    ffi_shim::silver_window_close(blur)
+end
+
+#[test]
+fn e2e_object_position_and_image_rendering() is
+    let img: string = "<img src=\"/tmp/silver_testdata/disc.png\">"
+    let base: string = "body { margin: 0; } img { display: block; width: 200px; height: 100px; object-fit: none; "
+    let left: int = shot(img, base + "object-position: left top; }", 220, 120)
+    let right: int = shot(img, base + "object-position: right top; }", 220, 120)
+    assert_true(cnt_px(left, 0, 0, 100, 100, 3) > 500)
+    assert_eq(cnt_px(left, 110, 0, 200, 100, 3), 0)
+    assert_true(cnt_px(right, 100, 0, 200, 100, 3) > 500)
+    assert_eq(cnt_px(right, 0, 0, 90, 100, 3), 0)
+    ffi_shim::silver_window_close(left)
+    ffi_shim::silver_window_close(right)
+    ;; image-rendering: pixelated vs smooth na powiększonym obrazie różnią się pikselami brzegu
+    let big: string = "body { margin: 0; } img { display: block; width: 400px; height: 400px; "
+    let a: int = shot(img, big + "image-rendering: pixelated; }", 400, 400)
+    let b: int = shot(img, big + "image-rendering: smooth; }", 400, 400)
+    let mut diff: int = 0
+    let mut y: int = 0
+    while y < 400 is
+        let mut x: int = 0
+        while x < 400 is
+            if ffi_shim::silver_pixel(a, x, y) != ffi_shim::silver_pixel(b, x, y) is diff += 1 end
+            x += 7
+        end
+        y += 7
+    end
+    assert_true(diff > 0)
+    ffi_shim::silver_window_close(a)
+    ffi_shim::silver_window_close(b)
+end
+
+#[test]
+fn e2e_text_decoration_offset_position_trim_and_emphasis_color() is
+    let base: string = "body { margin: 0; } p { margin: 0; padding: 10px 0 30px 0; font-size: 24px; color: #000000; text-decoration: underline; text-decoration-color: #ff0000; "
+    let d0: int = shot("<p>MMMM</p>", base + "}", 200, 90)
+    let d6: int = shot("<p>MMMM</p>", base + "text-underline-offset: 6px; }", 200, 90)
+    let du: int = shot("<p>MMMM</p>", base + "text-underline-position: under; }", 200, 90)
+    let y0: int = rows_with_red(d0, 0, 120, 0, 90, 20)
+    let y6: int = rows_with_red(d6, 0, 120, 0, 90, 20)
+    let yu: int = rows_with_red(du, 0, 120, 0, 90, 20)
+    assert_true(y0 > 0)
+    assert_eq(y6 - y0, 6)
+    assert_true(yu > y0)
+    ;; text-decoration-trim: skraca linię z obu końców
+    let full: int = cnt_px(d0, 0, y0, 200, y0 + 2, 0)
+    let tr: int = shot("<p>MMMM</p>", base + "text-decoration-trim: 10px 10px; }", 200, 90)
+    let trimmed: int = cnt_px(tr, 0, y0, 200, y0 + 2, 0)
+    assert_true(trimmed < full - 15)
+    ffi_shim::silver_window_close(d0)
+    ffi_shim::silver_window_close(d6)
+    ffi_shim::silver_window_close(du)
+    ffi_shim::silver_window_close(tr)
+    ;; text-emphasis-color jako osobny longhand
+    let e: int = shot("<p>MMMM</p>", "p { margin: 0; padding-top: 14px; font-size: 24px; color: #000000; text-emphasis-style: filled circle; text-emphasis-color: #ff0000; }", 200, 100)
+    assert_true(cnt_px(e, 0, 0, 120, 14, 0) > 10)
+    ffi_shim::silver_window_close(e)
+end
+
+fn shot_focus(html: string, css_text: string, w: int, h: int, focus_id: string) -> int is
+    let win: int = ffi_shim::silver_window_create("paint-test", w, h)
+    ffi_shim::silver_load_font(win, "", 16)
+    let d: dom::Dom = dom::parse(html)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(css_text), w, win)
+    let mut rs: paint::RenderState = paint::plain_state(0)
+    rs.focused = dom::find_by_id(d, focus_id)
+    rs.caret_on = true
+    rs.cursor = 1
+    rs.anchor = 1
+    paint::render(win, boxes, d, rs, style::Color { r: 255, g: 255, b: 255, a: 255 })
+    return win
+end
+
+#[test]
+fn e2e_caret_color_paints_the_caret_in_that_color() is
+    let html: string = "<input id=\"i\" value=\"ab\">"
+    let base: string = "input { margin: 4px; width: 120px; font-size: 20px; color: #000000; border: 1px solid #888888; "
+    let a: int = shot_focus(html, base + "caret-color: #ff0000; }", 200, 60, "i")
+    assert_true(cnt_px(a, 0, 0, 200, 60, 0) > 5)
+    ffi_shim::silver_window_close(a)
+    let b: int = shot_focus(html, base + "}", 200, 60, "i")
+    assert_eq(cnt_px(b, 0, 0, 200, 60, 0), 0)
+    ffi_shim::silver_window_close(b)
+end
+
+#[test]
+fn e2e_text_fill_and_stroke_image_family() is
+    let html: string = "<p>MMMM</p>"
+    let base: string = "body { margin: 0; } p { margin: 0; font-size: 48px; color: #000000; display: inline-block; "
+    ;; fill-image: tekst wypełniony obrazem (czerwień), bez niego czarny
+    let f: int = shot(html, base + "fill-image: linear-gradient(#ff0000, #ff0000); }", 260, 80)
+    assert_true(cnt_px(f, 0, 0, 260, 80, 0) > 200)
+    ffi_shim::silver_window_close(f)
+    let plain: int = shot(html, base + "}", 260, 80)
+    assert_true(cnt_px(plain, 0, 0, 260, 80, 0) == 0)
+    ffi_shim::silver_window_close(plain)
+    ;; fill-size + fill-repeat + fill-position: mały obraz bez powtarzania przy lewej albo prawej krawędzi
+    let sz: string = "fill-image: linear-gradient(#ff0000, #ff0000); fill-size: 20px 100%; fill-repeat: no-repeat; "
+    let l: int = shot(html, base + sz + "fill-position: left; }", 260, 80)
+    let r: int = shot(html, base + sz + "fill-position: right; }", 260, 80)
+    let rep: int = shot(html, base + "fill-image: linear-gradient(#ff0000, #ff0000); fill-size: 20px 100%; fill-repeat: repeat-x; }", 260, 80)
+    assert_true(cnt_px(l, 0, 0, 40, 80, 0) > 30)
+    assert_true(cnt_px(l, 100, 0, 260, 80, 0) == 0)
+    assert_true(cnt_px(r, 120, 0, 260, 80, 0) > 30)
+    assert_true(cnt_px(r, 0, 0, 60, 80, 0) == 0)
+    assert_true(cnt_px(rep, 0, 0, 260, 80, 0) > cnt_px(l, 0, 0, 260, 80, 0) * 3)
+    ffi_shim::silver_window_close(l)
+    ffi_shim::silver_window_close(r)
+    ffi_shim::silver_window_close(rep)
+    ;; fill-origin: border-box w obszarze dopełnienia (poza tekstem) vs content-box na tekście
+    let pad: string = "padding-left: 40px; fill-image: linear-gradient(#ff0000, #ff0000); fill-size: 20px 100%; fill-repeat: no-repeat; fill-position: left; "
+    let ob: int = shot(html, base + pad + "fill-origin: border-box; }", 300, 80)
+    let oc: int = shot(html, base + pad + "fill-origin: content-box; }", 300, 80)
+    assert_true(cnt_px(ob, 40, 0, 62, 80, 0) > 20 && cnt_px(ob, 82, 0, 104, 80, 0) == 0 && cnt_px(oc, 82, 0, 104, 80, 0) > 20 && cnt_px(oc, 40, 0, 62, 80, 0) == 0)
+    ffi_shim::silver_window_close(ob)
+    ffi_shim::silver_window_close(oc)
+    ;; obrys: stroke-image zamiast koloru, stroke-align zmienia położenie względem konturu
+    let st0: string = "-webkit-text-stroke: 4px #00ff00; "
+    let sg: int = shot(html, base + st0 + "}", 260, 80)
+    assert_true(cnt_px(sg, 0, 0, 260, 80, 1) > 100)
+    ffi_shim::silver_window_close(sg)
+    let si: int = shot(html, base + "stroke-width: 4px; stroke-image: linear-gradient(#0000ff, #0000ff); }", 260, 80)
+    assert_true(cnt_px(si, 0, 0, 260, 80, 2) > 100)
+    assert_true(cnt_px(si, 0, 0, 260, 80, 1) == 0)
+    ffi_shim::silver_window_close(si)
+    let ins: int = shot(html, base + st0 + "stroke-align: inside; }", 260, 80)
+    let out: int = shot(html, base + st0 + "stroke-align: outside; }", 260, 80)
+    assert_true(cnt_px(out, 0, 0, 260, 80, 3) > cnt_px(ins, 0, 0, 260, 80, 3))
+    ffi_shim::silver_window_close(ins)
+    ffi_shim::silver_window_close(out)
+    ;; stroke-size / stroke-repeat / stroke-position / stroke-origin działają jak ich odpowiedniki fill-*
+    let ss: string = "stroke-width: 4px; stroke-image: linear-gradient(#0000ff, #0000ff); stroke-size: 20px 100%; stroke-repeat: no-repeat; "
+    let sl: int = shot(html, base + ss + "stroke-position: left; }", 260, 80)
+    let sr: int = shot(html, base + ss + "stroke-position: right; }", 260, 80)
+    assert_true(cnt_px(sl, 0, 0, 40, 80, 2) > 10)
+    assert_true(cnt_px(sl, 100, 0, 260, 80, 2) == 0)
+    assert_true(cnt_px(sr, 120, 0, 260, 80, 2) > 10)
+    assert_true(cnt_px(sr, 0, 0, 60, 80, 2) == 0)
+    ffi_shim::silver_window_close(sl)
+    ffi_shim::silver_window_close(sr)
+    let sp: string = "padding-left: 40px; " + ss + "stroke-position: left; "
+    let sob: int = shot(html, base + sp + "stroke-origin: border-box; }", 300, 80)
+    let soc: int = shot(html, base + sp + "stroke-origin: content-box; }", 300, 80)
+    assert_true(cnt_px(sob, 38, 0, 62, 80, 2) > 8 && cnt_px(sob, 82, 0, 104, 80, 2) == 0 && cnt_px(soc, 82, 0, 104, 80, 2) > 8 && cnt_px(soc, 38, 0, 62, 80, 2) == 0)
+    ffi_shim::silver_window_close(sob)
+    ffi_shim::silver_window_close(soc)
+end
+
+#[test]
+fn e2e_pdf_bookmarks_level_label_and_state() is
+    let html: string = "<h1 id=\"a\" class=\"l1\">Intro</h1><h2 id=\"b\" class=\"l2\">Second</h2><p>plain</p>"
+    let css_text: string = "body { margin: 0; } @page { size: 300px 400px; margin: 0; } .l1 { bookmark-level: 1; bookmark-state: closed; } .l2 { bookmark-level: 2; bookmark-label: \"Sub\"; }"
+    let win: int = ffi_shim::silver_window_create("print-test", 300, 400)
+    let path: string = "/tmp/silver-bookmarks-test.pdf"
+    let pages: int = paged::print_pdf(win, dom::parse(html), css::parse(css_text), false, path)
+    ffi_shim::silver_window_close(win)
+    assert_true(pages >= 1)
+    assert_eq(string_trim(process::run("grep -a -c '/Type /Outlines' " + path)), "1")
+    ;; bookmark-label: własny tytuł w UTF-16 (Sub); h2 bez etykiety dostałby tekst elementu (Second)
+    assert_eq(string_trim(process::run("grep -a -c '<FEFF005300750062>' " + path)), "1")
+    assert_eq(string_trim(process::run("grep -a -c '<FEFF005300650063006F006E0064>' " + path)), "0")
+    ;; bookmark-level: tylko nagłówki z poziomem trafiają do konspektu (Intro tak, akapit nie)
+    assert_eq(string_trim(process::run("grep -a -c '<FEFF0049006E00740072006F>' " + path)), "1")
+    assert_eq(string_trim(process::run("grep -a -c '<FEFF0070006C00610069006E>' " + path)), "0")
+    ;; bookmark-state: closed → ujemny /Count przy elemencie z potomkiem
+    assert_eq(string_trim(process::run("grep -a -c '/Count -1' " + path)), "1")
+    ;; bez bookmark-level nie ma konspektu
+    let w2: int = ffi_shim::silver_window_create("print-test", 300, 400)
+    let p2: string = "/tmp/silver-bookmarks-none.pdf"
+    let n2: int = paged::print_pdf(w2, dom::parse(html), css::parse("body { margin: 0; } @page { size: 300px 400px; margin: 0; }"), false, p2)
+    ffi_shim::silver_window_close(w2)
+    assert_true(n2 >= 1)
+    assert_eq(string_trim(process::run("grep -a -c '/Type /Outlines' " + p2)), "0")
+end
+
+#[test]
+fn e2e_fill_break_and_stroke_break_choose_reference_rectangle_of_wrapped_text() is
+    let html: string = "<p>MMMM MM</p>"
+    let base: string = "body { margin: 0; } p { margin: 0; width: 170px; font-size: 40px; color: #000000; } "
+    let g: string = "fill-image: linear-gradient(to right, #ff0000, #0000ff); "
+    let bb: int = shot(html, base + "p { " + g + "}", 200, 120)
+    let cl: int = shot(html, base + "p { " + g + "fill-break: clone; }", 200, 120)
+    let sl: int = shot(html, base + "p { " + g + "fill-break: slice; }", 200, 120)
+    ;; drugi wiersz (krótki "MM"): przy clone gradient kończy się na jego prawym końcu (niebieski), przy bounding-box nie dochodzi do niebieskiego
+    let b_bb: int = cnt_px(bb, 0, 50, 200, 120, 2)
+    let b_cl: int = cnt_px(cl, 0, 50, 200, 120, 2)
+    let b_sl: int = cnt_px(sl, 0, 50, 200, 120, 2)
+    assert_true(b_cl > b_bb)
+    assert_true(b_sl != b_cl)
+    ffi_shim::silver_window_close(bb)
+    ffi_shim::silver_window_close(cl)
+    ffi_shim::silver_window_close(sl)
+    ;; to samo dla obrysu
+    let sg: string = "stroke-width: 3px; stroke-image: linear-gradient(to right, #ff0000, #0000ff); "
+    let sbb: int = shot(html, base + "p { " + sg + "}", 200, 120)
+    let scl: int = shot(html, base + "p { " + sg + "stroke-break: clone; }", 200, 120)
+    assert_true(cnt_px(scl, 0, 50, 200, 120, 2) > cnt_px(sbb, 0, 50, 200, 120, 2))
+    ffi_shim::silver_window_close(sbb)
+    ffi_shim::silver_window_close(scl)
+end
+
+#[test]
+fn e2e_pdf_with_footnotes_renders_area_and_paginates() is
+    let css_text: string = "@page { size: 300px 400px; margin: 0; } body { margin: 0; } p { margin: 0; line-height: 22px; } .sp { height: 330px; } .fn { float: footnote; }"
+    let html: string = "<p>First <span class=\"fn\">Note one text</span> end.</p><div class=\"sp\"></div><p>Second <span class=\"fn\">Note two</span> end.</p>"
+    let win: int = ffi_shim::silver_window_create("print-test", 300, 400)
+    let path: string = "/tmp/silver-footnotes-test.pdf"
+    let pages: int = paged::print_pdf(win, dom::parse(html), css::parse(css_text), false, path)
+    ffi_shim::silver_window_close(win)
+    ;; przypis nr 1 zajmuje miejsce na stronie 0, więc drugi akapit i jego przypis lądują na stronie 1
+    assert_eq(pages, 2)
+    assert_true(str_to_int(string_trim(process::run("stat -c %s " + path))) > 500)
 end
