@@ -108,7 +108,16 @@ pub fn allow_discrete(st: style::ComputedStyle) -> bool is
 end
 
 pub fn lerp_style(a: style::ComputedStyle, b: style::ComputedStyle, t: int, full: bool) -> style::ComputedStyle is
-    let mut s: style::ComputedStyle = b
+    let mut s: style::ComputedStyle = style::copy_style(b)
+    ;; interpolate-size: allow-keywords — przejście wysokości z/do `auto`: wartość `auto` zastępuje naturalna wysokość treści,
+    ;; którą zna dopiero układ; tu zostawiamy znacznik "<kierunek>,<px po stronie liczbowej>,<t>" (patrz layout_block)
+    if string_lower(string_trim(props::xget(b.xp, "interpolate-size"))) == "allow-keywords" is
+        if a.height_mode == "px" && b.height_mode == "auto" is
+            s.xp = props::xset(s.xp, "x-interp-h", "to-auto," + to_string(a.height) + "," + to_string(t))
+        elsif a.height_mode == "auto" && b.height_mode == "px" is
+            s.xp = props::xset(s.xp, "x-interp-h", "from-auto," + to_string(b.height) + "," + to_string(t))
+        end
+    end
     if a.width_mode == "px" && b.width_mode == "px" is s.width = li(a.width, b.width, t) end
     if a.height_mode == "px" && b.height_mode == "px" is s.height = li(a.height, b.height, t) end
     if a.width_mode == "pct" && b.width_mode == "pct" is s.width_pct = li(a.width_pct, b.width_pct, t) end
@@ -329,7 +338,7 @@ end
 ;; Wartość animacji składana z bazową; tylko pola, które klatka kluczowa zmieniła względem bazy. `mode`: add | accumulate.
 ;; Różnica add/accumulate dotyczy skali: add = iloczyn, accumulate = suma przyrostów.
 pub fn compose_style(base: style::ComputedStyle, anim: style::ComputedStyle, mode: string) -> style::ComputedStyle is
-    let mut s: style::ComputedStyle = anim
+    let mut s: style::ComputedStyle = style::copy_style(anim)
     if anim.width_mode == "px" && base.width_mode == "px" && anim.width != base.width is s.width = base.width + anim.width end
     if anim.height_mode == "px" && base.height_mode == "px" && anim.height != base.height is s.height = base.height + anim.height end
     if anim.mar_top != base.mar_top && !is_auto(anim.mar_top) && !is_auto(base.mar_top) is s.mar_top = base.mar_top + anim.mar_top end
@@ -391,7 +400,7 @@ end
 
 ;; Hak wołany z compute_styles: nakłada animację @keyframes i przejście na styl węzła.
 pub fn animate_style(sheet: css::Stylesheet, st0: style::ComputedStyle, parent: style::ComputedStyle, ctx: AnimCtx, id: int) -> style::ComputedStyle is
-    let mut st: style::ComputedStyle = st0
+    let mut st: style::ComputedStyle = style::copy_style(st0)
     let ti: int = find_trans(ctx, id)
     if ti >= 0 is
         let elapsed: int = ctx.now - ctx.t_start[ti] - ctx.t_delay[ti]
@@ -436,4 +445,39 @@ end
 pub fn resume_start(start: int, pause_at: int, now: int) -> int is
     if pause_at > 0 && now > pause_at is return start + (now - pause_at) end
     return start
+end
+
+;; ---------- animation-trigger: maszyna stanów akcji ----------
+;; Stan animacji sterowanej triggerem: [pozycja ms, czas odniesienia, kierunek (1 | -1), gra (0 | 1), odegrana (0 | 1)].
+pub fn trig_initial() -> [int] is
+    return [0, 0, 1, 0, 0]
+end
+
+;; Bieżąca pozycja (ms) w zakresie 0..dur.
+pub fn trig_pos(st: [int], now: int, dur: int) -> int is
+    let mut p: int = st[0]
+    if st[3] == 1 is p = st[0] + st[2] * (now - st[1]) end
+    if p < 0 is p = 0 end
+    if p > dur is p = dur end
+    return p
+end
+
+;; Akcje: none | play | play-once | play-forwards | play-backwards | pause | reset | replay.
+pub fn trig_apply(st0: [int], action: string, now: int, dur: int) -> [int] is
+    let a: string = string_lower(string_trim(action))
+    let pos: int = trig_pos(st0, now, dur)
+    if a == "" || a == "none" is return st0 end
+    if a == "play" is return [pos, now, st0[2], 1, 1] end
+    if a == "play-once" is
+        if st0[4] == 1 is return st0 end
+        return [pos, now, 1, 1, 1]
+    end
+    if a == "play-forwards" is return [pos, now, 1, 1, 1] end
+    if a == "play-backwards" is
+        return [if pos == 0 then dur else pos, now, -1, 1, 1]
+    end
+    if a == "pause" is return [pos, now, st0[2], 0, st0[4]] end
+    if a == "reset" is return [0, now, 1, 0, 0] end
+    if a == "replay" is return [if st0[2] < 0 then dur else 0, now, st0[2], 1, 1] end
+    return st0
 end
