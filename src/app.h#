@@ -9,6 +9,7 @@ mod engine
 use "std -> fs"    from "fs"
 use "std -> log"   from "log"
 use "std -> env"   from "env"
+use "std -> env" from "env"
 use "std -> conv" from "conv"
 use "std -> time"  from "time"
 use "std -> http"  from "http"
@@ -41,6 +42,9 @@ pub struct App is
     pub js_handle: int             ;; -1 = brak JS
     pub theme:     string          ;; "auto" | "light" | "dark"
     pub dark:      bool
+    pub touch:     [int]           ;; 0.4: stan gestów dotykowych (touch.h#)
+    pub zoom_pct:  int             ;; 0.4: powiększenie strony gestem pinch-zoom (%)
+    pub forced:    bool            ;; 0.4: tryb wymuszonych kolorów (forced-colors: active, forced-color-adjust)
     pub bg:        style::Color
 
     pub html_src:  string
@@ -94,6 +98,7 @@ pub struct App is
     pub kf_nodes:  [int]
     pub kf_start:  [int]
     pub kf_pause:  [int]    ;; 0.4: chwila rozpoczęcia pauzy animacji (0 = nie wstrzymana)
+    pub trg:       [int]    ;; 0.4: stan animation-trigger: grupy po 7 [węzeł, aktywny, pozycja, odniesienie, kierunek, gra, odegrana]
     pub kf_name:   [string]
     pub prev_st:   [style::ComputedStyle]
     pub has_tl:    bool            ;; 0.4: są animacje sterowane przewijaniem (animation-timeline)
@@ -154,7 +159,7 @@ pub fn new(title: string, width: int, height: int) -> App is
     end
     return App {
         win: win, dom: dom::empty(), sheet: css::empty_sheet(), router: ipc::new_router(),
-        font_path: "", font_size: 16, store: "{{}}", js_handle: -1, theme: "auto", dark: false,
+        font_path: "", font_size: 16, store: "{{}}", js_handle: -1, theme: "auto", dark: false, touch: touch::new_state(), zoom_pct: 100, forced: env::get_or("SILVER_FORCED_COLORS", "") == "1",
         bg: style::Color { r: 255, g: 255, b: 255, a: 255 },
         html_src: "", html_path: "", css_files: [], css_texts: [], js_files: [], has_structural: false, state_css: false,
         scroll_y: 0, elem_scroll: [], doc_h: 0, viewport_w: width, viewport_h: height,
@@ -163,7 +168,7 @@ pub fn new(title: string, width: int, height: int) -> App is
         ime: "", caret_t0: 0, caret_phase: true, dragging: false, sel_lo: 0, sel_hi: 0, sel_anchor: -1, sel_drag: false, rz_node: -1, rz_x0: 0, rz_y0: 0, rz_w0: 0, rz_h0: 0, mouse_x: -1, mouse_y: -1,
         cur_cursor: "default", has_focus: true, text_input_on: false,
         prev_bg: [], prev_fg: [], prev_op: [], anims: [],
-        kf_nodes: [], kf_start: [], kf_pause: [], kf_name: [], prev_st: [], has_tl: false, tr_ids: [], tr_from: [], tr_start: [], tr_dur: [], tr_delay: [], tr_ease: [],
+        kf_nodes: [], kf_start: [], kf_pause: [], trg: [], kf_name: [], prev_st: [], has_tl: false, tr_ids: [], tr_from: [], tr_start: [], tr_dur: [], tr_delay: [], tr_ease: [],
         anim_busy: false, scroll_goal: -1, has_motion: false,
         js_layout_watch: false, js_watch_ids: [], js_last_layout: "", storage_path: "", storage_data: "{{}}", storage_dirty: false, storage_last: 0,
         dev_mode: false, mtimes: [], last_dev: 0, tick_ms: 100, last_tick: 0, last_theme: 0,
@@ -211,6 +216,36 @@ pub fn set_theme(app: App, theme: string) -> App is
     a.last_theme = 0
     a.dirty_layout = true
     return a
+end
+
+;; 0.4: włącza/wyłącza tryb wymuszonych kolorów (jak Windows High Contrast): kolory z arkusza zastępuje paleta systemowa,
+;; poza elementami z `forced-color-adjust: none`; media `forced-colors: active`.
+pub fn set_forced_colors(app: App, on: bool) -> App is
+    let mut a: App = app
+    a.forced = on
+    a.dirty_layout = true
+    return a
+end
+
+;; 0.4: druk bieżącego dokumentu do PDF (@page, page, break-*, print-color-adjust); zwraca liczbę stron (0 = błąd).
+pub fn print_pdf(app: App, path: string, backgrounds: bool) -> int is
+    return paged::print_pdf(app.win.handle, app.dom, app.sheet, backgrounds, path)
+end
+
+;; 0.4: tekst do wypowiedzenia dla elementu pasującego do selektora ("" = body); uwzględnia `speak-as`.
+pub fn speak_selector_text(app: App, selector: string) -> string is
+    let mut root: int = css::query_first(app.dom, if selector == "" then "body" else selector)
+    if root < 0 is root = 0 end
+    let styles: [style::ComputedStyle] = layout::compute_styles(app.dom, app.sheet, interaction_state(app))
+    return speech::spoken_text(app.dom, styles, root)
+end
+
+;; 0.4: opcje głosu (voice-rate/pitch/volume/family) elementu pasującego do selektora
+pub fn speak_selector_opts(app: App, selector: string) -> string is
+    let mut root: int = css::query_first(app.dom, if selector == "" then "body" else selector)
+    if root < 0 is root = 0 end
+    let styles: [style::ComputedStyle] = layout::compute_styles(app.dom, app.sheet, interaction_state(app))
+    return speech::voice_opts_text(styles[root], speech::spoken_text(app.dom, styles, root))
 end
 
 pub fn enable_hot_reload(app: App) -> App is
@@ -690,6 +725,15 @@ fn motion_ctx(a: App, now: int) -> anim::AnimCtx is
 end
 
 ;; Aktualizuje rejestr animacji na podstawie stylów BEZ nakładek (cel) w tej klatce.
+fn trg_index(trg: [int], nid: int) -> int is
+    let mut i: int = 0
+    while i + 6 < array_len(trg) is
+        if trg[i] == nid is return i end
+        i += 7
+    end
+    return -1
+end
+
 fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
     let mut a: App = a0
     let n: int = array_len(raw)
@@ -698,6 +742,7 @@ fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
     let mut ks: [int] = []
     let mut kp: [int] = []
     let mut kname: [string] = []
+    let mut ntrg: [int] = []
     let mut nt_ids: [int] = a.tr_ids
     let mut nt_from: [style::ComputedStyle] = a.tr_from
     let mut nt_start: [int] = a.tr_start
@@ -729,6 +774,26 @@ fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
                 start = anim::resume_start(start, pause_at, now)
                 pause_at = 0
             end
+            ;; animation-trigger: pozycja animacji wynika z akcji wywołanych wejściem/wyjściem z zakresu triggera
+            let atr: [string] = layout::animation_trigger_of(st)
+            if array_len(atr) == 3 is
+                let ti: int = trg_index(a.trg, nid)
+                let mut was: bool = false
+                let mut sst: [int] = anim::trig_initial()
+                if ti >= 0 is
+                    was = a.trg[ti + 1] == 1
+                    sst = [a.trg[ti + 2], a.trg[ti + 3], a.trg[ti + 4], a.trg[ti + 5], a.trg[ti + 6]]
+                end
+                let tn: int = layout::find_trigger(a.boxes, a.dom, nid, atr[0])
+                let act: bool = tn >= 0 && layout::trigger_active(a.boxes, a.dom, tn, was, a.scroll_y, max_page_scroll(a), a.viewport_w, a.viewport_h)
+                if act && !was is sst = anim::trig_apply(sst, atr[1], now, st.anim_ms) end
+                if !act && was is sst = anim::trig_apply(sst, atr[2], now, st.anim_ms) end
+                let tpos: int = anim::trig_pos(sst, now, st.anim_ms)
+                start = now - tpos
+                pause_at = 0
+                ntrg = array_push(array_push(array_push(array_push(array_push(array_push(array_push(ntrg, nid), if act then 1 else 0), sst[0]), sst[1]), sst[2]), sst[3]), sst[4])
+                if sst[3] == 1 && ((sst[2] > 0 && tpos < st.anim_ms) || (sst[2] < 0 && tpos > 0)) is busy = true end
+            end
             kn = array_push(kn, nid)
             ks = array_push(ks, start)
             kp = array_push(kp, pause_at)
@@ -737,7 +802,7 @@ fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
         end
         if had_prev && anim::trans_covers_geometry(st) && anim::geometry_differs(a.prev_st[nid], st) is
             let prev: style::ComputedStyle = a.prev_st[nid]
-            let mut from: style::ComputedStyle = prev
+            let mut from: style::ComputedStyle = style::copy_style(prev)
             let ti: int = int_index(nt_ids, nid)
             if ti >= 0 is
                 let el: int = now - nt_start[ti] - nt_delay[ti]
@@ -779,6 +844,7 @@ fn update_motion(a0: App, raw: [style::ComputedStyle], now: int) -> App is
         end
         i += 1
     end
+    a.trg = ntrg
     a.kf_nodes = kn
     a.kf_start = ks
     a.kf_pause = kp
@@ -1135,12 +1201,22 @@ fn is_text_field(n: dom::DomNode) -> bool is
 end
 
 fn is_focusable(n: dom::DomNode) -> bool is
-    if n.removed || n.disabled is return false end
-    if n.tag == "input" is return string_lower(n.attr_type) != "hidden" end
-    if n.tag == "textarea" || n.tag == "select" || n.tag == "button" is return true end
-    if n.tag == "a" is return n.attr_href != "" || n.on_click != "" end
-    return dom::has_attr(n, "tabindex") && dom::get_attr(n, "tabindex") != "-1"
+    return focus::is_focusable(n)
 end
+
+fn hidden_by_style(a: App, id: int) -> bool is
+    return focus::hidden_by_style(a.dom, a.boxes, id)
+end
+
+;; 0.4: nav-up/-down/-left/-right — jawny cel nawigacji strzałką (logika w focus.h#)
+pub fn nav_target(a: App, node: int, prop: string) -> int is
+    return focus::nav_target(a.dom, a.boxes, node, prop)
+end
+
+pub fn next_focus(a: App, forward: bool) -> int is
+    return focus::next_focus(a.dom, a.boxes, a.focused_node, forward)
+end
+
 
 fn set_text_input(a0: App, on: bool) -> App is
     let mut a: App = a0
@@ -1208,39 +1284,13 @@ pub fn blur(app: App) -> App is
     return focus_node(app, -1)
 end
 
-;; kolejny/poprzedni element do fokusu w kolejności dokumentu
-fn next_focus(a: App, forward: bool) -> int is
-    let order: [int] = dom::document_order(a.dom)
-    let mut cands: [int] = []
-    let mut i: int = 0
-    while i < array_len(order) is
-        let id: int = order[i]
-        i += 1
-        if id > 0 && is_focusable(a.dom.nodes[id]) && !hidden_by_style(a, id) is cands = array_push(cands, id) end
-    end
-    if array_len(cands) == 0 is return -1 end
-    let mut pos: int = -1
-    i = 0
-    while i < array_len(cands) is
-        if cands[i] == a.focused_node is pos = i end
-        i += 1
-    end
-    if forward is
-        return cands[(pos + 1) % array_len(cands)]
-    end
-    if pos <= 0 is return cands[array_len(cands) - 1] end
-    return cands[pos - 1]
-end
 
-fn hidden_by_style(a: App, id: int) -> bool is
-    ;; element bez boxa w układzie (display:none u siebie lub przodka) nie bierze udziału w Tab
-    let mut i: int = 0
-    while i < array_len(a.boxes) is
-        if a.boxes[i].node_id == id && a.boxes[i].kind == "box" is return false end
-        i += 1
-    end
-    return array_len(a.boxes) > 0
-end
+
+
+
+
+
+
 
 ;; ---------- JS: start, snapshot DOM, polecenia ----------
 fn attr_json_pair(name: string, val: string) -> string is
@@ -2006,6 +2056,19 @@ fn handle_js_invoke(a0: App, raw: string) -> App is
         js::js_resolve(h, call_id, builtin_dialog(args))
         return a
     end
+    if cmd == "__print" is
+        let pages: int = print_pdf(a, jsonlite::get_str(args, "path"), jsonlite::get_bool(args, "backgrounds"))
+        js::js_resolve(h, call_id, jsonlite::set_int(jsonlite::object(), "pages", pages))
+        return a
+    end
+    if cmd == "__speak" is
+        let text: string = speak_selector_text(a, jsonlite::get_str(args, "selector"))
+        let ok: bool = speech::speak_text_opts(text, speak_selector_opts(a, jsonlite::get_str(args, "selector")), false)
+        let mut res: string = jsonlite::set_str(jsonlite::object(), "text", text)
+        res = jsonlite::set_bool(res, "ok", ok)
+        js::js_resolve(h, call_id, res)
+        return a
+    end
     if cmd == "__clip" is
         if jsonlite::get_str(args, "op") == "set" is
             window::clipboard_set(jsonlite::get_str(args, "text"))
@@ -2618,6 +2681,63 @@ fn scroll_page_to(a0: App, y: int) -> App is
     return a
 end
 
+;; ---------- 0.4: dotyk (touch-action, przewijanie palcem, tap = klik, pinch-zoom) ----------
+fn touch_bits_at(a: App, node: int) -> int is
+    let mut vals: [string] = []
+    let mut n: int = node
+    let mut guard: int = 0
+    while n >= 0 && guard < 128 is
+        vals = array_push(vals, props::xget(box_of(a, n).st.xp, "touch-action"))
+        n = a.dom.nodes[n].parent
+        guard += 1
+    end
+    return touch::bits_chain(vals)
+end
+
+fn mk_ev(kind: string, x: int, y: int, code: int, dx: int) -> window::InputEvent is
+    return window::InputEvent { kind: kind, x: x, y: y, code: code, text: "", mods: 0, clicks: 1, repeat: false, dx: dx }
+end
+
+fn apply_touch(a0: App, out: touch::TouchOut, x: int, y: int) -> App is
+    let mut a: App = a0
+    a.touch = out.state
+    if out.scroll_dx != 0 || out.scroll_dy != 0 is
+        ;; zdarzenie przewijania jak z kółka: x/code = pozycja, y = przesunięcie (ujemne = w dół), dx = poziome
+        a = on_scroll(a, mk_ev("scroll", x, 0 - out.scroll_dy, y, out.scroll_dx))
+    end
+    let mut i: int = 0
+    while i < array_len(out.mouse) is
+        let m: string = out.mouse[i]
+        i += 1
+        let c: int = string_find(m, ":")
+        if c <= 0 is continue end
+        let xy: [string] = string_split(string_slice(m, c + 1, string_len(m)), ",")
+        if array_len(xy) < 2 is continue end
+        let mx: int = conv::str_to_int(xy[0])
+        let my: int = conv::str_to_int(xy[1])
+        let kind: string = string_slice(m, 0, c)
+        if kind == "down" is a = on_mouse_down(a, mk_ev("mouse_down", mx, my, 1, 0)) end
+        if kind == "move" is a = on_mouse_move(a, mk_ev("mouse_move", mx, my, 0, 0)) end
+        if kind == "up" is a = on_mouse_up(a, mk_ev("mouse_up", mx, my, 1, 0)) end
+    end
+    if out.zoom >= 0 && out.zoom != a.zoom_pct is
+        a.zoom_pct = out.zoom
+        a.dirty_layout = true
+    end
+    return a
+end
+
+fn on_touch(a0: App, ev: window::InputEvent) -> App is
+    if ev.kind == "touch_down" is
+        let hit: int = node_or_neg(a0, paint::hit_test_at(a0.boxes, ev.x, ev.y, a0.scroll_y))
+        return apply_touch(a0, touch::touch_down(a0.touch, ev.code, ev.x, ev.y, touch_bits_at(a0, hit), a0.zoom_pct), ev.x, ev.y)
+    end
+    if ev.kind == "touch_move" is
+        return apply_touch(a0, touch::touch_move(a0.touch, ev.code, ev.x, ev.y), ev.x, ev.y)
+    end
+    return apply_touch(a0, touch::touch_up(a0.touch, ev.code, ev.x, ev.y), ev.x, ev.y)
+end
+
 fn on_scroll(a0: App, ev: window::InputEvent) -> App is
     let mut a: App = a0
     let mut dy: int = 0 - ev.y
@@ -2628,7 +2748,7 @@ fn on_scroll(a0: App, ev: window::InputEvent) -> App is
         dy = 0
     end
     if dxs != 0 && dy == 0 is
-        let xc: int = paint::scroll_container_x_at(a.boxes, a.dom, ev.x, ev.y, a.scroll_y)
+        let xc: int = paint::scroll_container_x_at(a.boxes, a.dom, ev.x, ev.code, a.scroll_y)
         if xc >= 0 is
             let key: int = layout::scroll_key_x(xc)
             let curx: int = get_pair(a.elem_scroll, key)
@@ -2647,7 +2767,7 @@ fn on_scroll(a0: App, ev: window::InputEvent) -> App is
         return a
     end
     if ev.mods % 2 == 1 && dy == 0 is return a end
-    let cont: int = paint::scroll_container_at(a.boxes, a.dom, ev.x, ev.y, a.scroll_y)
+    let cont: int = paint::scroll_container_at(a.boxes, a.dom, ev.x, ev.code, a.scroll_y)
     if cont >= 0 is
         let cur: int = get_pair(a.elem_scroll, cont)
         let mx: int = paint::max_scroll_of(a.boxes, cont)
@@ -2722,6 +2842,11 @@ fn on_key_down(a0: App, ev: window::InputEvent) -> App is
     end
     if node >= 0 && a.dom.nodes[node].tag == "select" && (code == 1073741905 || code == 1073741903) is return cycle_select(a, node, 1) end
     if node >= 0 && a.dom.nodes[node].tag == "select" && (code == 1073741906 || code == 1073741904) is return cycle_select(a, node, 0 - 1) end
+    if node >= 0 && (code == 1073741903 || code == 1073741904 || code == 1073741905 || code == 1073741906) is
+        let np: string = if code == 1073741903 then "nav-right" elsif code == 1073741904 then "nav-left" elsif code == 1073741905 then "nav-down" else "nav-up"
+        let nt: int = nav_target(a, node, np)
+        if nt > 0 is return focus_node(a, nt) end
+    end
     if code == 27 is return sel_clear(blur_current(a)) end
     if code == 1073741906 is return scroll_page_to(a, a.scroll_y - 40) end
     if code == 1073741905 is return scroll_page_to(a, a.scroll_y + 40) end
@@ -2822,6 +2947,7 @@ fn handle_event(a0: App, ev: window::InputEvent) -> App is
     if k == "key_down" is return on_key_down(a0, ev) end
     if k == "text" is return on_text(a0, ev) end
     if k == "text_edit" is return on_text_edit(a0, ev) end
+    if k == "touch_down" || k == "touch_move" || k == "touch_up" is return on_touch(a0, ev) end
     if k == "scroll" is return on_scroll(a0, ev) end
     if k == "resize" is return on_resize(a0, ev) end
     if k == "drop_file" || k == "drop_text" is return on_drop(a0, ev) end
@@ -2978,6 +3104,9 @@ fn interaction_state(a: App) -> css::InteractionState is
     ix.viewport_w = a.viewport_w
     ix.viewport_h = a.viewport_h
     ix.dark = a.dark
+    ix.forced = a.forced
+    ;; :target-current — aktualny odnośnik grupy scroll-target-group (wg poprzedniego układu i przesunięć przewijania)
+    if array_len(a.boxes) > 0 is ix.tcur = layout::scroll_target_current_any(a.boxes, a.dom, a.elem_scroll, a.scroll_y) end
     return ix
 end
 
@@ -3011,7 +3140,7 @@ fn page_background(a: App) -> style::Color is
     return col
 end
 
-fn relayout(a0: App, now: int) -> App is
+pub fn relayout(a0: App, now: int) -> App is
     let mut a: App = a0
     a.viewport_w = window::ffi_width(a.win)
     a.viewport_h = window::ffi_height(a.win)
@@ -3026,6 +3155,7 @@ fn relayout(a0: App, now: int) -> App is
         a.kf_nodes = []
         a.kf_start = []
         a.kf_pause = []
+        a.trg = []
         a.kf_name = []
         a.tr_ids = []
         a.tr_from = []
@@ -3035,11 +3165,14 @@ fn relayout(a0: App, now: int) -> App is
         a.tr_ease = []
         a.anim_busy = false
     end
-    let res: layout::LayoutResult = layout::layout_full_a(a.dom, a.sheet, a.viewport_w, a.viewport_h, a.win.handle,
+    ;; 0.4: pinch-zoom — układ liczony w zmniejszonym oknie, potem pudełka skalowane (hit-test i przewijanie zostają spójne)
+    let zp: int = if a.zoom_pct < 25 then 100 else a.zoom_pct
+    let res: layout::LayoutResult = layout::layout_full_a(a.dom, a.sheet, a.viewport_w * 100 / zp, a.viewport_h * 100 / zp, a.win.handle,
                                                           ix_now, a.elem_scroll, act)
-    let anchor_dy: int = layout::scroll_anchor_delta(a.boxes, res.boxes, a.scroll_y, a.viewport_h)
-    a.boxes = res.boxes
-    a.doc_h = res.height
+    let rboxes: [layout::LayoutBox] = if zp == 100 then res.boxes else layout::scale_all(res.boxes, zp)
+    let anchor_dy: int = layout::scroll_anchor_delta(a.boxes, rboxes, a.scroll_y, a.viewport_h)
+    a.boxes = rboxes
+    a.doc_h = res.height * zp / 100
     if anchor_dy != 0 is a.scroll_y = a.scroll_y + anchor_dy end
     if debug_on() is
         log::info("silver[debug]: layout viewport=" + to_string(a.viewport_w) + "x" + to_string(a.viewport_h) + " dom=" + to_string(array_len(a.dom.nodes)) + " boxes=" + to_string(array_len(res.boxes)) + " doc_h=" + to_string(res.height) + " css_rules=" + to_string(array_len(a.sheet.rules)))
@@ -3367,4 +3500,6 @@ pub fn scroll_to(app: App, y: int) -> App is
     return scroll_page_to(app, y)
 end
 
-pub fn is_dark(app: App) -> bool is return app.dark end
+pub fn is_dark(app: App) -> bool is
+    return app.dark
+end
