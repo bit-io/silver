@@ -78,6 +78,14 @@ extern static [c, "silvershim"] is
 
     ;; zdarzenia
     fn silver_poll_event(h: int) -> int
+    fn silver_target_begin(h: int, w: int, ht: int) -> int
+    fn silver_target_end(h: int) -> int
+    fn silver_pdf_begin() -> int
+    fn silver_pdf_page(h: int, tw: int, tht: int, pw: int, ph: int, cx: int, cy: int, cw: int, ch: int) -> int
+    fn silver_pdf_page_ex(h: int, tw: int, tht: int, pw: int, ph: int, cx: int, cy: int, cw: int, ch: int, rot: int, bleed: int, marks: int) -> int
+    fn silver_pdf_bookmark(title: string, level: int, page: int, y100: int, open: int) -> int
+    fn silver_pdf_end(path: string) -> int
+    fn silver_inject_touch(h: int, kind: int, finger: int, x: int, y: int) -> int
     fn silver_event_payload(h: int) -> string
     fn silver_wait_event(ms: int) -> bool
 
@@ -86,11 +94,13 @@ extern static [c, "silvershim"] is
     fn silver_fill_rect(h: int, x: int, y: int, w: int, rh: int, r: int, g: int, b: int, a: int) -> bool
     fn silver_stroke_rect(h: int, x: int, y: int, w: int, rh: int, r: int, g: int, b: int, a: int) -> bool
     fn silver_fill_round_rect(h: int, x: int, y: int, w: int, rh: int, rad: int, r: int, g: int, b: int, a: int) -> bool
+    fn silver_fill_shape_rect(h: int, x: int, y: int, w: int, rh: int, spec: string, r: int, g: int, b: int, a: int) -> bool
     fn silver_stroke_round_rect(h: int, x: int, y: int, w: int, rh: int, rad: int, bw: int, r: int, g: int, b: int, a: int) -> bool
     fn silver_fill_gradient(h: int, x: int, y: int, w: int, rh: int, r1: int, g1: int, b1: int, a1: int, r2: int, g2: int, b2: int, a2: int, vertical: int) -> bool
     fn silver_clip_set(h: int, x: int, y: int, w: int, rh: int) -> bool
     fn silver_clip_clear(h: int) -> bool
     fn silver_draw_text(h: int, x: int, y: int, text: string, r: int, g: int, b: int, a: int) -> int
+    fn silver_draw_text_stroke(h: int, x: int, y: int, text: string, r: int, g: int, b: int, a: int, size: int, style: int, width: int, align: int) -> int
     fn silver_draw_text_ex(h: int, x: int, y: int, text: string, r: int, g: int, b: int, a: int, size: int, style: int) -> int
     fn silver_measure_text(h: int, text: string) -> int
     fn silver_measure_text_ex(h: int, text: string, size: int, style: int) -> int
