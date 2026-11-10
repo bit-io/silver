@@ -447,6 +447,8 @@ pub fn list_at(list: string, i: int) -> string is
 end
 
 pub fn list_len(list: string) -> int is
+    ;; pusta lista = 0 elementów (split_commas("") zwraca jeden pusty element)
+    if string_trim(list) == "" is return 0 end
     return array_len(cssval::split_commas(list))
 end
 
