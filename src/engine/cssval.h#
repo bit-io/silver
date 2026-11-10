@@ -233,6 +233,7 @@ pub fn is_color(val: string) -> bool is
     let v: string = string_trim(string_replace(val, "\u0001", ""))
     let lower: string = string_lower(v)
     if lower == "transparent" || lower == "currentcolor" is return true end
+    if is_system_color(lower) is return true end
     if string_starts_with(lower, "#") is
         let n: int = string_len(lower) - 1
         return (n == 3 || n == 4 || n == 6 || n == 8) && is_hex_digits(string_slice(lower, 1, string_len(lower)))
@@ -244,9 +245,53 @@ end
 
 ;; Parsuje kolor; przy błędzie zwraca czarny (a=255) — użyj `is_color`,
 ;; jeśli musisz wiedzieć, czy wartość była poprawna.
+;; 0.4: kolory systemowe CSS Color 4 (Canvas, CanvasText, LinkText, ButtonFace…). Paleta jasna albo kontrastowa ciemna
+;; (taka sama jak w trybie wymuszonych kolorów). Nazwy w małych literach.
+fn sys_names() -> [string] is
+    return ["canvas", "canvastext", "linktext", "visitedtext", "activetext", "buttonface", "buttontext", "buttonborder",
+            "field", "fieldtext", "highlight", "highlighttext", "selecteditem", "selecteditemtext", "mark", "marktext",
+            "graytext", "accentcolor", "accentcolortext"]
+end
+
+fn sys_hex(dark: bool) -> [string] is
+    if dark is
+        return ["000000", "ffffff", "ffff00", "ff80ff", "00ffff", "000000", "ffffff", "ffffff",
+                "000000", "ffffff", "1aebff", "000000", "1aebff", "000000", "ffff00", "000000",
+                "3fe1b0", "1aebff", "000000"]
+    end
+    return ["ffffff", "000000", "0000ee", "551a8b", "ff0000", "efefef", "000000", "767676",
+            "ffffff", "000000", "3584e4", "ffffff", "3584e4", "ffffff", "ffff00", "000000",
+            "6d6d6d", "3584e4", "ffffff"]
+end
+
+pub fn is_system_color(name: string) -> bool is
+    let n: [string] = sys_names()
+    let mut i: int = 0
+    while i < array_len(n) is
+        if n[i] == name is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn system_color(name: string, dark: bool) -> Color is
+    let n: [string] = sys_names()
+    let h: [string] = sys_hex(dark)
+    let mut i: int = 0
+    while i < array_len(n) is
+        if n[i] == name is
+            let x: string = h[i]
+            return Color { r: hex_pair(string_slice(x, 0, 2)), g: hex_pair(string_slice(x, 2, 4)), b: hex_pair(string_slice(x, 4, 6)), a: 255 }
+        end
+        i += 1
+    end
+    return Color { r: 0, g: 0, b: 0, a: 255 }
+end
+
 pub fn parse_color(val: string) -> Color is
     let v: string = string_lower(string_trim(val))
     if v == "transparent" is return Color { r: 0, g: 0, b: 0, a: 0 } end
+    if is_system_color(v) is return system_color(v, false) end
 
     if string_starts_with(v, "#") is
         let hex: string = string_slice(v, 1, string_len(v))
