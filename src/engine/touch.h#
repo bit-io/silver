@@ -1,0 +1,155 @@
+mod props
+use "std -> conv" from "conv"
+
+;; 0.4: gesty dotykowe i `touch-action`. Czysta maszyna stanów (bez okna): app.h# podaje zdarzenia palców i wykonuje wynik
+;; (przewijanie, zdarzenia myszy, powiększenie strony). Bity dozwolonych gestów (przecięcie wartości elementu i jego przodków):
+;;   1 = pan w lewo, 2 = pan w prawo, 4 = pan w górę, 8 = pan w dół (kierunek RUCHU PALCA), 16 = pinch-zoom.
+;; auto/manipulation = wszystko; none = nic; pan-x = 1|2; pan-y = 4|8; pan-left/right/up/down i pinch-zoom łączone sumą.
+;; Stan: [id1, x, y, startX, startY, tryb, bity, id2, x2, y2, odległość0, zoom0, zoom]; tryb 0 oczekuje, 1 pan, 2 mysz (przeciąganie
+;; gdy pan niedozwolony), 3 pinch.
+
+pub struct TouchOut is
+    pub state:     [int]
+    pub scroll_dx: int         ;; przewinięcie zawartości w px (dodatnie = w prawo / w dół)
+    pub scroll_dy: int
+    pub mouse:     [string]    ;; "down:x,y" | "move:x,y" | "up:x,y"
+    pub zoom:      int         ;; nowy zoom strony w % albo -1
+end
+
+pub fn bits_of_value(v0: string) -> int is
+    let v: string = string_lower(string_trim(v0))
+    if v == "" || v == "auto" || v == "manipulation" is return 31 end
+    if v == "none" is return 0 end
+    let toks: [string] = string_split(v, " ")
+    let mut b: int = 0
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if t == "pan-x" is b = b | 3 end
+        if t == "pan-left" is b = b | 1 end
+        if t == "pan-right" is b = b | 2 end
+        if t == "pan-y" is b = b | 12 end
+        if t == "pan-up" is b = b | 4 end
+        if t == "pan-down" is b = b | 8 end
+        if t == "pinch-zoom" is b = b | 16 end
+    end
+    return b
+end
+
+;; przecięcie wartości elementu i przodków (od elementu w górę)
+pub fn bits_chain(vals: [string]) -> int is
+    let mut b: int = 31
+    let mut i: int = 0
+    while i < array_len(vals) is
+        b = b & bits_of_value(vals[i])
+        i += 1
+    end
+    return b
+end
+
+pub fn new_state() -> [int] is
+    return [-1, 0, 0, 0, 0, 0, 31, -1, 0, 0, 1, 100, 100]
+end
+
+fn out0(st: [int]) -> TouchOut is
+    return TouchOut { state: st, scroll_dx: 0, scroll_dy: 0, mouse: [], zoom: -1 }
+end
+
+fn pt(x: int, y: int) -> string is
+    return to_string(x) + "," + to_string(y)
+end
+
+fn dist(x1: int, y1: int, x2: int, y2: int) -> int is
+    let dx: int = x2 - x1
+    let dy: int = y2 - y1
+    let d2: int = dx * dx + dy * dy
+    let mut r: int = 1
+    while r * r < d2 is r += 1 end
+    return r
+end
+
+fn abs_i(v: int) -> int is
+    return if v < 0 then 0 - v else v
+end
+
+fn clamp_zoom(z: int) -> int is
+    return if z < 50 then 50 elsif z > 500 then 500 else z
+end
+
+;; `zoom_now` — bieżący zoom strony (%), `bits` — dozwolone gesty dla elementu pod palcem.
+pub fn touch_down(st: [int], id: int, x: int, y: int, bits: int, zoom_now: int) -> TouchOut is
+    if st[0] == -1 is
+        return out0([id, x, y, x, y, 0, bits, -1, 0, 0, 1, zoom_now, zoom_now])
+    end
+    if st[7] == -1 && id != st[0] is
+        if (st[6] & 16) == 0 is return out0(st) end
+        let d0: int = dist(st[1], st[2], x, y)
+        return out0([st[0], st[1], st[2], st[3], st[4], 3, st[6], id, x, y, d0, st[12], st[12]])
+    end
+    return out0(st)
+end
+
+pub fn touch_move(st: [int], id: int, x: int, y: int) -> TouchOut is
+    if st[0] == -1 is return out0(st) end
+    let slop: int = 8
+    if id == st[7] is
+        let ns: [int] = [st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], x, y, st[10], st[11], st[12]]
+        return pinch(ns)
+    end
+    if id != st[0] is return out0(st) end
+    let px: int = st[1]
+    let py: int = st[2]
+    let mut ns: [int] = [st[0], x, y, st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], st[11], st[12]]
+    if st[5] == 3 is return pinch(ns) end
+    let mut out: TouchOut = out0(ns)
+    if st[5] == 0 is
+        let dx: int = x - st[3]
+        let dy: int = y - st[4]
+        if abs_i(dx) <= slop && abs_i(dy) <= slop is return out end
+        let dirbit: int = if abs_i(dx) >= abs_i(dy) then (if dx < 0 then 1 else 2) else (if dy < 0 then 4 else 8)
+        if (st[6] & dirbit) != 0 is
+            ns[5] = 1
+            out = out0(ns)
+            out.scroll_dx = if (st[6] & 3) != 0 then 0 - dx else 0
+            out.scroll_dy = if (st[6] & 12) != 0 then 0 - dy else 0
+        else is
+            ns[5] = 2
+            out = out0(ns)
+            out.mouse = ["down:" + pt(st[3], st[4]), "move:" + pt(x, y)]
+        end
+        return out
+    end
+    if st[5] == 1 is
+        out.scroll_dx = if (st[6] & 3) != 0 then 0 - (x - px) else 0
+        out.scroll_dy = if (st[6] & 12) != 0 then 0 - (y - py) else 0
+        return out
+    end
+    if st[5] == 2 is
+        out.mouse = ["move:" + pt(x, y)]
+    end
+    return out
+end
+
+fn pinch(ns: [int]) -> TouchOut is
+    let d: int = dist(ns[1], ns[2], ns[8], ns[9])
+    let mut s2: [int] = ns
+    s2[12] = clamp_zoom(ns[11] * d / ns[10])
+    let mut out: TouchOut = out0(s2)
+    out.zoom = s2[12]
+    return out
+end
+
+pub fn touch_up(st: [int], id: int, x: int, y: int) -> TouchOut is
+    if st[0] == -1 is return out0(st) end
+    if id == st[7] is
+        ;; drugi palec puszczony: wracamy do panoramowania pierwszym
+        return out0([st[0], st[1], st[2], st[1], st[2], 1, st[6], -1, 0, 0, 1, st[12], st[12]])
+    end
+    if id != st[0] is return out0(st) end
+    let mut out: TouchOut = out0(new_state())
+    out.state = [-1, 0, 0, 0, 0, 0, 31, -1, 0, 0, 1, st[12], st[12]]
+    if st[5] == 0 is out.mouse = ["down:" + pt(st[3], st[4]), "up:" + pt(st[3], st[4])] end
+    if st[5] == 2 is out.mouse = ["up:" + pt(x, y)] end
+    return out
+end
