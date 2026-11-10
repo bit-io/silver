@@ -83,6 +83,7 @@ pub struct ComputedStyle is
     pub white_space: string  ;; normal | nowrap | pre | pre-wrap
     pub ellipsis:   bool
     pub break_words: bool
+    pub break_all:   bool    ;; word-break: break-all — łamanie między dowolnymi znakami
     pub cursor:     string
 
     pub border:     int      ;; = szerokość górnej krawędzi (zgodność wsteczna)
@@ -241,7 +242,7 @@ pub fn root_style() -> ComputedStyle is
         top: a, right: a, bottom: a, left: a, z_index: 0,
         font_size: 16, bold: false, italic: false, underline: false, strike: false, line_height: 0,
         text_align: "start", text_transform: "none", white_space: "normal", ellipsis: false,
-        break_words: false, cursor: "default",
+        break_words: false, break_all: false, cursor: "default",
         border: 0, bt: 0, br: 0, bb: 0, bl: 0, border_color: black(),
         bct: black(), bcr: black(), bcb: black(), bcl: black(),
         rad_tl: 0, rad_tr: 0, rad_br: 0, rad_bl: 0,
@@ -311,13 +312,14 @@ fn base_for(inherited: ComputedStyle) -> ComputedStyle is
     st.accent = inherited.accent
     st.scroll_behavior = inherited.scroll_behavior
     st.break_words = inherited.break_words
+    st.break_all = inherited.break_all
     st.align = "stretch"
     return st
 end
 
 ;; Style agenta użytkownika (domyślny wygląd tagów HTML).
 fn apply_ua(tag: string, st0: ComputedStyle, parent: ComputedStyle) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     if tag == "span" || tag == "a" || tag == "text" || tag == "b" || tag == "strong" || tag == "i" || tag == "em" ||
        tag == "u" || tag == "small" || tag == "code" || tag == "label" || tag == "sub" || tag == "sup" ||
        tag == "abbr" || tag == "mark" || tag == "kbd" || tag == "s" || tag == "del" || tag == "img" || tag == "cite" is
@@ -549,6 +551,11 @@ pub fn parse_color(val: string) -> Color is
     return to_color(cssval::parse_color(val))
 end
 
+;; 0.4: kolor systemowy z palety jasnej albo kontrastowej ciemnej (tryb wymuszonych kolorów)
+pub fn parse_color_sys(name: string, dark: bool) -> Color is
+    return to_color(cssval::system_color(name, dark))
+end
+
 fn env_for(em: int, ix: css::InteractionState) -> cssval::LenEnv is
     return cssval::LenEnv { em: em, rem: root_font_size(), vw: ix.viewport_w, vh: ix.viewport_h }
 end
@@ -729,7 +736,7 @@ end
 
 ;; box-shadow (pierwszy cień, bez inset): offset-x offset-y [blur [spread]] [color]
 fn apply_shadow(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let first: [string] = cssval::split_commas(val)
     if array_len(first) == 0 || string_lower(string_trim(first[0])) == "none" is
         st.has_shadow = false
@@ -766,7 +773,7 @@ end
 
 ;; background / background-image: obsługa color, url(...), linear-gradient(...)
 fn parse_gradient(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let open: int = string_find(val, "(")
     let close: int = string_len(val) - 1
     let parts: [string] = cssval::split_commas(string_slice(val, open + 1, close))
@@ -801,7 +808,7 @@ fn parse_gradient(st0: ComputedStyle, val: string) -> ComputedStyle is
 end
 
 fn apply_background(st0: ComputedStyle, val: string, em: int, env: cssval::LenEnv) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let v: string = string_trim(val)
     if string_find(v, "linear-gradient") >= 0 is
         let s: int = string_find(v, "linear-gradient")
@@ -827,7 +834,7 @@ end
 
 ;; flex: none | auto | <grow> [<shrink>] [<basis>]
 fn apply_flex_shorthand(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let v: string = string_lower(string_trim(val))
     if v == "none" is
         st.flex_grow = 0
@@ -867,7 +874,7 @@ fn apply_flex_shorthand(st0: ComputedStyle, val: string, env: cssval::LenEnv) ->
 end
 
 fn apply_flex_flow(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let toks: [string] = cssval::split_top(string_lower(val))
     let mut i: int = 0
     while i < array_len(toks) is
@@ -881,7 +888,7 @@ fn apply_flex_flow(st0: ComputedStyle, val: string) -> ComputedStyle is
 end
 
 fn apply_text_decoration(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let v: string = string_lower(val)
     st.underline = string_find(v, "underline") >= 0
     st.strike = string_find(v, "line-through") >= 0
@@ -889,7 +896,7 @@ fn apply_text_decoration(st0: ComputedStyle, val: string) -> ComputedStyle is
 end
 
 fn apply_overflow(st0: ComputedStyle, val: string, axis: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let toks: [string] = cssval::split_top(string_lower(val))
     if array_len(toks) == 0 is return st end
     let x: string = toks[0]
@@ -930,7 +937,7 @@ pub fn is_trivial_value(v: string) -> bool is
 end
 
 fn set_all_borders(st0: ComputedStyle, w: int, c: Color, set_color: bool) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     st.bt = w
     st.br = w
     st.bb = w
@@ -1020,7 +1027,7 @@ fn parse_px_pct(tok: string, env: cssval::LenEnv) -> PxPct is
 end
 
 fn apply_transform_fns(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let l: string = string_lower(string_trim(val))
     st.has_transform = false
     st.tr_tx = 0
@@ -1438,7 +1445,7 @@ end
 ;; Liczone po wszystkich deklaracjach elementu (math-depth może stać po font-size), więc potomkowie dziedziczą wynik.
 fn finalize_math(st0: ComputedStyle, parent: ComputedStyle) -> ComputedStyle is
     if !props::xhas(st0.xp, "x-fs-math") is return st0 end
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let dd: int = math_depth_of(st.xp) - math_depth_of(parent.xp)
     let mut msz: int = parent.font_size
     let mut k: int = 0
@@ -1456,7 +1463,7 @@ fn finalize_math(st0: ComputedStyle, parent: ComputedStyle) -> ComputedStyle is
 end
 
 fn finalize_transform(st0: ComputedStyle) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let mt: [int] = mat_parse(props::xget(st.xp, "x-m-transform"))
     let mtr: [int] = mat_parse(props::xget(st.xp, "x-m-translate"))
     let mr: [int] = mat_parse(props::xget(st.xp, "x-m-rotate"))
@@ -1496,7 +1503,7 @@ fn origin_tok(t: string) -> int is
 end
 
 fn apply_filter_fns(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let l: string = string_lower(string_trim(val))
     st.has_filter = false
     st.f_gray = 0
@@ -1553,7 +1560,7 @@ fn is_timing_tok(t: string) -> bool is
 end
 
 fn apply_animation(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let layers: [string] = cssval::split_commas(val)
     if array_len(layers) == 0 || string_lower(string_trim(layers[0])) == "none" is
         st.anim_name = ""
@@ -1604,7 +1611,7 @@ fn apply_animation(st0: ComputedStyle, val: string) -> ComputedStyle is
 end
 
 fn apply_transition(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let layers: [string] = cssval::split_commas(val)
     if array_len(layers) == 0 || string_lower(string_trim(layers[0])) == "none" is
         st.trans_ms = 0
@@ -1771,7 +1778,7 @@ fn areas_and_row_sizes(part: string) -> [string] is
 end
 
 fn apply_grid_shorthand(st0: ComputedStyle, val: string, full: bool) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let v: string = string_trim(val)
     let low: string = string_lower(v)
     if low == "none" is
@@ -1848,7 +1855,7 @@ fn list_style_type(t: string) -> bool is
 end
 
 fn apply_list_style(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let toks: [string] = cssval::split_top(string_lower(val))
     let mut i: int = 0
     while i < array_len(toks) is
@@ -1861,7 +1868,7 @@ fn apply_list_style(st0: ComputedStyle, val: string) -> ComputedStyle is
 end
 
 fn apply_text_shadow(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let layers: [string] = cssval::split_commas(val)
     if array_len(layers) == 0 || string_lower(string_trim(layers[0])) == "none" is
         st.has_tshadow = false
@@ -1895,7 +1902,7 @@ fn apply_text_shadow(st0: ComputedStyle, val: string, env: cssval::LenEnv) -> Co
 end
 
 fn apply_vertical_align(st0: ComputedStyle, lower: string, env: cssval::LenEnv) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     st.valign_px = 0
     if lower == "baseline" || lower == "top" || lower == "middle" || lower == "bottom" || lower == "sub" ||
        lower == "super" || lower == "text-top" || lower == "text-bottom" is
@@ -1917,7 +1924,7 @@ fn font_weight_num(lower: string, cur: int) -> int is
 end
 
 fn apply_deco_extras(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let toks: [string] = cssval::split_top(string_lower(val))
     let mut i: int = 0
     while i < array_len(toks) is
@@ -1934,7 +1941,7 @@ fn apply_deco_extras(st0: ComputedStyle, val: string) -> ComputedStyle is
 end
 
 fn apply_bg_extras(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let toks: [string] = cssval::split_top(string_lower(val))
     let mut pos: string = ""
     let mut i: int = 0
@@ -2125,12 +2132,40 @@ fn expand_logical(decls: [css::CssDecl], rtl: bool) -> [css::CssDecl] is
 end
 
 ;; Zdejmuje prefiksy dostawców z nazwy właściwości.
-fn unprefix(prop: string) -> string is
-    if string_starts_with(prop, "-webkit-") is return string_slice(prop, 8, string_len(prop)) end
-    if string_starts_with(prop, "-moz-") is return string_slice(prop, 5, string_len(prop)) end
-    if string_starts_with(prop, "-ms-") is return string_slice(prop, 4, string_len(prop)) end
-    if string_starts_with(prop, "-o-") is return string_slice(prop, 3, string_len(prop)) end
+;; 0.4: skrót reguł odstępów: [<width> || <style> || <color>] dla `column` lub `row`
+fn rule_set(xp0: string, which: string, lower: string) -> string is
+    let mut xp: string = xp0
+    let t: [string] = cssval::split_top(lower)
+    let mut k: int = 0
+    while k < array_len(t) is
+        if is_line_style(t[k]) is xp = props::xset(xp, which + "-rule-style", t[k])
+        elsif t[k] == "thin" || t[k] == "medium" || t[k] == "thick" || (props::is_len(t[k]) && !cssval::is_color(t[k])) is xp = props::xset(xp, which + "-rule-width", t[k])
+        elsif cssval::is_color(t[k]) is xp = props::xset(xp, which + "-rule-color", t[k]) end
+        k += 1
+    end
+    return xp
+end
+
+fn unprefix_alias(prop: string) -> string is
+    ;; 0.4: aliasy właściwości (CSS Fonts 4: font-width = font-stretch; CSS Color Adjust: color-adjust = print-color-adjust;
+    ;; CSS Fill & Stroke: fill-color / stroke-color to warstwa koloru tych samych właściwości SVG;
+    ;; -webkit-text-stroke-width / -color = stroke-width / stroke)
+    if prop == "font-width" is return "font-stretch" end
+    if prop == "color-adjust" is return "print-color-adjust" end
+    if prop == "text-stroke-width" is return "stroke-width" end
+    if prop == "text-stroke-color" is return "stroke" end
+    if prop == "fill-color" is return "fill" end
+    if prop == "stroke-color" is return "stroke" end
     return prop
+end
+
+fn unprefix(prop: string) -> string is
+    let mut p: string = prop
+    if string_starts_with(prop, "-webkit-") is p = string_slice(prop, 8, string_len(prop))
+    elsif string_starts_with(prop, "-moz-") is p = string_slice(prop, 5, string_len(prop))
+    elsif string_starts_with(prop, "-ms-") is p = string_slice(prop, 4, string_len(prop))
+    elsif string_starts_with(prop, "-o-") is p = string_slice(prop, 3, string_len(prop)) end
+    return unprefix_alias(p)
 end
 
 ;; Właściwości dziedziczone (do `unset`).
@@ -2146,7 +2181,7 @@ end
 
 ;; Kopiuje wartość właściwości `prop` (i jej skrótowych odpowiedników) z `src` do `st0`.
 fn copy_prop(st0: ComputedStyle, src: ComputedStyle, prop: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     if prop == "color" is st.color = src.color
     elsif prop == "background" || prop == "background-color" || prop == "background-image" is
         st.background = src.background
@@ -2246,7 +2281,9 @@ fn copy_prop(st0: ComputedStyle, src: ComputedStyle, prop: string) -> ComputedSt
         st.deco_style = src.deco_style
     elsif prop == "text-overflow" is st.ellipsis = src.ellipsis
     elsif prop == "white-space" is st.white_space = src.white_space
-    elsif prop == "word-break" || prop == "overflow-wrap" || prop == "word-wrap" is st.break_words = src.break_words
+    elsif prop == "word-break" || prop == "overflow-wrap" || prop == "word-wrap" is
+        st.break_words = src.break_words
+        st.break_all = src.break_all
     elsif prop == "cursor" is st.cursor = src.cursor
     elsif prop == "letter-spacing" is st.letter_spacing = src.letter_spacing
     elsif prop == "word-spacing" is st.word_spacing = src.word_spacing
@@ -2454,7 +2491,7 @@ end
 
 ;; Słowa kluczowe całej kaskady: inherit / initial / unset / revert.
 fn apply_css_wide(st0: ComputedStyle, prop: string, kw: string, parent: ComputedStyle) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     if prop == "all" is
         let keep: string = st.vars
         if kw == "inherit" is
@@ -2473,7 +2510,7 @@ fn apply_css_wide(st0: ComputedStyle, prop: string, kw: string, parent: Computed
 end
 
 fn apply_border_style(st0: ComputedStyle, val: string) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     let toks: [string] = cssval::split_top(string_lower(val))
     if array_len(toks) == 0 is return st end
     let a: string = toks[0]
@@ -2496,7 +2533,7 @@ end
 
 ;; Właściwości spoza głównego łańcucha apply_decls.
 fn apply_extra(st0: ComputedStyle, prop: string, val: string, lower: string, env: cssval::LenEnv, parent: ComputedStyle) -> ComputedStyle is
-    let mut st: ComputedStyle = st0
+    let mut st: ComputedStyle = copy_style(st0)
     if prop == "float" is
         st.float_side = if lower == "inline-start" then "left" elsif lower == "inline-end" then "right" else lower
     elsif prop == "clear" is st.clear_side = lower
@@ -2585,6 +2622,19 @@ fn apply_extra(st0: ComputedStyle, prop: string, val: string, lower: string, env
         st.xp = props::xset(st.xp, "filter", string_trim(val))
     elsif prop == "clip-path" is st.clip_path = if lower == "none" then "" else lower
     elsif prop == "pointer-events" is st.pointer_events = lower != "none"
+    elsif prop == "text-decoration-skip" is
+        ;; 0.4: starsza nazwa — none wyłącza przerwy, pozostałe wartości (objects/ink/auto/…) = skip-ink: auto
+        st.xp = props::xset(st.xp, "text-decoration-skip-ink", if lower == "none" then "none" else "auto")
+    elsif prop == "continue" is
+        ;; 0.4: dla line-clamp/max-lines nadmiarowa treść jest odrzucana (auto = discard)
+        st.xp = props::xset(st.xp, "continue", lower)
+    elsif prop == "interactivity" is
+        ;; 0.4: `inert` — poddrzewo bez zdarzeń myszy i bez zaznaczania (dziedziczone przez pola xp + stan stylu)
+        st.xp = props::xset(st.xp, "interactivity", lower)
+        if lower == "inert" is
+            st.pointer_events = false
+            st.user_select = "none"
+        end
     elsif prop == "user-select" is st.user_select = if lower == "auto" then st.user_select else lower
     elsif prop == "resize" is st.resize = lower
     elsif prop == "scroll-behavior" is st.scroll_behavior = lower
@@ -2695,6 +2745,39 @@ fn apply_extra(st0: ComputedStyle, prop: string, val: string, lower: string, env
             elsif cssval::is_color(t[k]) is st.xp = props::xset(st.xp, "column-rule-color", t[k]) end
             k += 1
         end
+    elsif prop == "text-stroke" is
+        ;; 0.4: skrót -webkit-text-stroke: <szerokość> || <kolor>
+        let tk: [string] = cssval::split_top(lower)
+        let mut q: int = 0
+        while q < array_len(tk) is
+            if cssval::is_color(tk[q]) is st.xp = props::xset(st.xp, "stroke", tk[q])
+            elsif props::is_len(tk[q]) || props::is_num(tk[q]) || tk[q] == "thin" || tk[q] == "medium" || tk[q] == "thick" is
+                st.xp = props::xset(st.xp, "stroke-width", if tk[q] == "thin" then "1px" elsif tk[q] == "medium" then "3px" elsif tk[q] == "thick" then "5px" else tk[q])
+            end
+            q += 1
+        end
+    elsif prop == "row-rule" is st.xp = rule_set(st.xp, "row", lower)
+    elsif prop == "rule" is
+        st.xp = rule_set(st.xp, "column", lower)
+        st.xp = rule_set(st.xp, "row", lower)
+    elsif prop == "rule-style" || prop == "rule-color" || prop == "rule-width" is
+        let part: string = string_slice(prop, 5, string_len(prop))
+        st.xp = props::xset(st.xp, "column-rule-" + part, lower)
+        st.xp = props::xset(st.xp, "row-rule-" + part, lower)
+    elsif prop == "text-spacing" is
+        ;; 0.4: skrót text-autospace || text-spacing-trim
+        let tk: [string] = cssval::split_top(lower)
+        let mut j: int = 0
+        while j < array_len(tk) is
+            let w: string = tk[j]
+            j += 1
+            if w == "space-all" || w == "space-first" || w == "trim-start" is st.xp = props::xset(st.xp, "text-spacing-trim", w)
+            elsif w == "none" is
+                st.xp = props::xset(st.xp, "text-spacing-trim", "space-all")
+                st.xp = props::xset(st.xp, "text-autospace", "no-autospace")
+            elsif w == "normal" is st.xp = props::xset(st.xp, "text-spacing-trim", "normal")
+            else is st.xp = props::xset(st.xp, "text-autospace", w) end
+        end
     elsif prop == "container" is
         let sl: int = string_find(val, "/")
         let nm: string = string_trim(if sl >= 0 then string_slice(val, 0, sl) else val)
@@ -2758,7 +2841,7 @@ end
 
 pub fn apply_decls(base: ComputedStyle, decls0: [css::CssDecl], em_base: int, ix: css::InteractionState, parent: ComputedStyle) -> ComputedStyle is
     let decls: [css::CssDecl] = expand_logical(decls0, dir_is_rtl(decls0, parent.direction))
-    let mut st: ComputedStyle = base
+    let mut st: ComputedStyle = copy_style(base)
     st.vars = collect_vars(st.vars, decls)
     let basis: int = ix.viewport_w
     let mut i: int = 0
@@ -3033,6 +3116,7 @@ pub fn apply_decls(base: ComputedStyle, decls0: [css::CssDecl], em_base: int, ix
         elsif prop == "white-space" is st.white_space = lower
         elsif prop == "word-break" || prop == "overflow-wrap" || prop == "word-wrap" is
             st.break_words = lower == "break-all" || lower == "break-word" || lower == "anywhere"
+            if prop == "word-break" is st.break_all = lower == "break-all" end
         elsif prop == "cursor" is st.cursor = lower
         elsif prop == "overflow" is st = apply_overflow(st, val, "both")
         elsif prop == "overflow-x" is st = apply_overflow(st, val, "x")
@@ -3208,4 +3292,212 @@ end
 pub fn line_height_of(st: ComputedStyle, font_h: int) -> int is
     if st.line_height > 0 is return st.line_height end
     return font_h
+end
+
+
+;; ---------- 0.4: kopiowanie struktur ----------
+;; W skompilowanym H# przypisanie struktury (`let mut s = b`) NIE kopiuje — obie nazwy wskazują ten sam obiekt
+;; (interpreter kopiował). Te funkcje (generowane z definicji struktury) dają prawdziwą kopię tam, gdzie kod
+;; modyfikuje wynik, a oryginał ma zostać nietknięty.
+pub fn copy_ints(a: [int]) -> [int] is
+    let mut o: [int] = []
+    let mut i: int = 0
+    while i < array_len(a) is
+        o = array_push(o, a[i])
+        i += 1
+    end
+    return o
+end
+
+pub fn copy_color(c: Color) -> Color is
+    return Color { r: c.r, g: c.g, b: c.b, a: c.a }
+end
+
+pub fn copy_style(s: ComputedStyle) -> ComputedStyle is
+    return ComputedStyle {
+        display: s.display,
+        position: s.position,
+        visible: s.visible,
+        overflow_x: s.overflow_x,
+        overflow_y: s.overflow_y,
+        color: copy_color(s.color),
+        background: copy_color(s.background),
+        has_bg: s.has_bg,
+        bg_image: s.bg_image,
+        bg_size: s.bg_size,
+        has_grad: s.has_grad,
+        grad_from: copy_color(s.grad_from),
+        grad_to: copy_color(s.grad_to),
+        grad_vertical: s.grad_vertical,
+        width: s.width,
+        width_pct: s.width_pct,
+        width_mode: s.width_mode,
+        height: s.height,
+        height_pct: s.height_pct,
+        height_mode: s.height_mode,
+        min_width: s.min_width,
+        min_width_pct: s.min_width_pct,
+        max_width: s.max_width,
+        max_width_pct: s.max_width_pct,
+        max_width_mode: s.max_width_mode,
+        min_height: s.min_height,
+        max_height: s.max_height,
+        max_height_mode: s.max_height_mode,
+        border_box: s.border_box,
+        padding: s.padding,
+        margin: s.margin,
+        pad_top: s.pad_top,
+        pad_right: s.pad_right,
+        pad_bottom: s.pad_bottom,
+        pad_left: s.pad_left,
+        mar_top: s.mar_top,
+        mar_right: s.mar_right,
+        mar_bottom: s.mar_bottom,
+        mar_left: s.mar_left,
+        top: s.top,
+        right: s.right,
+        bottom: s.bottom,
+        left: s.left,
+        z_index: s.z_index,
+        font_size: s.font_size,
+        bold: s.bold,
+        italic: s.italic,
+        underline: s.underline,
+        strike: s.strike,
+        line_height: s.line_height,
+        text_align: s.text_align,
+        text_transform: s.text_transform,
+        white_space: s.white_space,
+        ellipsis: s.ellipsis,
+        break_words: s.break_words,
+        break_all: s.break_all,
+        cursor: s.cursor,
+        border: s.border,
+        bt: s.bt,
+        br: s.br,
+        bb: s.bb,
+        bl: s.bl,
+        border_color: copy_color(s.border_color),
+        bct: copy_color(s.bct),
+        bcr: copy_color(s.bcr),
+        bcb: copy_color(s.bcb),
+        bcl: copy_color(s.bcl),
+        rad_tl: s.rad_tl,
+        rad_tr: s.rad_tr,
+        rad_br: s.rad_br,
+        rad_bl: s.rad_bl,
+        has_shadow: s.has_shadow,
+        sh_x: s.sh_x,
+        sh_y: s.sh_y,
+        sh_blur: s.sh_blur,
+        sh_spread: s.sh_spread,
+        sh_color: copy_color(s.sh_color),
+        outline_w: s.outline_w,
+        outline_color: copy_color(s.outline_color),
+        gap: s.gap,
+        row_gap: s.row_gap,
+        flex_dir: s.flex_dir,
+        flex_wrap: s.flex_wrap,
+        justify: s.justify,
+        align: s.align,
+        align_self: s.align_self,
+        flex_grow: s.flex_grow,
+        flex_shrink: s.flex_shrink,
+        flex_basis: s.flex_basis,
+        order: s.order,
+        grid_cols: s.grid_cols,
+        grid_rows: s.grid_rows,
+        grid_col_span: s.grid_col_span,
+        opacity: s.opacity,
+        object_fit: s.object_fit,
+        trans_ms: s.trans_ms,
+        content: s.content,
+        has_content: s.has_content,
+        vars: s.vars,
+        tr_m: copy_ints(s.tr_m),
+        xp: s.xp,
+        letter_spacing: s.letter_spacing,
+        word_spacing: s.word_spacing,
+        text_indent: s.text_indent,
+        has_tshadow: s.has_tshadow,
+        ts_x: s.ts_x,
+        ts_y: s.ts_y,
+        ts_blur: s.ts_blur,
+        ts_color: copy_color(s.ts_color),
+        valign: s.valign,
+        valign_px: s.valign_px,
+        list_style: s.list_style,
+        list_pos: s.list_pos,
+        font_family: s.font_family,
+        font_key: s.font_key,
+        font_weight: s.font_weight,
+        deco_color: copy_color(s.deco_color),
+        has_deco_color: s.has_deco_color,
+        deco_style: s.deco_style,
+        deco_thick: s.deco_thick,
+        direction: s.direction,
+        hyphens: s.hyphens,
+        tab_size: s.tab_size,
+        border_spacing: s.border_spacing,
+        border_collapse: s.border_collapse,
+        table_fixed: s.table_fixed,
+        float_side: s.float_side,
+        clear_side: s.clear_side,
+        align_content: s.align_content,
+        justify_items: s.justify_items,
+        justify_self: s.justify_self,
+        grid_areas: s.grid_areas,
+        grid_area: s.grid_area,
+        grid_row_start: s.grid_row_start,
+        grid_row_span: s.grid_row_span,
+        grid_col_start: s.grid_col_start,
+        grid_auto_flow: s.grid_auto_flow,
+        grid_auto_rows: s.grid_auto_rows,
+        grid_auto_cols: s.grid_auto_cols,
+        aspect_ratio: s.aspect_ratio,
+        box_sizing_content: s.box_sizing_content,
+        pointer_events: s.pointer_events,
+        user_select: s.user_select,
+        resize: s.resize,
+        accent: copy_color(s.accent),
+        has_accent: s.has_accent,
+        scroll_behavior: s.scroll_behavior,
+        has_transform: s.has_transform,
+        tr_tx: s.tr_tx,
+        tr_ty: s.tr_ty,
+        tr_tx_pct: s.tr_tx_pct,
+        tr_ty_pct: s.tr_ty_pct,
+        tr_sx: s.tr_sx,
+        tr_sy: s.tr_sy,
+        tr_rot: s.tr_rot,
+        origin_x: s.origin_x,
+        origin_y: s.origin_y,
+        has_filter: s.has_filter,
+        f_gray: s.f_gray,
+        f_bright: s.f_bright,
+        f_contrast: s.f_contrast,
+        f_invert: s.f_invert,
+        f_sepia: s.f_sepia,
+        f_opacity: s.f_opacity,
+        clip_path: s.clip_path,
+        bg_repeat: s.bg_repeat,
+        bg_pos: s.bg_pos,
+        border_style: s.border_style,
+        bs_r: s.bs_r,
+        bs_b: s.bs_b,
+        bs_l: s.bs_l,
+        outline_style: s.outline_style,
+        outline_offset: s.outline_offset,
+        anim_name: s.anim_name,
+        anim_ms: s.anim_ms,
+        anim_delay: s.anim_delay,
+        anim_iter: s.anim_iter,
+        anim_dir: s.anim_dir,
+        anim_fill: s.anim_fill,
+        anim_ease: s.anim_ease,
+        anim_paused: s.anim_paused,
+        trans_prop: s.trans_prop,
+        trans_delay: s.trans_delay,
+        trans_ease: s.trans_ease
+    }
 end
