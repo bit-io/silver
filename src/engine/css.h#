@@ -63,6 +63,9 @@ pub struct Stylesheet is
     pub imports:   [string]      ;; @import: "url\u0001warunek-media" (jeszcze nierozwiązane)
     pub fonts:     [FontFace]
     pub keyframes: [Keyframes]
+    pub palettes:  [string]      ;; 0.4: @font-palette-values: "--nazwa\u0001rodziny\u0001base-palette\u0001override-colors"
+    pub pages:     [string]      ;; 0.4: @page: "selektor\u0001ciało" (selektor: "", ":first", ":left", ":right", "nazwa", "nazwa:first"…)
+    pub fvalues:   [string]      ;; 0.4: @font-feature-values: "rodziny\u0001rodzaj\u0001nazwa\u0001liczby"
 end
 
 pub struct SelectorPath is
@@ -79,29 +82,40 @@ pub struct InteractionState is
     pub viewport_w:  int
     pub viewport_h:  int
     pub dark:        bool
+    pub forced:      bool      ;; 0.4: tryb wymuszonych kolorów (media forced-colors: active)
+    pub print:       bool      ;; 0.4: renderowanie do druku (media print, print-color-adjust)
+    pub print_bg:    bool      ;; 0.4: druk teł (opcja „grafika tła”): wyłączona = print-color-adjust: economy gubi tła
     pub cq_w:        [int]     ;; @container: szerokość zawartości kontenera wg id węzła (-1 = nie jest kontenerem)
     pub cq_h:        [int]     ;; wysokość (-1 = brak / kontener tylko w osi inline)
     pub cq_names:    [string]  ;; nazwy kontenerów wg id węzła, spacjami
+    pub excl:        [int]     ;; wykluczenia wrap-flow: grupy [x, y, w, h, tryb, id węzła]
+    pub tcur:        int       ;; :target-current — id węzła aktualnego odnośnika grupy scroll-target-group (-1 = brak)
+end
+
+pub fn copy_interaction(i: InteractionState) -> InteractionState is
+    return InteractionState { hovered_id: i.hovered_id, focused_id: i.focused_id, active_id: i.active_id, focused_node: i.focused_node,
+                              viewport_w: i.viewport_w, viewport_h: i.viewport_h, dark: i.dark, forced: i.forced, print: i.print, print_bg: i.print_bg,
+                              cq_w: i.cq_w, cq_h: i.cq_h, cq_names: i.cq_names, excl: i.excl, tcur: i.tcur }
 end
 
 pub fn no_interaction() -> InteractionState is
     return InteractionState { hovered_id: -1, focused_id: "", active_id: -1, focused_node: -1,
-                              viewport_w: 800, viewport_h: 600, dark: false, cq_w: [], cq_h: [], cq_names: [] }
+                              viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], excl: [], tcur: -1 }
 end
 
 pub fn interaction(hovered: int, focused_node: int, active: int) -> InteractionState is
     return InteractionState { hovered_id: hovered, focused_id: "", active_id: active,
-                              focused_node: focused_node, viewport_w: 800, viewport_h: 600, dark: false, cq_w: [], cq_h: [], cq_names: [] }
+                              focused_node: focused_node, viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], excl: [], tcur: -1 }
 end
 
 ;; Zgodność z 0.1: fokus po attr_id zamiast id węzła.
 pub fn ix_legacy(hovered: int, focused_id: string, active: int) -> InteractionState is
     return InteractionState { hovered_id: hovered, focused_id: focused_id, active_id: active, focused_node: -1,
-                              viewport_w: 800, viewport_h: 600, dark: false, cq_w: [], cq_h: [], cq_names: [] }
+                              viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], excl: [], tcur: -1 }
 end
 
 pub fn empty_sheet() -> Stylesheet is
-    return Stylesheet { rules: [], imports: [], fonts: [], keyframes: [] }
+    return Stylesheet { rules: [], imports: [], fonts: [], keyframes: [], palettes: [], pages: [], fvalues: [] }
 end
 
 ;; ---------- pomocnicze ----------
@@ -1016,7 +1030,85 @@ pub fn parse(css: string) -> Stylesheet is
             end
         end
     end
-    return Stylesheet { rules: rules, imports: imports, fonts: fonts, keyframes: kfs }
+    return Stylesheet { rules: rules, imports: imports, fonts: fonts, keyframes: kfs, palettes: parse_palettes(clean), pages: parse_pages(clean), fvalues: parse_fvalues(clean) }
+end
+
+;; 0.4: wartość deklaracji `prop` z ciała bloku "a: b; c: d"
+pub fn css_decl(body: string, prop: string) -> string is
+    let decls: [string] = string_split(body, ";")
+    let mut i: int = 0
+    while i < array_len(decls) is
+        let c: int = string_find(decls[i], ":")
+        if c > 0 && string_lower(string_trim(string_slice(decls[i], 0, c))) == prop is
+            return string_trim(string_slice(decls[i], c + 1, string_len(decls[i])))
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; @page [nazwa][:first|:left|:right] { size: A4; margin: 20mm }
+fn parse_pages(clean: string) -> [string] is
+    let mut out: [string] = []
+    let blocks: [string] = scan_at(clean, "page", [])
+    let mut i: int = 0
+    while i < array_len(blocks) is
+        let parts: [string] = string_split(blocks[i], "\u0002")
+        i += 1
+        if array_len(parts) < 2 is continue end
+        out = array_push(out, string_lower(string_replace(string_trim(parts[0]), " ", "")) + "\u0001" + parts[1])
+    end
+    return out
+end
+
+;; @font-palette-values --nazwa { font-family: X; base-palette: 1; override-colors: 0 #f00, 2 rgb(0 0 255) }
+fn parse_palettes(clean: string) -> [string] is
+    let mut out: [string] = []
+    let blocks: [string] = scan_at(clean, "font-palette-values", [])
+    let mut i: int = 0
+    while i < array_len(blocks) is
+        let parts: [string] = string_split(blocks[i], "\u0002")
+        i += 1
+        if array_len(parts) < 2 || !string_starts_with(string_trim(parts[0]), "--") is continue end
+        out = array_push(out, string_trim(parts[0]) + "\u0001" + strip_quotes_css(css_decl(parts[1], "font-family")) + "\u0001" +
+                              string_lower(css_decl(parts[1], "base-palette")) + "\u0001" + css_decl(parts[1], "override-colors"))
+    end
+    return out
+end
+
+;; @font-feature-values Rodzina { @styleset { nazwa: 1 3; } @swash { x: 2; } … }
+fn parse_fvalues(clean: string) -> [string] is
+    let mut out: [string] = []
+    let blocks: [string] = scan_at(clean, "font-feature-values", [])
+    let kinds: [string] = ["stylistic", "historical-forms", "styleset", "character-variant", "swash", "ornaments", "annotation"]
+    let mut i: int = 0
+    while i < array_len(blocks) is
+        let parts: [string] = string_split(blocks[i], "\u0002")
+        i += 1
+        if array_len(parts) < 2 is continue end
+        let fam: string = string_lower(string_replace(string_replace(string_replace(parts[0], "\"", ""), "'", ""), ", ", ","))
+        let mut k: int = 0
+        while k < array_len(kinds) is
+            let kb: [string] = scan_at(parts[1], kinds[k], [])
+            let mut q: int = 0
+            while q < array_len(kb) is
+                let kp: [string] = string_split(kb[q], "\u0002")
+                q += 1
+                if array_len(kp) < 2 is continue end
+                let decls: [string] = string_split(kp[1], ";")
+                let mut d: int = 0
+                while d < array_len(decls) is
+                    let c: int = string_find(decls[d], ":")
+                    if c > 0 is
+                        out = array_push(out, string_trim(fam) + "\u0001" + kinds[k] + "\u0001" + string_trim(string_slice(decls[d], 0, c)) + "\u0001" + string_trim(string_slice(decls[d], c + 1, string_len(decls[d]))))
+                    end
+                    d += 1
+                end
+            end
+            k += 1
+        end
+    end
+    return out
 end
 
 fn strip_quotes_css(v: string) -> string is
@@ -1073,7 +1165,40 @@ pub fn concat(a: Stylesheet, b: Stylesheet) -> Stylesheet is
         kfs = array_push(kfs, b.keyframes[i])
         i += 1
     end
-    return Stylesheet { rules: rules, imports: imports, fonts: fonts, keyframes: kfs }
+    let mut palettes: [string] = []
+    let mut fvalues: [string] = []
+    let mut pages: [string] = []
+    i = 0
+    while i < array_len(a.pages) is
+        pages = array_push(pages, a.pages[i])
+        i += 1
+    end
+    i = 0
+    while i < array_len(b.pages) is
+        pages = array_push(pages, b.pages[i])
+        i += 1
+    end
+    i = 0
+    while i < array_len(a.palettes) is
+        palettes = array_push(palettes, a.palettes[i])
+        i += 1
+    end
+    i = 0
+    while i < array_len(b.palettes) is
+        palettes = array_push(palettes, b.palettes[i])
+        i += 1
+    end
+    i = 0
+    while i < array_len(a.fvalues) is
+        fvalues = array_push(fvalues, a.fvalues[i])
+        i += 1
+    end
+    i = 0
+    while i < array_len(b.fvalues) is
+        fvalues = array_push(fvalues, b.fvalues[i])
+        i += 1
+    end
+    return Stylesheet { rules: rules, imports: imports, fonts: fonts, keyframes: kfs, palettes: palettes, pages: pages, fvalues: fvalues }
 end
 
 ;; ---------- @media ----------
@@ -1224,9 +1349,13 @@ fn media_feature(feat: string, ix: InteractionState) -> bool is
         return if ix.viewport_w >= ix.viewport_h then val == "landscape" else val == "portrait"
     end
     if name == "prefers-reduced-motion" is return val == "no-preference" end
-    if name == "prefers-contrast" is return val == "no-preference" end
+    if name == "prefers-contrast" is
+        return if ix.forced then val == "more" else val == "no-preference"
+    end
     if name == "prefers-reduced-transparency" is return val == "no-preference" end
-    if name == "forced-colors" is return val == "none" end
+    if name == "forced-colors" is
+        return if ix.forced then val == "active" else val == "none"
+    end
     if name == "display-mode" is return val == "standalone" || val == "browser" end
     if name == "update" is return val == "fast" end
     if name == "hover" || name == "any-hover" is return val == "hover" end
@@ -1281,7 +1410,11 @@ fn media_expr(expr: string, ix: InteractionState) -> bool is
             continue
         end
         let mut v: bool = true
-        if tl == "print" || tl == "speech" || tl == "tty" || tl == "projection" is
+        if tl == "print" is
+            v = ix.print
+        elsif tl == "screen" is
+            v = !ix.print
+        elsif tl == "speech" || tl == "tty" || tl == "projection" is
             v = false
         elsif string_starts_with(t, "(") is
             let inner: string = string_trim(string_slice(t, 1, string_len(t) - 1))
@@ -1440,6 +1573,7 @@ fn pseudo_matches(d: dom::Dom, node_id: int, ps: string, ix: InteractionState) -
     let n: dom::DomNode = d.nodes[node_id]
     if ps == "hover" is return ix.hovered_id >= 0 && is_self_or_ancestor(d, node_id, ix.hovered_id) end
     if ps == "active" is return ix.active_id >= 0 && is_self_or_ancestor(d, node_id, ix.active_id) end
+    if ps == "target-current" is return ix.tcur >= 0 && ix.tcur == node_id end
     if ps == "focus" is
         return (ix.focused_node >= 0 && ix.focused_node == node_id) || (n.attr_id != "" && n.attr_id == ix.focused_id)
     end
