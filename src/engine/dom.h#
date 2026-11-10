@@ -197,6 +197,28 @@ pub fn norm_tag(t: string) -> string is
     return t
 end
 
+;; Głęboka kopia: w skompilowanym H# tablice i struktury są współdzielone, a generowanie pseudo-elementów dopisuje węzły
+;; i dzieci — bez kopii powtórne układy tego samego DOM powielałyby ::before/::after.
+pub fn copy_node(n: DomNode) -> DomNode is
+    let mut kids: [int] = []
+    let mut k: int = 0
+    while k < array_len(n.children) is
+        kids = array_push(kids, n.children[k])
+        k += 1
+    end
+    return DomNode { id: n.id, parent: n.parent, tag: n.tag, text: n.text, attr_id: n.attr_id, attr_class: n.attr_class, on_click: n.on_click, attr_src: n.attr_src, attr_value: n.attr_value, attr_style: n.attr_style, attr_placeholder: n.attr_placeholder, attr_type: n.attr_type, attr_name: n.attr_name, attr_href: n.attr_href, attr_title: n.attr_title, on_input: n.on_input, on_change: n.on_change, on_submit: n.on_submit, on_keydown: n.on_keydown, on_hover: n.on_hover, attrs: n.attrs, disabled: n.disabled, checked: n.checked, readonly: n.readonly, removed: n.removed, glue: n.glue, pseudo: n.pseudo, children: kids }
+end
+
+pub fn deep_copy(d: Dom) -> Dom is
+    let mut nodes: [DomNode] = []
+    let mut i: int = 0
+    while i < array_len(d.nodes) is
+        nodes = array_push(nodes, copy_node(d.nodes[i]))
+        i += 1
+    end
+    return Dom { nodes: nodes, inline_css: d.inline_css, inline_js: d.inline_js, stylesheets: d.stylesheets, scripts: d.scripts, title: d.title }
+end
+
 pub fn new_node(dom: Dom, parent: int, tag: string) -> Dom is
     let node: DomNode = blank_node(array_len(dom.nodes), parent, tag)
     let mut d: Dom = Dom {
