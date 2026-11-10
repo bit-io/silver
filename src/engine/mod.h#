@@ -9,10 +9,14 @@ mod shape
 mod anchor
 mod anim
 mod layout
+mod speech
+mod touch
 mod gfx
 mod svg
 mod paint
+mod paged
 mod template
 mod jsonlite
 mod jsonval
 mod netutil
+mod focus
