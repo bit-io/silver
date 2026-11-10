@@ -140,8 +140,18 @@ pub fn decode(code: int, payload: string) -> InputEvent is
         e.kind = "expose"
     elsif code == 16 is
         e.kind = "mouse_leave"
+    elsif code == 18 || code == 19 || code == 20 is
+        e.kind = if code == 18 then "touch_down" elsif code == 19 then "touch_move" else "touch_up"
+        e.code = field(parts, 0)
+        e.x = field(parts, 1)
+        e.y = field(parts, 2)
     end
     return e
+end
+
+;; 0.4: wstrzykuje zdarzenie palca (kind: 0 down, 1 move, 2 up) — testy i automatyzacja
+pub fn inject_touch(win: Window, kind: int, finger: int, x: int, y: int) -> bool is
+    return ffi_shim::silver_inject_touch(win.handle, kind, finger, x, y) != 0
 end
 
 pub fn poll(win: Window) -> InputEvent is
