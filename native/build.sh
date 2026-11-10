@@ -29,9 +29,20 @@ else
 SDL_CFLAGS=$(sdl2-config --cflags 2>/dev/null || pkg-config --cflags sdl2 SDL2_ttf SDL2_image 2>/dev/null || echo "")
 fi
 
+# 0.4: kształtowanie tekstu (HarfBuzz + FreeType) dla font-variant-alternates / font-language-override / font-palette
+SHAPE_CFLAGS=""
+SHAPE_LIBS=""
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists harfbuzz freetype2 2>/dev/null; then
+    SHAPE_CFLAGS="-DSILVER_SHAPING=1 $(pkg-config --cflags harfbuzz freetype2)"
+    SHAPE_LIBS="$(pkg-config --libs harfbuzz freetype2)"
+    echo "[silver] kształtowanie tekstu: HarfBuzz + FreeType"
+else
+    echo "[silver] UWAGA: brak harfbuzz/freetype2 (pkg-config) — font-variant-alternates, font-language-override, font-palette i font-optical-sizing bez efektu (apt install libharfbuzz-dev libfreetype-dev)"
+fi
+
 echo "[silver] libsilvershim.a (SDL2)"
 # shellcheck disable=SC2086
-$CC $CFLAGS $SDL_CFLAGS -c silver_shim.c -o "$OUT/silver_shim.o"
+$CC $CFLAGS $SDL_CFLAGS $SHAPE_CFLAGS -c silver_shim.c -o "$OUT/silver_shim.o"
 $AR rcs "$OUT/libsilvershim.a" "$OUT/silver_shim.o"
 # wariant dla linkowania w pełni statycznego: domyślnie renderer programowy (patrz silver_shim.c)
 if [ -x "$OUT/deps/bin/sdl2-config" ]; then
@@ -96,7 +107,7 @@ write_pc() { # nazwa opis libs
         echo "Libs: -L\${libdir} -l$1 $3"
     } > "$PC/$1.pc"
 }
-write_pc silvershim    "Silver: warstwa okienna SDL2" "-lSDL2_image -lSDL2_ttf -lSDL2 -lm"
+write_pc silvershim    "Silver: warstwa okienna SDL2" "-lSDL2_image -lSDL2_ttf -lSDL2 $SHAPE_LIBS -lz -lm"
 write_pc silverjs      "Silver: QuickJS + mostek JS"  "-lm -lpthread"
 write_pc silverdialogs "Silver: natywne dialogi"      ""
 
