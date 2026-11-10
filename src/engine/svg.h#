@@ -3,6 +3,8 @@ mod cssval
 mod props
 mod style
 mod gfx
+use "std -> conv" from "conv"
+use "std -> math" from "math"
 
 ;; ====================================================================
 ;;  Silver 0.4 — SVG w HTML: rozmiar elementu <svg> i serializacja poddrzewa do znacznika SVG
@@ -144,6 +146,10 @@ fn presentation_style(st: style::ComputedStyle, scale1000: int, vec_fix: bool) -
     s = add_decl(s, "stroke-miterlimit", props::xget(xp, "stroke-miterlimit"))
     s = add_decl(s, "stroke-dasharray", props::xget(xp, "stroke-dasharray"))
     s = add_decl(s, "stroke-dashoffset", props::xget(xp, "stroke-dashoffset"))
+    ;; 0.4: stroke-dash-justify / stroke-dashadjust / stroke-dash-corner → rasteryzator (nanosvg, nsvg__dashJustified)
+    s = add_decl(s, "stroke-dash-justify", props::xget(xp, "stroke-dash-justify"))
+    s = add_decl(s, "stroke-dashadjust", props::xget(xp, "stroke-dashadjust"))
+    s = add_decl(s, "stroke-dash-corner", props::xget(xp, "stroke-dash-corner"))
     let sw: string = props::xget(xp, "stroke-width")
     if sw != "" is
         if vec_fix && scale1000 > 0 && attr_px(sw) >= 0 is
@@ -178,6 +184,10 @@ fn geometry_attrs(st: style::ComputedStyle) -> string is
 end
 
 fn attrs_of(n: dom::DomNode, tag: string, extra_style: string) -> string is
+    return attrs_of_ord(n, tag, extra_style, false)
+end
+
+fn attrs_of_ord(n: dom::DomNode, tag: string, extra_style: string, extra_last: bool) -> string is
     let mut out: string = ""
     let names: [string] = dom::extra_attr_names(n)
     let bbox: bool = tag == "lineargradient" || tag == "radialgradient"
@@ -200,14 +210,15 @@ fn attrs_of(n: dom::DomNode, tag: string, extra_style: string) -> string is
         out = out + " xlink:href=\"" + esc_attr(n.attr_href) + "\""
     end
     if n.attr_id != "" is out = out + " id=\"" + esc_attr(n.attr_id) + "\"" end
-    let st_all: string = extra_style + orig_style
+    let st_all: string = if extra_last then orig_style + extra_style else extra_style + orig_style
     if st_all != "" is out = out + " style=\"" + esc_attr(st_all) + "\"" end
     return out
 end
 
 fn is_skipped(tag: string) -> bool is
     return tag == "title" || tag == "desc" || tag == "metadata" || tag == "script" || tag == "style" || tag == "text" || tag == "tspan" ||
-           tag == "textpath" || tag == "foreignobject" || tag == "marker" || tag == "symbol" || tag == "svg-text"
+           tag == "textpath" || tag == "foreignobject" || tag == "marker" || tag == "symbol" || tag == "svg-text" ||
+           tag == "clippath" || tag == "mask" || tag == "filter"
 end
 
 fn find_by_attr_id(d: dom::Dom, id: string) -> int is
@@ -225,7 +236,405 @@ fn num_attr_or0(n: dom::DomNode, name: string) -> string is
     return v
 end
 
-fn node_markup(d: dom::Dom, styles: [style::ComputedStyle], id: int, depth: int, scale1000: int) -> string is
+;; ---------- 0.4: color-interpolation: linearRGB (gradienty) ----------
+;; NanoSVG miesza kolory przystanków w sRGB. Dla gradientu z `color-interpolation: linearRGB` serializer zastępuje
+;; każdy odcinek między przystankami serią pośrednich przystanków liczonych w przestrzeni liniowej.
+fn srgb_to_lin(c: int) -> f64 is
+    let x: f64 = conv::int_to_float(c) / 255.0
+    if x <= 0.04045 is return x / 12.92 end
+    return math::pow((x + 0.055) / 1.055, 2.4)
+end
+
+fn lin_to_srgb(x: f64) -> int is
+    let mut y: f64 = x * 12.92
+    if x > 0.0031308 is y = 1.055 * math::pow(x, 1.0 / 2.4) - 0.055 end
+    let v: int = conv::float_to_int(y * 255.0 + 0.5)
+    if v < 0 is return 0 end
+    if v > 255 is return 255 end
+    return v
+end
+
+fn stop_offset_of(n: dom::DomNode) -> f64 is
+    let raw: string = string_trim(dom::get_attr(n, "offset"))
+    if raw == "" is return 0.0 end
+    let mut v: f64 = 0.0
+    if string_ends_with(raw, "%") is
+        v = conv::str_to_float(string_slice(raw, 0, string_len(raw) - 1)) / 100.0
+    else is
+        v = conv::str_to_float(raw)
+    end
+    if v < 0.0 is return 0.0 end
+    if v > 1.0 is return 1.0 end
+    return v
+end
+
+fn stop_tag(off: f64, r: int, g: int, b: int, op: f64) -> string is
+    let o1000: int = conv::float_to_int(off * 100000.0 + 0.5)
+    let a1000: int = conv::float_to_int(op * 1000.0 + 0.5)
+    return "<stop offset=\"" + gfx::fmt_x1000(o1000) + "%\" style=\"stop-color:rgb(" + to_string(r) + "," + to_string(g) + "," + to_string(b) + ");stop-opacity:" + gfx::fmt_x1000(a1000) + "\"/>"
+end
+
+fn linear_rgb_stops(d: dom::Dom, styles: [style::ComputedStyle], kids: [int]) -> string is
+    let mut offs: [f64] = []
+    let mut cs: [style::Color] = []
+    let mut ops: [f64] = []
+    let mut ci: int = 0
+    while ci < array_len(kids) is
+        let sn: dom::DomNode = d.nodes[kids[ci]]
+        if sn.tag == "stop" && !sn.removed is
+            let sst: style::ComputedStyle = styles[kids[ci]]
+            let mut col: string = resolve_current(props::xget(sst.xp, "stop-color"), sst)
+            if col == "" is col = resolve_current(dom::get_attr(sn, "stop-color"), sst) end
+            if col == "" is col = "black" end
+            let mut opv: string = props::xget(sst.xp, "stop-opacity")
+            if opv == "" is opv = dom::get_attr(sn, "stop-opacity") end
+            if opv == "" is opv = "1" end
+            let mut last: f64 = 0.0
+            if array_len(offs) > 0 is last = offs[array_len(offs) - 1] end
+            let mut o: f64 = stop_offset_of(sn)
+            if o < last is o = last end
+            offs = array_push(offs, o)
+            cs = array_push(cs, style::parse_color(col))
+            ops = array_push(ops, conv::str_to_float(string_trim(opv)))
+        end
+        ci += 1
+    end
+    let mut out: string = ""
+    let n: int = array_len(offs)
+    let mut i: int = 0
+    while i < n is
+        out = out + stop_tag(offs[i], cs[i].r, cs[i].g, cs[i].b, ops[i])
+        if i + 1 < n is
+            let k_steps: int = 8
+            let mut k: int = 1
+            while k < k_steps is
+                let t: f64 = conv::int_to_float(k) / conv::int_to_float(k_steps)
+                let lr: f64 = srgb_to_lin(cs[i].r) * (1.0 - t) + srgb_to_lin(cs[i + 1].r) * t
+                let lg: f64 = srgb_to_lin(cs[i].g) * (1.0 - t) + srgb_to_lin(cs[i + 1].g) * t
+                let lb: f64 = srgb_to_lin(cs[i].b) * (1.0 - t) + srgb_to_lin(cs[i + 1].b) * t
+                out = out + stop_tag(offs[i] + (offs[i + 1] - offs[i]) * t, lin_to_srgb(lr), lin_to_srgb(lg), lin_to_srgb(lb), ops[i] * (1.0 - t) + ops[i + 1] * t)
+                k += 1
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+
+;; ============ 0.4: efekty SVG na warstwach — clip-path (clip-rule), mask (mask-type), filter ============
+;; NanoSVG nie zna clipPath/mask/filter. Element z takim odwołaniem zostaje w dokumencie znacznikiem \u001e<id>\u001e,
+;; a markup() rozbija dokument na warstwy (protokół opisany w native/silver_svgfx.h): zwykłe segmenty ("draw") i elementy
+;; z efektami ("fx": filtr → clip → maska → krycie), które rasteryzator natywny składa w kolejności malowania.
+;; Ograniczenia: efekty zagnieżdżone wewnątrz elementu z efektem oraz w <use>/<marker> są pomijane; clipPathUnits i
+;; maskUnits="objectBoundingBox" (poza domyślnym regionem filtra) nie są liczone; obwiednia filtra = obwiednia alfy źródła.
+fn ctl_clean(s: string) -> string is
+    let mut o: string = s
+    o = string_replace(o, "\u001b", " ")
+    o = string_replace(o, "\u001c", " ")
+    o = string_replace(o, "\u001d", " ")
+    o = string_replace(o, "\u001e", " ")
+    o = string_replace(o, "\u001f", " ")
+    return o
+end
+
+fn is_def_tag(t: string) -> bool is
+    return t == "defs" || t == "clippath" || t == "mask" || t == "filter" || t == "pattern" || t == "marker" || t == "symbol" ||
+           t == "lineargradient" || t == "radialgradient"
+end
+
+fn inside_def(d: dom::Dom, id: int) -> bool is
+    let mut p: int = d.nodes[id].parent
+    let mut guard: int = 0
+    while p >= 0 && guard < 64 is
+        if d.nodes[p].tag == "svg" is return false end
+        if is_def_tag(d.nodes[p].tag) is return true end
+        p = d.nodes[p].parent
+        guard += 1
+    end
+    return false
+end
+
+fn fx_val(n: dom::DomNode, st: style::ComputedStyle, name: string) -> string is
+    let mut v: string = ""
+    if name == "clip-path" is v = st.clip_path end
+    if v == "" || v == "none" is v = props::xget(st.xp, name) end
+    if v == "" || v == "none" is v = dom::get_attr(n, name) end
+    return v
+end
+
+fn fx_ref_node(d: dom::Dom, v: string, want: string) -> int is
+    let rid: string = marker_ref(v)
+    if rid == "" is return -1 end
+    let t: int = find_by_attr_id(d, rid)
+    if t < 0 || d.nodes[t].tag != want is return -1 end
+    return t
+end
+
+;; [clipPath, mask, filter] jako indeksy węzłów albo -1
+fn fx_targets(d: dom::Dom, styles: [style::ComputedStyle], id: int) -> [int] is
+    let n: dom::DomNode = d.nodes[id]
+    let st: style::ComputedStyle = styles[id]
+    let c: int = fx_ref_node(d, fx_val(n, st, "clip-path"), "clippath")
+    let m: int = fx_ref_node(d, fx_val(n, st, "mask"), "mask")
+    let f: int = fx_ref_node(d, fx_val(n, st, "filter"), "filter")
+    return [c, m, f]
+end
+
+fn has_fx(t: [int]) -> bool is
+    return t[0] >= 0 || t[1] >= 0 || t[2] >= 0
+end
+
+;; przodkowie elementu od najbardziej zewnętrznego (dziecko korzenia <svg>) do rodzica
+fn chain_of(d: dom::Dom, id: int) -> [int] is
+    let mut rev: [int] = []
+    let mut p: int = d.nodes[id].parent
+    let mut guard: int = 0
+    while p >= 0 && d.nodes[p].tag != "svg" && guard < 64 is
+        rev = array_push(rev, p)
+        p = d.nodes[p].parent
+        guard += 1
+    end
+    let mut out: [int] = []
+    let mut i: int = array_len(rev) - 1
+    while i >= 0 is
+        out = array_push(out, rev[i])
+        i -= 1
+    end
+    return out
+end
+
+fn open_tag_of(d: dom::Dom, styles: [style::ComputedStyle], id: int, scale1000: int) -> string is
+    let n: dom::DomNode = d.nodes[id]
+    let st: style::ComputedStyle = styles[id]
+    let vec_fix: bool = string_lower(props::xget(st.xp, "vector-effect")) == "non-scaling-stroke"
+    return "<" + camel_tag(n.tag) + attrs_of(n, n.tag, presentation_style(st, scale1000, vec_fix)) + geometry_attrs(st) + ">"
+end
+
+fn opens_str(d: dom::Dom, styles: [style::ComputedStyle], chain: [int], scale1000: int) -> string is
+    let mut o: string = ""
+    let mut i: int = 0
+    while i < array_len(chain) is
+        o = o + open_tag_of(d, styles, chain[i], scale1000)
+        i += 1
+    end
+    return o
+end
+
+fn closes_str(d: dom::Dom, chain: [int]) -> string is
+    let mut o: string = ""
+    let mut i: int = array_len(chain) - 1
+    while i >= 0 is
+        o = o + "</" + camel_tag(d.nodes[chain[i]].tag) + ">"
+        i -= 1
+    end
+    return o
+end
+
+fn ctm_chain(d: dom::Dom, chain: [int], id: int) -> string is
+    let mut o: string = ""
+    let mut i: int = 0
+    while i < array_len(chain) is
+        let t: string = dom::get_attr(d.nodes[chain[i]], "transform")
+        if t != "" is o = o + " " + t end
+        i += 1
+    end
+    let own: string = dom::get_attr(d.nodes[id], "transform")
+    if own != "" is o = o + " " + own end
+    return o
+end
+
+fn kvs(acc: string, k: string, v: string) -> string is
+    if v == "" is return acc end
+    return acc + "\u001b" + k + "=" + ctl_clean(v)
+end
+
+;; wartość własności prezentacyjnej filtra: arkusz CSS → atrybut elementu → atrybut elementu <filter>
+fn fe_prop(d: dom::Dom, styles: [style::ComputedStyle], cid: int, fid: int, name: string, inherit_from_filter: bool) -> string is
+    let v: string = props::xget(styles[cid].xp, name)
+    if v != "" is return v end
+    let a: string = dom::get_attr(d.nodes[cid], name)
+    if a != "" is return a end
+    if inherit_from_filter is
+        let fv: string = props::xget(styles[fid].xp, name)
+        if fv != "" is return fv end
+        return dom::get_attr(d.nodes[fid], name)
+    end
+    return ""
+end
+
+fn rgb_kv(raw: string, st: style::ComputedStyle, def: string) -> string is
+    let mut v: string = string_trim(raw)
+    if v == "" is v = def end
+    let c: style::Color = style::parse_color(resolve_current(v, st))
+    return to_string(c.r) + "," + to_string(c.g) + "," + to_string(c.b)
+end
+
+fn color_alpha1000(raw: string, st: style::ComputedStyle, def: string) -> int is
+    let mut v: string = string_trim(raw)
+    if v == "" is v = def end
+    let c: style::Color = style::parse_color(resolve_current(v, st))
+    return c.a * 1000 / 255
+end
+
+fn light_kv(d: dom::Dom, kids: [int]) -> string is
+    let mut i: int = 0
+    while i < array_len(kids) is
+        let l: dom::DomNode = d.nodes[kids[i]]
+        if l.tag == "fedistantlight" is
+            return "distant," + num_attr_or0(l, "azimuth") + "," + num_attr_or0(l, "elevation")
+        elsif l.tag == "fepointlight" is
+            return "point," + num_attr_or0(l, "x") + "," + num_attr_or0(l, "y") + "," + num_attr_or0(l, "z")
+        elsif l.tag == "fespotlight" is
+            let se: string = if dom::get_attr(l, "specularexponent") == "" then "1" else dom::get_attr(l, "specularexponent")
+            let cone: string = if dom::get_attr(l, "limitingconeangle") == "" then "0" else dom::get_attr(l, "limitingconeangle")
+            return "spot," + num_attr_or0(l, "x") + "," + num_attr_or0(l, "y") + "," + num_attr_or0(l, "z") + "," + num_attr_or0(l, "pointsatx") + "," + num_attr_or0(l, "pointsaty") + "," + num_attr_or0(l, "pointsatz") + "," + se + "," + cone
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn filter_payload(d: dom::Dom, styles: [style::ComputedStyle], fid: int) -> string is
+    let f: dom::DomNode = d.nodes[fid]
+    let units: string = string_lower(dom::get_attr(f, "filterunits"))
+    let mut out: string = "u=" + (if units == "userspaceonuse" then "user" else "bbox")
+    out = kvs(out, "x", dom::get_attr(f, "x"))
+    out = kvs(out, "y", dom::get_attr(f, "y"))
+    out = kvs(out, "w", dom::get_attr(f, "width"))
+    out = kvs(out, "h", dom::get_attr(f, "height"))
+    let mut i: int = 0
+    while i < array_len(f.children) is
+        let cid: int = f.children[i]
+        i += 1
+        let c: dom::DomNode = d.nodes[cid]
+        if c.removed || !string_starts_with(c.tag, "fe") is continue end
+        let st: style::ComputedStyle = styles[cid]
+        let mut p: string = "t=" + c.tag
+        p = kvs(p, "in", dom::get_attr(c, "in"))
+        p = kvs(p, "in2", dom::get_attr(c, "in2"))
+        p = kvs(p, "result", dom::get_attr(c, "result"))
+        p = kvs(p, "sd", string_replace(dom::get_attr(c, "stddeviation"), ",", " "))
+        p = kvs(p, "dx", dom::get_attr(c, "dx"))
+        p = kvs(p, "dy", dom::get_attr(c, "dy"))
+        p = kvs(p, "mode", string_lower(dom::get_attr(c, "mode")))
+        p = kvs(p, "op", string_lower(dom::get_attr(c, "operator")))
+        p = kvs(p, "k1", dom::get_attr(c, "k1"))
+        p = kvs(p, "k2", dom::get_attr(c, "k2"))
+        p = kvs(p, "k3", dom::get_attr(c, "k3"))
+        p = kvs(p, "k4", dom::get_attr(c, "k4"))
+        p = kvs(p, "type", string_lower(dom::get_attr(c, "type")))
+        p = kvs(p, "v", dom::get_attr(c, "values"))
+        p = kvs(p, "ss", dom::get_attr(c, "surfacescale"))
+        p = kvs(p, "kd", dom::get_attr(c, "diffuseconstant"))
+        p = kvs(p, "ks", dom::get_attr(c, "specularconstant"))
+        p = kvs(p, "se", dom::get_attr(c, "specularexponent"))
+        let cif: string = string_lower(fe_prop(d, styles, cid, fid, "color-interpolation-filters", true))
+        p = kvs(p, "cif", if cif == "srgb" then "srgb" else "linearrgb")
+        if c.tag == "feflood" || c.tag == "fedropshadow" is
+            p = kvs(p, "fc", rgb_kv(fe_prop(d, styles, cid, fid, "flood-color", false), st, "black"))
+            let fo: string = fe_prop(d, styles, cid, fid, "flood-opacity", false)
+            let op1000: int = if fo == "" then 1000 else gfx::parse_x1000(fo)
+            let a1000: int = color_alpha1000(fe_prop(d, styles, cid, fid, "flood-color", false), st, "black")
+            p = kvs(p, "fo", gfx::fmt_x1000(op1000 * a1000 / 1000))
+        end
+        if c.tag == "fediffuselighting" || c.tag == "fespecularlighting" is
+            p = kvs(p, "lc", rgb_kv(fe_prop(d, styles, cid, fid, "lighting-color", false), st, "white"))
+            p = kvs(p, "ls", light_kv(d, c.children))
+        end
+        if c.tag == "femerge" is
+            let mut nodes: string = ""
+            let mut q: int = 0
+            while q < array_len(c.children) is
+                if q > 0 is nodes = nodes + "," end
+                nodes = nodes + dom::get_attr(d.nodes[c.children[q]], "in")
+                q += 1
+            end
+            p = kvs(p, "nodes", nodes)
+        end
+        out = out + "\u001c" + p
+    end
+    return out
+end
+
+fn clip_rule_of(d: dom::Dom, styles: [style::ComputedStyle], cid: int, clip_node: int) -> string is
+    let mut v: string = string_lower(props::xget(styles[cid].xp, "clip-rule"))
+    if v == "" is v = string_lower(dom::get_attr(d.nodes[cid], "clip-rule")) end
+    if v == "" is v = string_lower(props::xget(styles[clip_node].xp, "clip-rule")) end
+    if v == "" is v = string_lower(dom::get_attr(d.nodes[clip_node], "clip-rule")) end
+    return if v == "evenodd" then "evenodd" else "nonzero"
+end
+
+fn clip_shapes_markup(d: dom::Dom, styles: [style::ComputedStyle], clip_node: int) -> string is
+    let mut o: string = ""
+    let k: dom::DomNode = d.nodes[clip_node]
+    let mut i: int = 0
+    while i < array_len(k.children) is
+        let cid: int = k.children[i]
+        i += 1
+        let c: dom::DomNode = d.nodes[cid]
+        let shape: bool = c.tag == "path" || c.tag == "rect" || c.tag == "circle" || c.tag == "ellipse" || c.tag == "line" || c.tag == "polyline" || c.tag == "polygon"
+        if c.removed || !shape || styles[cid].display == "none" is continue end
+        let ex: string = "fill:#000;stroke:none;fill-opacity:1;stroke-opacity:1;opacity:1;fill-rule:" + clip_rule_of(d, styles, cid, clip_node) + ";"
+        let tg: string = camel_tag(c.tag)
+        o = o + "<" + tg + attrs_of_ord(c, c.tag, ex, true) + geometry_attrs(styles[cid]) + "></" + tg + ">"
+    end
+    let tr: string = dom::get_attr(k, "transform")
+    if tr != "" is o = "<g transform=\"" + esc_attr(tr) + "\">" + o + "</g>" end
+    return o
+end
+
+fn mask_kids_markup(d: dom::Dom, styles: [style::ComputedStyle], mask_node: int, scale1000: int) -> string is
+    let mut o: string = ""
+    let k: dom::DomNode = d.nodes[mask_node]
+    let mut i: int = 0
+    while i < array_len(k.children) is
+        o = o + node_markup(d, styles, k.children[i], 1, scale1000, false)
+        i += 1
+    end
+    return o
+end
+
+fn fx_op(d: dom::Dom, styles: [style::ComputedStyle], id: int, scale1000: int, root_open: string, base_ctm: string) -> string is
+    let tg: [int] = fx_targets(d, styles, id)
+    let chain: [int] = chain_of(d, id)
+    let pre: string = root_open + opens_str(d, styles, chain, scale1000)
+    let post: string = closes_str(d, chain) + "</svg>"
+    let own_tr: string = dom::get_attr(d.nodes[id], "transform")
+    let wrap_o: string = if own_tr != "" then "<g transform=\"" + esc_attr(own_tr) + "\">" else ""
+    let wrap_c: string = if own_tr != "" then "</g>" else ""
+    ;; krycie elementu stosuje się po filtrze/clipie/masce, więc na czas serializacji treści zdejmujemy je ze stylu
+    let mut sty: [style::ComputedStyle] = styles
+    let old_op: int = sty[id].opacity
+    sty[id].opacity = 100
+    let body: string = node_markup(d, sty, id, 1, scale1000, false)
+    sty[id].opacity = old_op
+    let mut steps: string = ""
+    let mut aux: string = ""
+    if tg[2] >= 0 is steps = "F" + filter_payload(d, styles, tg[2]) end
+    if tg[0] >= 0 is
+        if steps != "" is steps = steps + "\u001d" end
+        steps = steps + "C"
+        aux = aux + "\u001f" + ctl_clean(pre + wrap_o + clip_shapes_markup(d, styles, tg[0]) + wrap_c + post)
+    end
+    if tg[1] >= 0 is
+        if steps != "" is steps = steps + "\u001d" end
+        let mn: dom::DomNode = d.nodes[tg[1]]
+        let mut mt: string = string_lower(props::xget(styles[tg[1]].xp, "mask-type"))
+        if mt == "" is mt = string_lower(dom::get_attr(mn, "mask-type")) end
+        let mut ci: string = string_lower(props::xget(styles[tg[1]].xp, "color-interpolation"))
+        if ci == "" is ci = string_lower(dom::get_attr(mn, "color-interpolation")) end
+        steps = steps + "M" + (if mt == "alpha" then "alpha" else "luminance") + (if ci == "linearrgb" then ",linear" else "")
+        aux = aux + "\u001f" + ctl_clean(pre + wrap_o + mask_kids_markup(d, styles, tg[1], scale1000) + wrap_c + post)
+    end
+    if old_op < 100 is
+        if steps != "" is steps = steps + "\u001d" end
+        steps = steps + "O" + gfx::fmt_x1000(old_op * 10)
+    end
+    return "fx\u001f" + steps + "\u001f" + ctl_clean(base_ctm + ctm_chain(d, chain, id)) + "\u001f" + ctl_clean(pre + body + post) + aux
+end
+
+fn node_markup(d: dom::Dom, styles: [style::ComputedStyle], id: int, depth: int, scale1000: int, fx: bool) -> string is
     if depth > 24 is return "" end
     let n: dom::DomNode = d.nodes[id]
     if n.removed || n.tag == "text" is return "" end
@@ -234,6 +643,10 @@ fn node_markup(d: dom::Dom, styles: [style::ComputedStyle], id: int, depth: int,
     let is_defs: bool = n.tag == "defs"
     if !is_defs && st.display == "none" is return "" end
     let tag: string = camel_tag(n.tag)
+    ;; 0.4: element z clip-path / mask / filter → znacznik położenia warstwy (markup() rozbija dokument)
+    if fx && !is_def_tag(n.tag) && !inside_def(d, id) && has_fx(fx_targets(d, styles, id)) is
+        return "\u001e" + to_string(id) + "\u001e"
+    end
     ;; <use>: rozwinięcie do <g transform> + kopia wskazanego elementu
     if n.tag == "use" is
         let href: string = if n.attr_href != "" then n.attr_href else dom::get_attr(n, "xlink:href")
@@ -243,7 +656,7 @@ fn node_markup(d: dom::Dom, styles: [style::ComputedStyle], id: int, depth: int,
         let ux: string = num_attr_or0(n, "x")
         let uy: string = num_attr_or0(n, "y")
         let own: string = presentation_style(st, scale1000, false)
-        let inner: string = node_markup(d, styles, tid, depth + 1, scale1000)
+        let inner: string = node_markup(d, styles, tid, depth + 1, scale1000, false)
         return "<g transform=\"translate(" + ux + "," + uy + ")\" style=\"" + esc_attr(own) + "\">" + inner + "</g>"
     end
     let vec_fix: bool = string_lower(props::xget(st.xp, "vector-effect")) == "non-scaling-stroke"
@@ -251,8 +664,12 @@ fn node_markup(d: dom::Dom, styles: [style::ComputedStyle], id: int, depth: int,
     let geo: string = geometry_attrs(st)
     let mut inner: string = ""
     let mut ci: int = 0
+    if (n.tag == "lineargradient" || n.tag == "radialgradient") && string_lower(props::xget(st.xp, "color-interpolation")) == "linearrgb" is
+        inner = linear_rgb_stops(d, styles, n.children)
+        ci = array_len(n.children)
+    end
     while ci < array_len(n.children) is
-        inner = inner + node_markup(d, styles, n.children[ci], depth + 1, scale1000)
+        inner = inner + node_markup(d, styles, n.children[ci], depth + 1, scale1000, fx)
         ci += 1
     end
     let open_attrs: string = attrs_of(n, n.tag, pres) + geo
@@ -333,7 +750,7 @@ pub fn markup(d: dom::Dom, styles: [style::ComputedStyle], root: int, w: int, h:
     let mut inner: string = ""
     let mut i: int = 0
     while i < array_len(n.children) is
-        inner = inner + node_markup(d, styles, n.children[i], 1, scale1000)
+        inner = inner + node_markup(d, styles, n.children[i], 1, scale1000, true)
         i += 1
     end
     ;; viewBox: własny albo z atrybutów width/height, by zawartość skalowała się do rozmiaru CSS
@@ -347,7 +764,49 @@ pub fn markup(d: dom::Dom, styles: [style::ComputedStyle], root: int, w: int, h:
     let par_attr: string = if par != "" then " preserveAspectRatio=\"" + esc_attr(par) + "\"" else ""
     let sr: string = string_lower(props::xget(styles[root].xp, "shape-rendering"))
     let sr_attr: string = if sr == "crispedges" || sr == "optimizespeed" then " data-sr=\"" + sr + "\"" else ""
-    return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + to_string(w) + "\" height=\"" + to_string(h) + "\" viewBox=\"" + vbs + "\"" + par_attr + sr_attr + ">" + inner + "</svg>"
+    let root_open: string = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + to_string(w) + "\" height=\"" + to_string(h) + "\" viewBox=\"" + vbs + "\"" + par_attr + sr_attr + ">"
+    if string_find(inner, "\u001e") < 0 is return root_open + inner + "</svg>" end
+    ;; 0.4: są elementy z efektami — dokument rozbity na warstwy (patrz native/silver_svgfx.h)
+    let mut vbx: f64 = 0.0
+    let mut vby: f64 = 0.0
+    let mut vbw: f64 = conv::int_to_float(nat[0])
+    let mut vbh: f64 = conv::int_to_float(nat[1])
+    if array_len(vb) == 4 is
+        vbx = conv::int_to_float(vb[0]) / 1000.0
+        vby = conv::int_to_float(vb[1]) / 1000.0
+        vbw = conv::int_to_float(vb[2]) / 1000.0
+        vbh = conv::int_to_float(vb[3]) / 1000.0
+    end
+    if vbw <= 0.0 is vbw = 1.0 end
+    if vbh <= 0.0 is vbh = 1.0 end
+    let fw: f64 = conv::int_to_float(w)
+    let fh: f64 = conv::int_to_float(h)
+    let mut sc: f64 = fw / vbw
+    if fh / vbh < sc is sc = fh / vbh end
+    let tx: f64 = (fw - vbw * sc) / 2.0 - vbx * sc
+    let ty: f64 = (fh - vbh * sc) / 2.0 - vby * sc
+    let base_ctm: string = "matrix(" + to_string(sc) + " 0 0 " + to_string(sc) + " " + to_string(tx) + " " + to_string(ty) + ")"
+    let parts: [string] = string_split(inner, "\u001e")
+    let mut ops: string = ""
+    let mut prev_chain: [int] = []
+    let mut k: int = 0
+    while k < array_len(parts) is
+        if k % 2 == 0 is
+            let mut next_chain: [int] = []
+            if k + 1 < array_len(parts) is next_chain = chain_of(d, conv::str_to_int(parts[k + 1])) end
+            if parts[k] != "" is
+                if ops != "" is ops = ops + "\u001e" end
+                ops = ops + "draw\u001f" + ctl_clean(root_open + opens_str(d, styles, prev_chain, scale1000) + parts[k] + closes_str(d, next_chain) + "</svg>")
+            end
+        else is
+            let eid: int = conv::str_to_int(parts[k])
+            if ops != "" is ops = ops + "\u001e" end
+            ops = ops + fx_op(d, styles, eid, scale1000, root_open, base_ctm)
+            prev_chain = chain_of(d, eid)
+        end
+        k += 1
+    end
+    return ops
 end
 
 
@@ -828,7 +1287,7 @@ fn marker_instance(d: dom::Dom, styles: [style::ComputedStyle], mid: int, vx: in
     let mut inner: string = ""
     let mut i: int = 0
     while i < array_len(m.children) is
-        inner = inner + node_markup(d, styles, m.children[i], depth + 1, scale1000)
+        inner = inner + node_markup(d, styles, m.children[i], depth + 1, scale1000, false)
         i += 1
     end
     return "<g transform=\"" + marker_matrix(vx, vy, dx, dy, k, refx, refy) + "\">" + inner + "</g>"
