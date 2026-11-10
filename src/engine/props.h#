@@ -65,7 +65,7 @@ pub fn is_len(tok: string) -> bool is
     if fn_name_in(low, " calc min max clamp var env attr round mod rem abs sign ") is return true end
     let u: string = unit_of(low)
     if u == "\u0001" is return false end
-    if u == "" is return is_num(low) && str_to_float(low) == 0.0 end
+    if u == "" is return is_num(low) && conv::str_to_float(low) == 0.0 end
     return string_find(" px em rem vw vh vmin vmax svw svh lvw lvh dvw dvh pt pc cm mm in q ch ex lh rlh cap ic fr % ", " " + u + " ") >= 0
 end
 
@@ -76,7 +76,7 @@ end
 
 pub fn is_ang(tok: string) -> bool is
     let u: string = unit_of(tok)
-    if u == "" is return is_num(tok) && str_to_float(tok) == 0.0 end
+    if u == "" is return is_num(tok) && conv::str_to_float(tok) == 0.0 end
     return u == "deg" || u == "rad" || u == "grad" || u == "turn"
 end
 
