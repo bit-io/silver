@@ -46,6 +46,48 @@ fn max_radius(st: style::ComputedStyle) -> int is
     return r
 end
 
+;; ---------- 0.4: corner-shape ----------
+;; kody: 1 round, 2 squircle, 3 bevel, 4 square, -1 scoop, -2 notch
+fn shape_code(tok0: string) -> int is
+    let tok: string = string_lower(string_trim(tok0))
+    if tok == "squircle" is return 2 end
+    if tok == "bevel" is return 3 end
+    if tok == "square" is return 4 end
+    if tok == "scoop" is return -1 end
+    if tok == "notch" is return -2 end
+    return 1
+end
+
+fn corner_tok(st: style::ComputedStyle, phys: string, logical: string, idx: int) -> string is
+    let mut v: string = props::xget(st.xp, "corner-" + phys + "-shape")
+    if v == "" is v = props::xget(st.xp, "corner-" + logical + "-shape") end
+    if v != "" is return v end
+    let sh: [string] = cssval::split_top(props::xget(st.xp, "corner-shape"))
+    let n: int = array_len(sh)
+    if n == 0 is return "" end
+    ;; kolejność jak border-radius: tl tr br bl (1 wartość = wszystkie, 2 = tl/br, tr/bl, 3 = tl, tr/bl, br)
+    if n == 1 is return sh[0] end
+    if n == 2 is return sh[idx % 2] end
+    if n == 3 is
+        if idx == 0 is return sh[0] end
+        if idx == 1 || idx == 3 is return sh[1] end
+        return sh[2]
+    end
+    return sh[idx]
+end
+
+;; "" gdy wszystkie narożniki okrągłe (domyślnie) albo brak promienia; inaczej spec dla silver_fill_shape_rect
+fn shape_spec(st: style::ComputedStyle, bw: int) -> string is
+    if max_radius(st) <= 0 is return "" end
+    let c0: int = shape_code(corner_tok(st, "top-left", "start-start", 0))
+    let c1: int = shape_code(corner_tok(st, "top-right", "start-end", 1))
+    let c2: int = shape_code(corner_tok(st, "bottom-right", "end-end", 2))
+    let c3: int = shape_code(corner_tok(st, "bottom-left", "end-start", 3))
+    if c0 == 1 && c1 == 1 && c2 == 1 && c3 == 1 is return "" end
+    return to_string(st.rad_tl) + "," + to_string(st.rad_tr) + "," + to_string(st.rad_br) + "," + to_string(st.rad_bl) + "," +
+           to_string(c0) + "," + to_string(c1) + "," + to_string(c2) + "," + to_string(c3) + "," + to_string(bw)
+end
+
 fn round_fill(win: int, x: int, y: int, w: int, h: int, rad: int, c: style::Color, opacity: int) -> int is
     if w <= 0 || h <= 0 || c.a <= 0 is return 0 end
     let a: int = scaled_alpha(c.a, opacity)
@@ -143,19 +185,115 @@ fn draw_text_spaced(win: int, x: int, y: int, text: string, st: style::ComputedS
         let ch: string = string_slice(text, pos, if step > n then n else step)
         pos = step
         if ch != " " is
-            ffi_shim::silver_draw_text_ex(win, cx, y, ch, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity), st.font_size, flags)
+            ffi_shim::silver_draw_text_ex(win, cx, y, layout::shape_prefix(st) + ch, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity), st.font_size, flags)
         end
-        cx = cx + ffi_shim::silver_measure_text_ex(win, ch, st.font_size, flags) + st.letter_spacing
+        cx = cx + ffi_shim::silver_measure_text_ex(win, layout::shape_prefix(st) + ch, st.font_size, flags) + st.letter_spacing
         if ch == " " is cx = cx + st.word_spacing end
     end
     return 0
 end
 
-fn draw_text_plain(win: int, x: int, y: int, text: string, st: style::ComputedStyle, c: style::Color, flags: int) -> int is
+fn draw_text_raw(win: int, x: int, y: int, text: string, st: style::ComputedStyle, c: style::Color, flags: int) -> int is
     if st.letter_spacing != 0 || st.word_spacing != 0 is
         return draw_text_spaced(win, x, y, text, st, c, flags)
     end
-    return ffi_shim::silver_draw_text_ex(win, x, y, text, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity), st.font_size, flags)
+    return ffi_shim::silver_draw_text_ex(win, x, y, layout::shape_prefix(st) + text, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity), st.font_size, flags)
+end
+
+;; 0.4: CSS Fill & Stroke dla tekstu HTML — fill-image (+ -position/-size/-repeat/-origin), stroke (kolor), stroke-width, stroke-align,
+;; stroke-image (+ …). Kolejność: fill-color, fill-image, stroke. Pominięte przy letter-spacing/word-spacing (rysowanie znak po znaku).
+fn stroke_solid_color(st: style::ComputedStyle) -> [int] is
+    let v: string = string_lower(string_trim(props::xget(st.xp, "stroke")))
+    if v == "" || v == "none" || string_starts_with(v, "url(") || string_starts_with(v, "context-") is return [] end
+    let c: style::Color = if v == "currentcolor" then st.color else style::parse_color(v)
+    if c.a <= 0 is return [] end
+    return [c.r, c.g, c.b, c.a]
+end
+
+fn text_stroke_width(st: style::ComputedStyle) -> int is
+    let v: string = string_trim(props::xget(st.xp, "stroke-width"))
+    if v == "" is return 1 end
+    return gfx::len_px(v, 0, st.font_size)
+end
+
+fn text_has_fill_stroke(st: style::ComputedStyle) -> bool is
+    if gfx::list_len(props::xget(st.xp, "fill-image")) > 0 is return true end
+    if gfx::list_len(props::xget(st.xp, "stroke-image")) > 0 && text_stroke_width(st) > 0 is return true end
+    return array_len(stroke_solid_color(st)) == 4 && text_stroke_width(st) > 0
+end
+
+;; 0.4: fill-break / stroke-break — prostokąt odniesienia obrazów: bounding-box (domyślnie: suma fragmentów tekstu w wierszach),
+;; slice (fragmenty jako kolejne plasterki jednego pudełka), clone (każdy fragment osobno). Adnotacje "dx,dy,W,H" ustawia annotate_text_fragments.
+fn frag_geom(st: style::ComputedStyle, key: string, x: int, y: int, tw: int, th: int) -> [int] is
+    let v: string = props::xget(st.xp, key)
+    if v == "" is return [x, y, tw, th] end
+    let p: [string] = string_split(v, ",")
+    if array_len(p) < 4 is return [x, y, tw, th] end
+    return [x + str_to_int(p[0]), y + str_to_int(p[1]), str_to_int(p[2]), str_to_int(p[3])]
+end
+
+fn draw_text_fill_stroke(win: int, x: int, y: int, text: string, st: style::ComputedStyle, flags: int, th: int) -> int is
+    let tw: int = ffi_shim::silver_measure_text_ex(win, layout::shape_prefix(st) + text, st.font_size, flags)
+    if tw <= 0 || th <= 0 is return 0 end
+    let fg: [int] = frag_geom(st, "\u0001fr", x, y, tw, th)
+    let whole: [int] = fg
+    let mut white: style::Color = st.color
+    white.r = 255
+    white.g = 255
+    white.b = 255
+    white.a = 255
+    let nfi: int = gfx::list_len(props::xget(st.xp, "fill-image"))
+    if nfi > 0 is
+        ffi_shim::silver_layer_begin(win, x, y, tw, th)
+        let mut i: int = nfi - 1
+        while i >= 0 is
+            draw_img_layer(win, st, "fill", i, fg[0], fg[1], fg[2], fg[3], 0, 0, 0, 0, 0, 0, whole)
+            i -= 1
+        end
+        ffi_shim::silver_layer_begin(win, x, y, tw, th)
+        draw_text_raw(win, x, y, text, st, white, flags)
+        ffi_shim::silver_layer_capture_mask(win, 0, 0)
+        ffi_shim::silver_layer_end_fx(win, 1000, 0, 0, 1000, 0, 0, 0, 0, 255, "mask")
+    end
+    let sw: int = text_stroke_width(st)
+    if sw > 0 is
+        let al: string = string_lower(string_trim(props::xget(st.xp, "stroke-align")))
+        let align: int = if al == "inside" then 1 elsif al == "outside" then 2 else 0
+        let pad: int = sw + 2
+        let nsi: int = gfx::list_len(props::xget(st.xp, "stroke-image"))
+        if nsi > 0 is
+            let sx: int = x - pad
+            let sy: int = y - pad
+            let sww: int = tw + 2 * pad
+            let shh: int = th + 2 * pad
+            let sg: [int] = frag_geom(st, "\u0001sr", x, y, tw, th)
+            let swhole: [int] = sg
+            ffi_shim::silver_layer_begin(win, sx, sy, sww, shh)
+            let mut k: int = nsi - 1
+            while k >= 0 is
+                draw_img_layer(win, st, "stroke", k, sg[0], sg[1], sg[2], sg[3], 0, 0, 0, 0, 0, 0, swhole)
+                k -= 1
+            end
+            ffi_shim::silver_layer_begin(win, sx, sy, sww, shh)
+            ffi_shim::silver_draw_text_stroke(win, x, y, layout::shape_prefix(st) + text, 255, 255, 255, 255, st.font_size, flags, sw, align)
+            ffi_shim::silver_layer_capture_mask(win, 0, 0)
+            ffi_shim::silver_layer_end_fx(win, 1000, 0, 0, 1000, 0, 0, 0, 0, 255, "mask")
+        else is
+            let sc: [int] = stroke_solid_color(st)
+            if array_len(sc) == 4 is
+                ffi_shim::silver_draw_text_stroke(win, x, y, layout::shape_prefix(st) + text, sc[0], sc[1], sc[2], scaled_alpha(sc[3], st.opacity), st.font_size, flags, sw, align)
+            end
+        end
+    end
+    return 0
+end
+
+fn draw_text_plain(win: int, x: int, y: int, text: string, st: style::ComputedStyle, c: style::Color, flags: int) -> int is
+    let th: int = draw_text_raw(win, x, y, text, st, c, flags)
+    if st.letter_spacing == 0 && st.word_spacing == 0 && text != "" && text_has_fill_stroke(st) is
+        draw_text_fill_stroke(win, x, y, text, st, flags, th)
+    end
+    return th
 end
 
 ;; Kolor z magazynu xp (caret-color, accent-color…) albo `dflt` dla auto/currentcolor/niepoprawnego.
@@ -258,6 +396,16 @@ pub fn solid_segments(len: int, gaps: [int]) -> [int] is
     return out
 end
 
+;; 0.4: text-decoration-trim: auto | <długość>{1,2} — [przycięcie z początku, z końca] linii dekoracji w px
+fn deco_trim(st: style::ComputedStyle) -> [int] is
+    let v: string = string_lower(string_trim(props::xget(st.xp, "text-decoration-trim")))
+    if v == "" || v == "auto" is return [0, 0] end
+    let t: [string] = cssval::split_top(v)
+    let a: int = gfx::len_px(t[0], 0, st.font_size)
+    let b: int = if array_len(t) >= 2 then gfx::len_px(t[1], 0, st.font_size) else a
+    return [if a < 0 then 0 else a, if b < 0 then 0 else b]
+end
+
 pub fn skip_ink_on(st: style::ComputedStyle) -> bool is
     let v: string = string_lower(props::xget(st.xp, "text-decoration-skip-ink"))
     return v == "auto" || v == "all"
@@ -283,7 +431,7 @@ fn draw_text_full(win: int, b: layout::LayoutBox, by: int) -> int is
     let st: style::ComputedStyle = b.st
     let c: style::Color = st.color
     let ul_custom: bool = st.underline && (props::xhas(st.xp, "text-underline-offset") || props::xget(st.xp, "text-underline-position") == "under")
-    let custom_deco: bool = (st.underline || st.strike) && (skip_ink_on(st) || st.has_deco_color || st.deco_style != "solid" || st.deco_thick > 0 || ul_custom)
+    let custom_deco: bool = (st.underline || st.strike) && (skip_ink_on(st) || st.has_deco_color || st.deco_style != "solid" || st.deco_thick > 0 || ul_custom || deco_trim(st)[0] > 0 || deco_trim(st)[1] > 0)
     let mut flags: int = flags_of(st)
     if custom_deco is flags = flags - (if st.underline then 4 else 0) - (if st.strike then 8 else 0) end
     if st.has_tshadow is
@@ -305,19 +453,23 @@ fn draw_text_full(win: int, b: layout::LayoutBox, by: int) -> int is
             let under: bool = props::xget(st.xp, "text-underline-position") == "under"
             let base_y: int = if under then by + b.h - t - 1 else by + (b.h + st.font_size) / 2 + 1
             let uy: int = base_y + xpx(st, "text-underline-offset", 0)
-            if skip_ink_on(st) is
-                let segs: [int] = solid_segments(b.w, underline_gaps_for(win, b, st, t))
-                let mut si: int = 0
-                while si + 1 < array_len(segs) is
-                    draw_line_styled(win, b.x + segs[si], uy, segs[si + 1], t, false, st.deco_style, dc, st.opacity)
-                    si += 2
-                end
-            else is
-                draw_line_styled(win, b.x, uy, b.w, t, false, st.deco_style, dc, st.opacity)
+            let trim: [int] = deco_trim(st)
+            let lo: int = trim[0]
+            let hi: int = b.w - trim[1]
+            let segs: [int] = if skip_ink_on(st) then solid_segments(b.w, underline_gaps_for(win, b, st, t)) else [0, b.w]
+            let mut si: int = 0
+            while si + 1 < array_len(segs) is
+                let s0: int = if segs[si] > lo then segs[si] else lo
+                let e0: int = if segs[si] + segs[si + 1] < hi then segs[si] + segs[si + 1] else hi
+                if e0 > s0 is draw_line_styled(win, b.x + s0, uy, e0 - s0, t, false, st.deco_style, dc, st.opacity) end
+                si += 2
             end
         end
         if st.strike is
-            draw_line_styled(win, b.x, by + b.h / 2, b.w, t, false, st.deco_style, dc, st.opacity)
+            let tr2: [int] = deco_trim(st)
+            if b.w - tr2[0] - tr2[1] > 0 is
+                draw_line_styled(win, b.x + tr2[0], by + b.h / 2, b.w - tr2[0] - tr2[1], t, false, st.deco_style, dc, st.opacity)
+            end
         end
     end
     return 0
@@ -453,7 +605,10 @@ fn draw_border(win: int, x: int, y: int, w: int, h: int, st: style::ComputedStyl
     if uniform && (plain || rad > 0) is
         let c: style::Color = st.bct
         if c.a > 0 is
-            if rad > 0 is
+            let spb: string = shape_spec(st, st.bt)
+            if spb != "" is
+                ffi_shim::silver_fill_shape_rect(win, x, y, w, h, spb, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity))
+            elsif rad > 0 is
                 ffi_shim::silver_stroke_round_rect(win, x, y, w, h, rad, st.bt, c.r, c.g, c.b, scaled_alpha(c.a, st.opacity))
             else is
                 fill(win, x, y, w, st.bt, c, st.opacity)
@@ -1231,7 +1386,12 @@ fn background_of(win: int, b: layout::LayoutBox, x0: int, y0: int, w0: int, h0: 
         return draw_bg_with_layers(win, b, x0, y0, w0, h0, ffi_shim::silver_get_width(win), ffi_shim::silver_get_height(win))
     end
     if st.has_bg is
-        round_fill(win, x, y, w, h, rad, st.background, st.opacity)
+        let sps: string = shape_spec(st, 0)
+        if sps != "" && st.background.a > 0 is
+            ffi_shim::silver_fill_shape_rect(win, x, y, w, h, sps, st.background.r, st.background.g, st.background.b, scaled_alpha(st.background.a, st.opacity))
+        else is
+            round_fill(win, x, y, w, h, rad, st.background, st.opacity)
+        end
     end
     if st.has_grad is
         let a1: int = scaled_alpha(st.grad_from.a, st.opacity)
@@ -1385,8 +1545,73 @@ fn draw_group(win: int, boxes: [layout::LayoutBox], d: dom::Dom, rs: RenderState
     return 0
 end
 
-pub fn render(win: int, boxes: [layout::LayoutBox], d: dom::Dom, rs: RenderState, bg: style::Color) -> int is
+fn frag_annot(boxes: [layout::LayoutBox], i: int, mode: string) -> string is
+    let b: layout::LayoutBox = boxes[i]
+    if mode == "clone" is return "" end
+    let mut minx: int = b.x
+    let mut miny: int = b.y
+    let mut maxx: int = b.x + b.w
+    let mut maxy: int = b.y + b.h
+    let mut off: int = 0
+    let mut total: int = 0
+    let mut j: int = 0
+    while j < array_len(boxes) is
+        let o: layout::LayoutBox = boxes[j]
+        if o.kind == "text" && o.node_id == b.node_id && o.text != "" is
+            if o.x < minx is minx = o.x end
+            if o.y < miny is miny = o.y end
+            if o.x + o.w > maxx is maxx = o.x + o.w end
+            if o.y + o.h > maxy is maxy = o.y + o.h end
+            if j < i is off = off + o.w end
+            total = total + o.w
+        end
+        j += 1
+    end
+    if mode == "slice" is return to_string(0 - off) + ",0," + to_string(total) + "," + to_string(b.h) end
+    return to_string(minx - b.x) + "," + to_string(miny - b.y) + "," + to_string(maxx - minx) + "," + to_string(maxy - miny)
+end
+
+;; 0.4: dla tekstu z fill-image/stroke-image dopisuje do xp prostokąt odniesienia wg fill-break / stroke-break
+fn annotate_text_fragments(boxes: [layout::LayoutBox]) -> [layout::LayoutBox] is
+    let mut need: bool = false
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        let b: layout::LayoutBox = boxes[i]
+        if b.kind == "text" && b.text != "" && (props::xget(b.st.xp, "fill-image") != "" || props::xget(b.st.xp, "stroke-image") != "") is need = true end
+        i += 1
+    end
+    if !need is return boxes end
+    let mut out: [layout::LayoutBox] = boxes
+    i = 0
+    while i < array_len(boxes) is
+        let b: layout::LayoutBox = boxes[i]
+        if b.kind == "text" && b.text != "" is
+            let mut xp: string = b.st.xp
+            if props::xget(xp, "fill-image") != "" is
+                let fb: string = string_lower(string_trim(props::xget(xp, "fill-break")))
+                let a: string = frag_annot(boxes, i, if fb == "" then "bounding-box" else fb)
+                if a != "" is xp = props::xset(xp, "\u0001fr", a) end
+            end
+            if props::xget(xp, "stroke-image") != "" is
+                let sb: string = string_lower(string_trim(props::xget(xp, "stroke-break")))
+                let a2: string = frag_annot(boxes, i, if sb == "" then "bounding-box" else sb)
+                if a2 != "" is xp = props::xset(xp, "\u0001sr", a2) end
+            end
+            out[i].st.xp = xp
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn render(win: int, boxes0: [layout::LayoutBox], d: dom::Dom, rs: RenderState, bg: style::Color) -> int is
     ffi_shim::silver_clear(win, bg.r, bg.g, bg.b)
+    return render_over(win, boxes0, d, rs)
+end
+
+;; Rysuje pudełka na istniejącej zawartości okna (bez czyszczenia tła) — np. pole przypisów u dołu strony.
+pub fn render_over(win: int, boxes0: [layout::LayoutBox], d: dom::Dom, rs: RenderState) -> int is
+    let boxes: [layout::LayoutBox] = annotate_text_fragments(boxes0)
     let count: int = array_len(boxes)
     let mut seen: [int] = []
     let mut i: int = 0
