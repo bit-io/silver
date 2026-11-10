@@ -14,6 +14,9 @@
 #define NANOSVGRAST_IMPLEMENTATION
 #include "third_party/nanosvg/nanosvg.h"
 #include "third_party/nanosvg/nanosvgrast.h"
+#include "silver_svgfx.h"
+#include <zlib.h>
+#include "silver_shape.h"
 
 #define SILVER_MAX_WINDOWS   8
 #define SILVER_EV_QUEUE      512
@@ -255,10 +258,29 @@ static void update_scale(SilverWindow *w) {
     SDL_RenderSetScale(w->ren, pct / 100.0f, pct / 100.0f);
 }
 
+/* 0.4: ścieżka pliku ostatnio wybranej czcionki (dla ścieżki kształtowania HarfBuzz) i przedrostek tekstu
+ * "\x02 ładunek \x03 tekst" z cechami OpenType / językiem / paletą (font-variant-alternates, font-language-override,
+ * font-palette). Bez SILVER_SHAPING przedrostek jest po prostu odcinany. */
+static const char *g_last_font_path = NULL;
+static const char *silver_text_prefix(const char *text, char *payload, size_t n) {
+    if (!text || text[0] != '\x02') return NULL;
+    const char *e = strchr(text + 1, '\x03');
+    if (!e) return NULL;
+    size_t l = (size_t)(e - (text + 1)); if (l >= n) l = n - 1;
+    memcpy(payload, text + 1, l); payload[l] = 0;
+    return e + 1;
+}
+static int silver_phys_px(SilverWindow *w, int size) {
+    if (size <= 0) size = w->font_base;
+    int phys = (size * w->scale_pct + 50) / 100;
+    return phys < 4 ? 4 : phys;
+}
+
 /* font o rozmiarze logicznym `size` (0 = bazowy) w pikselach fizycznych;
  * `tag` odróżnia pliki (0 = bazowy, inaczej indeks rodziny*4+wariant+1) */
 static TTF_Font *get_font_tag(SilverWindow *w, int size, int tag, const char *path) {
     if (!path) return NULL;
+    g_last_font_path = path;
     if (size <= 0) size = w->font_base;
     int phys = (size * w->scale_pct + 50) / 100;
     if (phys < 4) phys = 4;
@@ -846,15 +868,29 @@ static void route(SDL_Event *e) {
         for (int i = 0; i < SILVER_MAX_WINDOWS; i++)
             if (g_windows[i].used) push_ev(&g_windows[i], 1, "0|0|0");
         break;
+    case SDL_FINGERDOWN:
+    case SDL_FINGERMOTION:
+    case SDL_FINGERUP: {                    /* 0.4: gesty dotykowe (touch-action) */
+        w = by_window_id(e->tfinger.windowID);
+        if (!w) break;
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(w->win, &ww, &wh);
+        push_ev(w, e->type == SDL_FINGERDOWN ? 18 : e->type == SDL_FINGERMOTION ? 19 : 20, "%d|%d|%d",
+                (int)e->tfinger.fingerId, (int)(e->tfinger.x * ww), (int)(e->tfinger.y * wh));
+        break;
+    }
     case SDL_MOUSEBUTTONDOWN:
+        if (e->button.which == SDL_TOUCH_MOUSEID) break;   /* mysz emulowana z dotyku: obsługują ją zdarzenia palców */
         push_ev(by_window_id(e->button.windowID), 2, "%d|%d|%d|%d|%d",
                 e->button.x, e->button.y, e->button.button, e->button.clicks, mods_now());
         break;
     case SDL_MOUSEBUTTONUP:
+        if (e->button.which == SDL_TOUCH_MOUSEID) break;
         push_ev(by_window_id(e->button.windowID), 3, "%d|%d|%d|%d|%d",
                 e->button.x, e->button.y, e->button.button, e->button.clicks, mods_now());
         break;
     case SDL_MOUSEMOTION:
+        if (e->motion.which == SDL_TOUCH_MOUSEID) break;
         push_ev(by_window_id(e->motion.windowID), 4, "%d|%d|%u|%d",
                 e->motion.x, e->motion.y, (unsigned)e->motion.state, mods_now());
         break;
@@ -932,6 +968,24 @@ static int pump(int timeout_ms) {
 int silver_wait_event(int ms) {
     if (!g_sdl_ready) return 0;
     return pump(ms);
+}
+
+/* 0.4: wstrzykuje zdarzenie palca (kind: 0 = down, 1 = move, 2 = up; x,y w pikselach okna) — testy i automatyzacja. */
+int silver_inject_touch(int h, int kind, int finger, int x, int y) {
+    if (!VALID(h)) return 0;
+    SilverWindow *w = &g_windows[h];
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(w->win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return 0;
+    SDL_Event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = kind == 0 ? SDL_FINGERDOWN : kind == 1 ? SDL_FINGERMOTION : SDL_FINGERUP;
+    ev.tfinger.windowID = SDL_GetWindowID(w->win);
+    ev.tfinger.fingerId = (SDL_FingerID)finger;
+    ev.tfinger.x = (float)x / (float)ww;
+    ev.tfinger.y = (float)y / (float)wh;
+    route(&ev);
+    return 1;
 }
 
 int silver_poll_event(int h) {
@@ -1039,6 +1093,79 @@ int silver_fill_round_rect(int h, int x, int y, int w, int hh, int rad,
         int in = row_inset(j, hh, rad);
         SDL_Rect rc = { x + in, y + j, w - 2 * in, 1 };
         SDL_RenderFillRect(sw->ren, &rc);
+    }
+    return 1;
+}
+
+/* ---- 0.4: corner-shape — wypełnienie/obramowanie prostokąta o dowolnych kształtach narożników ----
+   Kształt narożnika (kod): 1 round, 2 squircle, 3 bevel, 4 square, -1 scoop, -2 notch.
+   spec: "rtl,rtr,rbr,rbl,stl,str,sbr,sbl,bw" (bw=0: wypełnienie; bw>0: pierścień grubości bw). */
+static float corner_inset_f(int shape, float r, float d) {
+    if (r <= 0.0f || d >= r) return 0.0f;
+    float p = 2.0f; int concave = 0;
+    switch (shape) {
+        case 1: p = 2.0f; break;
+        case 2: p = 4.0f; break;
+        case 3: p = 1.0f; break;
+        case 4: return 0.0f;
+        case -1: p = 2.0f; concave = 1; break;
+        case -2: return r;
+        default: p = 2.0f; break;
+    }
+    float t = d / r;
+    if (concave) return r * powf(1.0f - powf(t, p), 1.0f / p);
+    float y = 1.0f - t;
+    return r * (1.0f - powf(1.0f - powf(y, p), 1.0f / p));
+}
+
+static void shape_row_span(const int *rad, const int *shp, int w, int hh, int j, int *lo, int *hi) {
+    float dt = (float)j + 0.5f, db = (float)(hh - j) - 0.5f;
+    float l = 0.0f, r = 0.0f, v;
+    v = corner_inset_f(shp[0], (float)rad[0], dt); if (v > l) l = v;   /* tl */
+    v = corner_inset_f(shp[3], (float)rad[3], db); if (v > l) l = v;   /* bl */
+    v = corner_inset_f(shp[1], (float)rad[1], dt); if (v > r) r = v;   /* tr */
+    v = corner_inset_f(shp[2], (float)rad[2], db); if (v > r) r = v;   /* br */
+    *lo = (int)ceilf(l - 0.25f); *hi = (int)ceilf(r - 0.25f);
+    if (*lo < 0) *lo = 0;
+    if (*hi < 0) *hi = 0;
+    if (*lo + *hi > w) { *lo = w / 2; *hi = w - *lo; }
+}
+
+int silver_fill_shape_rect(int h, int x, int y, int w, int hh, const char *spec,
+                           int r, int g, int b, int a) {
+    CNT(g_cnt_rect);
+    if (!VALID(h) || w <= 0 || hh <= 0 || !spec) return 0;
+    int rad[4], shp[4], bw = 0;
+    if (sscanf(spec, "%d,%d,%d,%d,%d,%d,%d,%d,%d", &rad[0], &rad[1], &rad[2], &rad[3],
+               &shp[0], &shp[1], &shp[2], &shp[3], &bw) < 8) return 0;
+    int m = (w < hh ? w : hh) / 2;
+    for (int i = 0; i < 4; i++) { if (rad[i] > m) rad[i] = m; if (rad[i] < 0) rad[i] = 0; }
+    SilverWindow *sw = &g_windows[h];
+    set_col(sw, r, g, b, a);
+    int irad[4];
+    /* wypukłe: promień wewnętrzny r-bw; wklęsłe (scoop/notch): ten sam promień wokół narożnika wewnętrznego prostokąta */
+    for (int i = 0; i < 4; i++) { irad[i] = shp[i] < 0 ? rad[i] : rad[i] - bw; if (irad[i] < 0) irad[i] = 0; }
+    int iw = w - 2 * bw, ih = hh - 2 * bw;
+    for (int j = 0; j < hh; j++) {
+        int lo, hi;
+        shape_row_span(rad, shp, w, hh, j, &lo, &hi);
+        int ox0 = lo, ox1 = w - hi;
+        if (ox1 <= ox0) continue;
+        if (bw <= 0 || iw <= 0 || ih <= 0 || j < bw || j >= hh - bw) {
+            SDL_Rect rc = { x + ox0, y + j, ox1 - ox0, 1 };
+            SDL_RenderFillRect(sw->ren, &rc);
+            continue;
+        }
+        int ilo, ihi;
+        shape_row_span(irad, shp, iw, ih, j - bw, &ilo, &ihi);
+        int ix0 = bw + ilo, ix1 = bw + iw - ihi;
+        if (ix1 <= ix0) {
+            SDL_Rect rc = { x + ox0, y + j, ox1 - ox0, 1 };
+            SDL_RenderFillRect(sw->ren, &rc);
+            continue;
+        }
+        if (ix0 > ox0) { SDL_Rect rc = { x + ox0, y + j, ix0 - ox0, 1 }; SDL_RenderFillRect(sw->ren, &rc); }
+        if (ox1 > ix1) { SDL_Rect rc = { x + ix1, y + j, ox1 - ix1, 1 }; SDL_RenderFillRect(sw->ren, &rc); }
     }
     return 1;
 }
@@ -1279,9 +1406,25 @@ static SilverTextEntry *text_entry(SilverWindow *w, TTF_Font *font, const char *
     TTF_SetFontKerning(font, (eff_style & 16) ? 0 : 1);
     TTF_SetFontHinting(font, (eff_style & 32) ? TTF_HINTING_NONE : TTF_HINTING_NORMAL);
     SDL_Color col = { (Uint8)r, (Uint8)g, (Uint8)b, 255 };
+    char shp_pl[600];
+    const char *shp_real = silver_text_prefix(text, shp_pl, sizeof shp_pl);
+    SDL_Surface *shp_surf = NULL;
+#ifdef SILVER_SHAPING
+    /* font-optical-sizing: auto — czcionka zmienna z osią opsz jest zawsze kształtowana ścieżką HarfBuzz */
+    if (!shp_real && g_last_font_path && shp_font_has_opsz(g_last_font_path)) { shp_real = text; shp_pl[0] = 0; }
+    if (shp_real && g_last_font_path) {
+        ShpBitmap bm;
+        if (shp_render(g_last_font_path, silver_phys_px(w, size), shp_pl, shp_real, r, g, b, TTF_FontAscent(font), TTF_FontHeight(font), eff_style & 12, &bm)) {
+            shp_surf = SDL_CreateRGBSurfaceWithFormat(0, bm.w, bm.h, 32, SDL_PIXELFORMAT_ARGB8888);
+            if (shp_surf) memcpy(shp_surf->pixels, bm.argb, (size_t)bm.w * bm.h * 4);
+            free(bm.argb);
+        }
+    }
+#endif
+    if (shp_real) text = shp_real;
     int tnum = (eff_style & 256) ? 1 : 0;
     int trim = ((eff_style & 32768) && has_trim_candidates(text)) ? 1 : 0;
-    SDL_Surface *surf = ((eff_style & 16) || tnum || trim) ? render_nokern(font, text, col, tnum, trim) : TTF_RenderUTF8_Blended(font, text, col);
+    SDL_Surface *surf = shp_surf ? shp_surf : (((eff_style & 16) || tnum || trim) ? render_nokern(font, text, col, tnum, trim) : TTF_RenderUTF8_Blended(font, text, col));
     if (!surf) { free(key); return NULL; }
     SDL_Texture *tex = SDL_CreateTextureFromSurface(w->ren, surf);
     e->w = surf->w; e->h = surf->h;
@@ -1312,6 +1455,99 @@ int silver_draw_text_ex(int h, int x, int y, const char *text, int r, int g, int
     return (int)(fh + 0.5f);
 }
 
+/* ---- 0.4: obrys tekstu (stroke-width / stroke-align / -webkit-text-stroke) ----
+   Rysuje WYŁĄCZNIE pierścień obrysu (wypełnienie rysuje się osobno, kolejność: fill, stroke). align: 0 center, 1 inside, 2 outside.
+   Pierścień = różnica dylatacji i erozji alfy glifów dyskiem o promieniu R (px fizyczne). */
+static void alpha_morph(const uint8_t *src, uint8_t *dst, int W, int H, int R, int dilate) {
+    if (R <= 0) { memcpy(dst, src, (size_t)W * H); return; }
+    int R2 = R * R + R / 2;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int best = dilate ? 0 : 255;
+            for (int dy = -R; dy <= R; dy++) {
+                int yy = y + dy;
+                int inside_y = yy >= 0 && yy < H;
+                for (int dx = -R; dx <= R; dx++) {
+                    if (dx * dx + dy * dy > R2) continue;
+                    int xx = x + dx;
+                    int v = (inside_y && xx >= 0 && xx < W) ? src[yy * W + xx] : 0;
+                    if (dilate) { if (v > best) best = v; } else { if (v < best) best = v; }
+                }
+            }
+            dst[y * W + x] = (uint8_t)best;
+        }
+    }
+}
+
+int silver_draw_text_stroke(int h, int x, int y, const char *text, int r, int g, int b, int a,
+                            int size, int style, int width, int align) {
+    if (!VALID(h) || !text || !text[0] || width <= 0) return 0;
+    SilverWindow *w = &g_windows[h];
+    int eff = 0;
+    TTF_Font *font = get_font_style(w, size, style, &eff);
+    if (!font) return 0;
+    SilverTextEntry *e = text_entry(w, font, text, size, style, eff, 255, 255, 255);
+    if (!e || e->w < 1 || e->h < 1) return 0;
+    int R = (width * w->scale_pct + 50) / 100;
+    if (R < 1) R = 1;
+    int Rd = align == 0 ? (R + 1) / 2 : R;
+    int pad = Rd + 1;
+    int W = e->w + 2 * pad, H = e->h + 2 * pad;
+    /* alfa glifów: kopiujemy teksturę tekstu do tymczasowego celu i odczytujemy piksele */
+    SDL_Texture *T = SDL_CreateTexture(w->ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, W, H);
+    if (!T) return 0;
+    SDL_Texture *prev = SDL_GetRenderTarget(w->ren);
+    SDL_Rect pvp; SDL_RenderGetViewport(w->ren, &pvp);
+    SDL_Rect pclip; int had_clip = SDL_RenderIsClipEnabled(w->ren); SDL_RenderGetClipRect(w->ren, &pclip);
+    float osx, osy; SDL_RenderGetScale(w->ren, &osx, &osy);
+    SDL_SetRenderTarget(w->ren, T);
+    SDL_RenderSetViewport(w->ren, NULL); SDL_RenderSetClipRect(w->ren, NULL); SDL_RenderSetScale(w->ren, 1.0f, 1.0f);
+    SDL_SetTextureBlendMode(T, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawBlendMode(w->ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(w->ren, 0, 0, 0, 0);
+    SDL_RenderClear(w->ren);
+    SDL_SetTextureAlphaMod(e->tex, 255);
+    SDL_Rect dst = { pad, pad, e->w, e->h };
+    SDL_RenderCopy(w->ren, e->tex, NULL, &dst);
+    uint32_t *px = (uint32_t *)malloc((size_t)W * H * 4);
+    int ok = px && SDL_RenderReadPixels(w->ren, NULL, SDL_PIXELFORMAT_ARGB8888, px, W * 4) == 0;
+    SDL_SetRenderTarget(w->ren, prev);
+    SDL_RenderSetViewport(w->ren, &pvp);
+    if (had_clip) SDL_RenderSetClipRect(w->ren, &pclip); else SDL_RenderSetClipRect(w->ren, NULL);
+    SDL_RenderSetScale(w->ren, osx, osy);
+    SDL_DestroyTexture(T);
+    if (!ok) { free(px); return 0; }
+    uint8_t *A = (uint8_t *)malloc((size_t)W * H), *D = (uint8_t *)malloc((size_t)W * H), *E = (uint8_t *)malloc((size_t)W * H);
+    uint32_t *out = (uint32_t *)malloc((size_t)W * H * 4);
+    if (!A || !D || !E || !out) { free(px); free(A); free(D); free(E); free(out); return 0; }
+    for (long i = 0; i < (long)W * H; i++) A[i] = (uint8_t)(px[i] >> 24);
+    free(px);
+    if (align == 1) {            /* inside: glif minus erozja */
+        memcpy(D, A, (size_t)W * H); alpha_morph(A, E, W, H, Rd, 0);
+    } else if (align == 2) {     /* outside: dylatacja minus glif */
+        alpha_morph(A, D, W, H, Rd, 1); memcpy(E, A, (size_t)W * H);
+    } else {                     /* center: dylatacja minus erozja o połowę szerokości */
+        alpha_morph(A, D, W, H, Rd, 1); alpha_morph(A, E, W, H, Rd, 0);
+    }
+    for (long i = 0; i < (long)W * H; i++) {
+        int v = D[i] - E[i]; if (v < 0) v = 0;
+        out[i] = ((uint32_t)v << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+    free(A); free(D); free(E);
+    SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormatFrom(out, W, H, 32, W * 4, SDL_PIXELFORMAT_ARGB8888);
+    SDL_Texture *tex = surf ? SDL_CreateTextureFromSurface(w->ren, surf) : NULL;
+    if (surf) SDL_FreeSurface(surf);
+    free(out);
+    if (!tex) return 0;
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+    SDL_SetTextureAlphaMod(tex, (Uint8)a);
+    float k = 100.0f / w->scale_pct;
+    SDL_FRect dstf = { (float)x - pad * k, (float)y - pad * k, W * k * stretch_pct(eff) / 100.0f, H * k };
+    SDL_RenderCopyF(w->ren, tex, NULL, &dstf);
+    SDL_DestroyTexture(tex);
+    return 1;
+}
+
 int silver_draw_text(int h, int x, int y, const char *text, int r, int g, int b, int a) {
     return silver_draw_text_ex(h, x, y, text, r, g, b, a, 0, 0);
 }
@@ -1326,6 +1562,20 @@ int silver_measure_text_ex(int h, const char *text, int size, int style) {
     TTF_SetFontKerning(font, (eff & 16) ? 0 : 1);
     TTF_SetFontHinting(font, (eff & 32) ? TTF_HINTING_NONE : TTF_HINTING_NORMAL);
     int tw = 0, th = 0;
+    char shp_pl[600];
+    const char *shp_real = silver_text_prefix(text, shp_pl, sizeof shp_pl);
+#ifdef SILVER_SHAPING
+    if (!shp_real && g_last_font_path && shp_font_has_opsz(g_last_font_path)) { shp_real = text; shp_pl[0] = 0; }
+#endif
+    if (shp_real) {
+#ifdef SILVER_SHAPING
+        if (g_last_font_path) {
+            int sw = shp_measure(g_last_font_path, silver_phys_px(w, size), shp_pl, shp_real);
+            if (sw >= 0) { sw = sw * stretch_pct(eff) / 100; return (sw * 100 + w->scale_pct - 1) / w->scale_pct; }
+        }
+#endif
+        text = shp_real;
+    }
     int trim_m = ((eff & 32768) && has_trim_candidates(text)) ? 1 : 0;
     if ((eff & 16) || (eff & 256) || trim_m) tw = nokern_width(font, text, (eff & 256) ? 1 : 0, trim_m); else TTF_SizeUTF8(font, text, &tw, &th);
     tw = tw * stretch_pct(eff) / 100;         /* 0.4: font-stretch */
@@ -1367,20 +1617,24 @@ int silver_font_ratio(int h, int size, int style, int kind) {
  * się w max_w px — do zawijania wierszy bez pomiaru znak po znaku. */
 int silver_text_fit(int h, const char *text, int size, int style, int max_w) {
     if (!VALID(h) || !text) return 0;
-    int n = (int)strlen(text);
+    char shp_pl[600];
+    const char *real = silver_text_prefix(text, shp_pl, sizeof shp_pl);
+    size_t plen = real ? (size_t)(real - text) : 0;      /* przedrostek zachowujemy w każdym mierzonym fragmencie */
+    const char *body = real ? real : text;
+    int n = (int)strlen(body);
     if (silver_measure_text_ex(h, text, size, style) <= max_w) return n;
-    int lo = 0, hi = silver_utf8_len(text);       /* w znakach */
+    int lo = 0, hi = silver_utf8_len(body);       /* w znakach */
     while (lo < hi) {
         int mid = (lo + hi + 1) / 2;
-        int off = silver_utf8_offset(text, mid);
-        char *tmp = (char *)malloc((size_t)off + 1);
+        int off = silver_utf8_offset(body, mid);
+        char *tmp = (char *)malloc(plen + (size_t)off + 1);
         if (!tmp) return 0;
-        memcpy(tmp, text, (size_t)off); tmp[off] = '\0';
+        memcpy(tmp, text, plen); memcpy(tmp + plen, body, (size_t)off); tmp[plen + off] = '\0';
         int wd = silver_measure_text_ex(h, tmp, size, style);
         free(tmp);
         if (wd <= max_w) lo = mid; else hi = mid - 1;
     }
-    return silver_utf8_offset(text, lo);
+    return silver_utf8_offset(body, lo);
 }
 
 int silver_present(int h) {
@@ -1720,6 +1974,27 @@ int silver_draw_svg(int h, const char *markup, int x, int y, int w, int hh, int 
         }
         if (!g_svg_cache[i].tex && slot < 0) slot = i;
         if (g_svg_cache[i].tex && g_svg_cache[i].used < g_svg_cache[old_i].used) old_i = i;
+    }
+    if (!tex && (!strncmp(markup, "draw\x1f", 5) || !strncmp(markup, "fx\x1f", 3))) {
+        /* 0.4: znacznik warstwowy (clip-path / mask / filter) — patrz silver_svgfx.h */
+        unsigned char *rgba = sfx_render(markup, pw, ph);
+        if (!rgba) return 0;
+        uint32_t *px = (uint32_t *)malloc((size_t)pw * (size_t)ph * 4);
+        if (px) {
+            for (long i = 0; i < (long)pw * ph; i++) {
+                const unsigned char *q = rgba + i * 4;
+                px[i] = FX_PACK(q[3], q[0], q[1], q[2]);
+            }
+            tex = fx_texture(sw->ren, px, pw, ph);
+            free(px);
+        }
+        free(rgba);
+        if (!tex) return 0;
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        int sl = slot >= 0 ? slot : old_i;
+        if (g_svg_cache[sl].tex) SDL_DestroyTexture(g_svg_cache[sl].tex);
+        g_svg_cache[sl].hash = key; g_svg_cache[sl].pw = pw; g_svg_cache[sl].ph = ph;
+        g_svg_cache[sl].tex = tex; g_svg_cache[sl].ren = sw->ren; g_svg_cache[sl].used = clk;
     }
     if (!tex) {
         char *copy = strdup(markup);
@@ -2220,6 +2495,224 @@ int silver_pixel(int h, int x, int y) {
 }
 
 /* Zapis całego okna do PNG (testy wizualne, zrzuty ekranu). */
+/* ---- 0.4: druk — renderowanie strony do tekstury i zapis PDF (strony jako obrazy RGB, FlateDecode) ---- */
+static SDL_Texture *g_print_tgt = NULL;
+int silver_target_begin(int h, int w, int ht) {
+    if (!VALID(h) || w < 1 || ht < 1) return 0;
+    SilverWindow *sw = &g_windows[h];
+    if (g_print_tgt) { SDL_SetRenderTarget(sw->ren, NULL); SDL_DestroyTexture(g_print_tgt); g_print_tgt = NULL; }
+    g_print_tgt = SDL_CreateTexture(sw->ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, w, ht);
+    if (!g_print_tgt) return 0;
+    SDL_SetRenderTarget(sw->ren, g_print_tgt);
+    SDL_SetRenderDrawColor(sw->ren, 255, 255, 255, 255);
+    SDL_RenderClear(sw->ren);
+    return 1;
+}
+int silver_target_end(int h) {
+    if (!VALID(h)) return 0;
+    SDL_SetRenderTarget(g_windows[h].ren, NULL);
+    if (g_print_tgt) { SDL_DestroyTexture(g_print_tgt); g_print_tgt = NULL; }
+    return 1;
+}
+
+static unsigned char *g_pdf = NULL;
+static size_t g_pdf_len = 0, g_pdf_cap = 0;
+static long g_pdf_off[8192];
+static int g_pdf_nobj = 0, g_pdf_page_obj[2048], g_pdf_npages = 0;
+static int g_pdf_page_ph[2048], g_pdf_page_ext[2048];
+/* 0.4: zakładki PDF (bookmark-label/level/state) */
+typedef struct { char *title; int level, page, y100, open; } PdfBm;
+static PdfBm g_bm[512];
+static int g_bm_n = 0;
+static void pdf_bm_reset(void) { for (int i = 0; i < g_bm_n; i++) free(g_bm[i].title); g_bm_n = 0; }
+
+static int pdf_put(const void *p, size_t n) {
+    if (g_pdf_len + n + 1 > g_pdf_cap) {
+        size_t nc = g_pdf_cap ? g_pdf_cap * 2 : 65536;
+        while (nc < g_pdf_len + n + 1) nc *= 2;
+        unsigned char *nb = (unsigned char *)realloc(g_pdf, nc);
+        if (!nb) return 0;
+        g_pdf = nb; g_pdf_cap = nc;
+    }
+    memcpy(g_pdf + g_pdf_len, p, n); g_pdf_len += n;
+    return 1;
+}
+static int pdf_printf(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    return n > 0 && pdf_put(buf, (size_t)n);
+}
+static int pdf_obj(void) {                      /* zaczyna obiekt; numery 1 i 2 zarezerwowane (katalog, drzewo stron) */
+    if (g_pdf_nobj >= 8000) return 0;
+    g_pdf_nobj++;
+    g_pdf_off[g_pdf_nobj] = (long)g_pdf_len;
+    pdf_printf("%d 0 obj\n", g_pdf_nobj);
+    return g_pdf_nobj;
+}
+int silver_pdf_begin(void) {
+    pdf_bm_reset();
+    free(g_pdf); g_pdf = NULL; g_pdf_len = g_pdf_cap = 0; g_pdf_nobj = 2; g_pdf_npages = 0;
+    return pdf_put("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n", 15);
+}
+/* strona z bieżącego celu renderowania; wymiary w setnych punktu: strona pw×ph (TrimBox), obszar treści cx,cy (od lewego górnego rogu) cw×ch.
+   0.4: rot (0/90/180/270 → /Rotate), bleed (spad, setne pkt: BleedBox), marks (1 = znaczniki cięcia, 2 = krzyżyki; rysowane poza spadem). */
+int silver_pdf_page_ex(int h, int tw, int tht, int pw, int ph, int cx, int cy, int cw, int ch, int rot, int bleed, int marks) {
+    if (!VALID(h) || tw < 1 || tht < 1 || g_pdf_npages >= 2000) return 0;
+    if (bleed < 0) bleed = 0;
+    SilverWindow *sw = &g_windows[h];
+    uint32_t *px = (uint32_t *)malloc((size_t)tw * tht * 4);
+    if (!px) return 0;
+    if (SDL_RenderReadPixels(sw->ren, NULL, SDL_PIXELFORMAT_ARGB8888, px, tw * 4) != 0) { free(px); return 0; }
+    unsigned char *rgb = (unsigned char *)malloc((size_t)tw * tht * 3);
+    if (!rgb) { free(px); return 0; }
+    for (long i = 0; i < (long)tw * tht; i++) {
+        uint32_t v = px[i]; unsigned a = v >> 24, r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255;
+        rgb[i * 3] = (unsigned char)((r * a + 255 * (255 - a)) / 255);
+        rgb[i * 3 + 1] = (unsigned char)((g * a + 255 * (255 - a)) / 255);
+        rgb[i * 3 + 2] = (unsigned char)((b * a + 255 * (255 - a)) / 255);
+    }
+    free(px);
+    uLongf zl = compressBound((uLong)tw * tht * 3);
+    unsigned char *z = (unsigned char *)malloc(zl);
+    if (!z || compress2(z, &zl, rgb, (uLong)tw * tht * 3, 6) != Z_OK) { free(rgb); free(z); return 0; }
+    free(rgb);
+    int ext = bleed + ((marks & 3) ? 1500 : 0);          /* margines arkusza na spad i znaczniki */
+    int W = pw + 2 * ext, H = ph + 2 * ext;
+    int im = pdf_obj();
+    pdf_printf("<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length %lu >>\nstream\n", tw, tht, (unsigned long)zl);
+    pdf_put(z, zl); pdf_printf("\nendstream\nendobj\n");
+    free(z);
+    char cs[2048];
+    int n = snprintf(cs, sizeof cs, "q %.2f 0 0 %.2f %.2f %.2f cm /Im0 Do Q", cw / 100.0, ch / 100.0, (cx + ext) / 100.0, (H - (cy + ext) - ch) / 100.0);
+    if (marks & 3) {
+        double x0 = ext / 100.0, y0 = ext / 100.0, x1 = (ext + pw) / 100.0, y1 = (ext + ph) / 100.0;
+        double off = (bleed + 300) / 100.0, len = 9.0;
+        n += snprintf(cs + n, sizeof cs - n, " q 0 G 0.5 w");
+        if (marks & 1) {   /* crop: po dwie kreski przy każdym narożniku, poza spadem */
+            double xs[2] = { x0, x1 }, ys[2] = { y0, y1 };
+            for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
+                double dx = i ? 1.0 : -1.0, dy = j ? 1.0 : -1.0;
+                n += snprintf(cs + n, sizeof cs - n, " %.2f %.2f m %.2f %.2f l S", xs[i] + dx * off, ys[j], xs[i] + dx * (off + len), ys[j]);
+                n += snprintf(cs + n, sizeof cs - n, " %.2f %.2f m %.2f %.2f l S", xs[i], ys[j] + dy * off, xs[i], ys[j] + dy * (off + len));
+            }
+        }
+        if (marks & 2) {   /* cross: krzyżyki na środkach krawędzi */
+            double mx = (x0 + x1) / 2, my = (y0 + y1) / 2, c = off + len / 2;
+            n += snprintf(cs + n, sizeof cs - n, " %.2f %.2f m %.2f %.2f l S %.2f %.2f m %.2f %.2f l S", mx - len / 2, y1 + c, mx + len / 2, y1 + c, mx, y1 + c - len / 2, mx, y1 + c + len / 2);
+            n += snprintf(cs + n, sizeof cs - n, " %.2f %.2f m %.2f %.2f l S %.2f %.2f m %.2f %.2f l S", mx - len / 2, y0 - c, mx + len / 2, y0 - c, mx, y0 - c - len / 2, mx, y0 - c + len / 2);
+            n += snprintf(cs + n, sizeof cs - n, " %.2f %.2f m %.2f %.2f l S %.2f %.2f m %.2f %.2f l S", x0 - c - len / 2, my, x0 - c + len / 2, my, x0 - c, my - len / 2, x0 - c, my + len / 2);
+            n += snprintf(cs + n, sizeof cs - n, " %.2f %.2f m %.2f %.2f l S %.2f %.2f m %.2f %.2f l S", x1 + c - len / 2, my, x1 + c + len / 2, my, x1 + c, my - len / 2, x1 + c, my + len / 2);
+        }
+        n += snprintf(cs + n, sizeof cs - n, " Q");
+    }
+    int co = pdf_obj();
+    pdf_printf("<< /Length %d >>\nstream\n%s\nendstream\nendobj\n", n, cs);
+    int po = pdf_obj();
+    rot = ((rot % 360) + 360) % 360; rot -= rot % 90;
+    pdf_printf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f] /TrimBox [%.2f %.2f %.2f %.2f] /BleedBox [%.2f %.2f %.2f %.2f] /Rotate %d /Resources << /XObject << /Im0 %d 0 R >> >> /Contents %d 0 R >>\nendobj\n",
+               W / 100.0, H / 100.0, ext / 100.0, ext / 100.0, (ext + pw) / 100.0, (ext + ph) / 100.0,
+               (ext - bleed) / 100.0, (ext - bleed) / 100.0, (ext + pw + bleed) / 100.0, (ext + ph + bleed) / 100.0, rot, im, co);
+    g_pdf_page_ph[g_pdf_npages] = H; g_pdf_page_ext[g_pdf_npages] = ext;
+    g_pdf_page_obj[g_pdf_npages++] = po;
+    return po > 0;
+}
+int silver_pdf_page(int h, int tw, int tht, int pw, int ph, int cx, int cy, int cw, int ch) {
+    return silver_pdf_page_ex(h, tw, tht, pw, ph, cx, cy, cw, ch, 0, 0, 0);
+}
+/* zakładka: tytuł UTF-8, poziom (>=1), indeks strony, odległość od góry arkusza w setnych pkt, open (1/0) */
+int silver_pdf_bookmark(const char *title, int level, int page, int y100, int open) {
+    if (!title || level < 1 || page < 0 || g_bm_n >= 512) return 0;
+    g_bm[g_bm_n].title = strdup(title); g_bm[g_bm_n].level = level; g_bm[g_bm_n].page = page;
+    g_bm[g_bm_n].y100 = y100; g_bm[g_bm_n].open = open ? 1 : 0; g_bm_n++;
+    return 1;
+}
+static void pdf_utf16_hex(const char *u) {
+    pdf_printf("<FEFF");
+    const unsigned char *p = (const unsigned char *)u;
+    while (*p) {
+        unsigned cp = 0; int n = 1;
+        if (*p < 0x80) cp = *p;
+        else if ((*p & 0xE0) == 0xC0) { cp = *p & 0x1F; n = 2; }
+        else if ((*p & 0xF0) == 0xE0) { cp = *p & 0x0F; n = 3; }
+        else { cp = *p & 0x07; n = 4; }
+        for (int i = 1; i < n && p[i]; i++) cp = (cp << 6) | (p[i] & 0x3F);
+        p += n;
+        if (cp >= 0x10000) { cp -= 0x10000; pdf_printf("%04X%04X", 0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)); }
+        else pdf_printf("%04X", cp);
+    }
+    pdf_printf(">");
+}
+static int bm_visible(int i, const int *parent, int n) {   /* liczba widocznych potomków */
+    int c = 0;
+    for (int k = i + 1; k < n; k++) {
+        if (parent[k] == i) c += 1 + (g_bm[k].open ? bm_visible(k, parent, n) : 0);
+    }
+    return c;
+}
+int silver_pdf_end(const char *path) {
+    if (!g_pdf || g_pdf_npages == 0 || !path) return 0;
+    /* zakładki → /Outlines (obiekty bezpośrednio po stronach) */
+    int bn = g_bm_n, root = 0;
+    int parent[512], first[512], last[512], prev[512], next[512], top_first = -1, top_last = -1;
+    if (bn > 0) {
+        int stack[16], sl[16], sp = 0;
+        for (int i = 0; i < bn; i++) { first[i] = last[i] = prev[i] = next[i] = -1; }
+        for (int i = 0; i < bn; i++) {
+            int lv = g_bm[i].level > 15 ? 15 : g_bm[i].level;
+            while (sp > 0 && sl[sp - 1] >= lv) sp--;
+            parent[i] = sp > 0 ? stack[sp - 1] : -1;
+            int *lastp = parent[i] >= 0 ? &last[parent[i]] : &top_last;
+            int *firstp = parent[i] >= 0 ? &first[parent[i]] : &top_first;
+            if (*lastp >= 0) { next[*lastp] = i; prev[i] = *lastp; } else *firstp = i;
+            *lastp = i;
+            stack[sp] = i; sl[sp] = lv; sp++;
+        }
+        root = g_pdf_nobj + 1;
+    }
+    int ol_first_obj = root + 1;
+    g_pdf_off[1] = (long)g_pdf_len;
+    if (bn > 0) pdf_printf("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines %d 0 R /PageMode /UseOutlines >>\nendobj\n", root);
+    else pdf_printf("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    g_pdf_off[2] = (long)g_pdf_len;
+    pdf_printf("2 0 obj\n<< /Type /Pages /Count %d /Kids [", g_pdf_npages);
+    for (int i = 0; i < g_pdf_npages; i++) pdf_printf("%d 0 R ", g_pdf_page_obj[i]);
+    pdf_printf("] >>\nendobj\n");
+    if (bn > 0) {
+        int top_count = 0;
+        for (int i = top_first; i >= 0; i = next[i]) top_count += 1 + (g_bm[i].open ? bm_visible(i, parent, bn) : 0);
+        pdf_obj();
+        pdf_printf("<< /Type /Outlines /First %d 0 R /Last %d 0 R /Count %d >>\nendobj\n", ol_first_obj + top_first, ol_first_obj + top_last, top_count);
+        for (int i = 0; i < bn; i++) {
+            pdf_obj();
+            int pg = g_bm[i].page < g_pdf_npages ? g_bm[i].page : g_pdf_npages - 1;
+            double ytop = (g_pdf_page_ph[pg] - g_bm[i].y100 - g_pdf_page_ext[pg]) / 100.0;
+            pdf_printf("<< /Title "); pdf_utf16_hex(g_bm[i].title);
+            pdf_printf(" /Parent %d 0 R", parent[i] >= 0 ? ol_first_obj + parent[i] : root);
+            if (prev[i] >= 0) pdf_printf(" /Prev %d 0 R", ol_first_obj + prev[i]);
+            if (next[i] >= 0) pdf_printf(" /Next %d 0 R", ol_first_obj + next[i]);
+            if (first[i] >= 0) {
+                int vis = bm_visible(i, parent, bn);
+                pdf_printf(" /First %d 0 R /Last %d 0 R /Count %d", ol_first_obj + first[i], ol_first_obj + last[i], g_bm[i].open ? vis : -vis);
+            }
+            pdf_printf(" /Dest [%d 0 R /XYZ 0 %.2f null] >>\nendobj\n", g_pdf_page_obj[pg], ytop < 0 ? 0 : ytop);
+        }
+    }
+    int info = pdf_obj();
+    pdf_printf("<< /Producer (Silver 0.4) >>\nendobj\n");
+    long xref = (long)g_pdf_len;
+    pdf_printf("xref\n0 %d\n0000000000 65535 f \n", g_pdf_nobj + 1);
+    for (int i = 1; i <= g_pdf_nobj; i++) pdf_printf("%010ld 00000 n \n", g_pdf_off[i]);
+    pdf_printf("trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%ld\n%%%%EOF\n", g_pdf_nobj + 1, info, xref);
+    FILE *f = fopen(path, "wb");
+    int ok = f && fwrite(g_pdf, 1, g_pdf_len, f) == g_pdf_len;
+    if (f) fclose(f);
+    free(g_pdf); g_pdf = NULL; g_pdf_len = g_pdf_cap = 0; g_pdf_nobj = 0; g_pdf_npages = 0;
+    pdf_bm_reset();
+    return ok;
+}
+
 int silver_save_png(int h, const char *path) {
     if (!VALID(h) || !path) return 0;
     SilverWindow *sw = &g_windows[h];
