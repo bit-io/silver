@@ -1,0 +1,484 @@
+mod dom
+mod css
+mod props
+mod style
+mod cssval
+use "std -> conv" from "conv"
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+use "std -> process" from "process"
+
+;; 0.4: CSS Speech — `speak-as` (spell-out, digits, literal-punctuation, no-punctuation) i synteza mowy.
+;; `spoken_text` składa tekst do wypowiedzenia z drzewa DOM (z pominięciem display:none / hidden / aria-hidden), stosując
+;; `speak-as` każdego węzła tekstowego; `speak_text` przekazuje go zewnętrznemu syntezatorowi (SILVER_TTS="cmd {{file}}",
+;; albo espeak-ng / espeak / spd-say / say — pierwszy znaleziony). API w JS: silver.speech.speak(selektor).
+
+pub struct SpeakAs is
+    pub spell:  bool
+    pub digits: bool
+    pub punct:  string      ;; "" | "literal" | "none"
+end
+
+pub fn parse_speak_as(v: string) -> SpeakAs is
+    let mut m: SpeakAs = SpeakAs { spell: false, digits: false, punct: "" }
+    let toks: [string] = string_split(string_lower(string_trim(v)), " ")
+    let mut i: int = 0
+    while i < array_len(toks) is
+        let t: string = toks[i]
+        i += 1
+        if t == "spell-out" is m.spell = true end
+        if t == "digits" is m.digits = true end
+        if t == "literal-punctuation" is m.punct = "literal" end
+        if t == "no-punctuation" is m.punct = "none" end
+    end
+    return m
+end
+
+fn punct_name(ch: string) -> string is
+    if ch == "." is return "period" end
+    if ch == "," is return "comma" end
+    if ch == ";" is return "semicolon" end
+    if ch == ":" is return "colon" end
+    if ch == "!" is return "exclamation mark" end
+    if ch == "?" is return "question mark" end
+    if ch == "-" is return "hyphen" end
+    if ch == "(" is return "left parenthesis" end
+    if ch == ")" is return "right parenthesis" end
+    if ch == "[" is return "left bracket" end
+    if ch == "]" is return "right bracket" end
+    if ch == "{" is return "left brace" end
+    if ch == "}" is return "right brace" end
+    if ch == "\"" is return "quote" end
+    if ch == "'" is return "apostrophe" end
+    if ch == "/" is return "slash" end
+    if ch == "\\" is return "backslash" end
+    if ch == "@" is return "at sign" end
+    if ch == "#" is return "number sign" end
+    if ch == "$" is return "dollar sign" end
+    if ch == "%" is return "percent sign" end
+    if ch == "&" is return "ampersand" end
+    if ch == "*" is return "asterisk" end
+    if ch == "+" is return "plus sign" end
+    if ch == "=" is return "equals sign" end
+    if ch == "<" is return "less-than sign" end
+    if ch == ">" is return "greater-than sign" end
+    if ch == "_" is return "underscore" end
+    if ch == "~" is return "tilde" end
+    if ch == "^" is return "caret" end
+    if ch == "|" is return "vertical bar" end
+    if ch == "`" is return "grave accent" end
+    return ""
+end
+
+fn is_digit(ch: string) -> bool is
+    return ch >= "0" && ch <= "9" && string_len(ch) == 1
+end
+
+fn is_space(ch: string) -> bool is
+    return ch == " " || ch == "\t" || ch == "\n" || ch == "\r"
+end
+
+;; Przekształcenie tekstu według `speak-as`: wynik trafia do syntezatora mowy.
+pub fn transform(text: string, m: SpeakAs) -> string is
+    if !m.spell && !m.digits && m.punct == "" is return collapse(text) end
+    let mut out: string = ""
+    let mut pos: int = 0
+    while pos < string_len(text) is
+        let nx: int = ffi_shim::silver_utf8_next(text, pos)
+        let ch: string = string_slice(text, pos, nx)
+        pos = nx
+        let pn: string = if string_len(ch) == 1 then punct_name(ch) else ""
+        if pn != "" is
+            if m.punct == "literal" is out = out + " " + pn + " "
+            elsif m.punct == "none" is out = out + " "
+            else is out = out + ch end
+        elsif is_space(ch) is
+            out = out + " "
+        elsif m.spell is
+            out = out + " " + ch + " "
+        elsif m.digits && is_digit(ch) is
+            out = out + " " + ch + " "
+        else is
+            out = out + ch
+        end
+    end
+    return collapse(out)
+end
+
+fn collapse(s: string) -> string is
+    let mut out: string = ""
+    let mut prev_space: bool = true
+    let mut pos: int = 0
+    while pos < string_len(s) is
+        let nx: int = ffi_shim::silver_utf8_next(s, pos)
+        let ch: string = string_slice(s, pos, nx)
+        pos = nx
+        if is_space(ch) is
+            if !prev_space is out = out + " " end
+            prev_space = true
+        else is
+            out = out + ch
+            prev_space = false
+        end
+    end
+    return string_trim(out)
+end
+
+
+;; ---------- 0.4: voice-stress, voice-range, voice-balance ----------
+;; Znacznik \u0001V<stress>;<range>;<balans>\u0001 … \u0001v\u0001 otacza treść elementu, gdy którakolwiek z tych właściwości różni się od rodzica.
+fn voice_kw(xp: string, name: string) -> string is
+    let v: string = string_lower(string_trim(props::xget(xp, name)))
+    if v == "" || v == "normal" || v == "medium" || v == "center" || v == "inherit" is return "" end
+    return v
+end
+
+pub fn balance_pan(v0: string) -> int is
+    let v: string = string_lower(string_trim(v0))
+    if v == "left" is return -100 end
+    if v == "right" is return 100 end
+    if v == "center" || v == "" is return 0 end
+    if v == "leftwards" is return -40 end
+    if v == "rightwards" is return 40 end
+    if props::is_num(v) is
+        let n: int = str_to_int(string_slice(v, 0, if string_find(v, ".") >= 0 then string_find(v, ".") else string_len(v)))
+        if n < -100 is return -100 end
+        if n > 100 is return 100 end
+        return n
+    end
+    return 0
+end
+
+fn voice_mark(xp: string, pxp: string) -> string is
+    let st: string = voice_kw(xp, "voice-stress")
+    let rg: string = voice_kw(xp, "voice-range")
+    let bl: string = string_lower(string_trim(props::xget(xp, "voice-balance")))
+    let pst: string = voice_kw(pxp, "voice-stress")
+    let prg: string = voice_kw(pxp, "voice-range")
+    let pbl: string = string_lower(string_trim(props::xget(pxp, "voice-balance")))
+    let st2: string = if st == pst then "" else (if st == "" then "none" else st)
+    let rg2: string = if rg == prg then "" else (if rg == "" then "medium" else rg)
+    let bl2: string = if bl == pbl then "" else (if bl == "" then "center" else bl)
+    if st2 == "" && rg2 == "" && bl2 == "" is return "" end
+    return st2 + ";" + rg2 + ";" + bl2
+end
+
+fn xml_esc(t: string) -> string is
+    return string_replace(string_replace(string_replace(t, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")
+end
+
+;; opakowuje tekst segmentu w SSML wg stosu \u0002-rozdzielonych wpisów "stress;range;balans" (od zewnętrznego do wewnętrznego)
+pub fn ssml_wrap(stack: string, text: string) -> string is
+    if stack == "" is return text end
+    let ents: [string] = string_split(stack, "\u0002")
+    let mut open: string = ""
+    let mut close: string = ""
+    let mut i: int = 0
+    while i < array_len(ents) is
+        let f: [string] = string_split(ents[i], ";")
+        i += 1
+        if array_len(f) < 2 is continue end
+        if f[0] != "" && (f[0] == "strong" || f[0] == "moderate" || f[0] == "reduced" || f[0] == "none") is
+            open = open + "<emphasis level=\"" + f[0] + "\">"
+            close = "</emphasis>" + close
+        end
+        if f[1] != "" && (f[1] == "x-low" || f[1] == "low" || f[1] == "medium" || f[1] == "high" || f[1] == "x-high") is
+            open = open + "<prosody range=\"" + f[1] + "\">"
+            close = "</prosody>" + close
+        end
+    end
+    if open == "" is return text end
+    return "<speak>" + open + xml_esc(text) + close + "</speak>"
+end
+
+;; panorama z góry stosu (ostatni niepusty wpis balansu), 0 = środek
+pub fn stack_pan(stack: string) -> int is
+    if stack == "" is return 0 end
+    let ents: [string] = string_split(stack, "\u0002")
+    let mut pan: int = 0
+    let mut i: int = 0
+    while i < array_len(ents) is
+        let f: [string] = string_split(ents[i], ";")
+        i += 1
+        if array_len(f) >= 3 && f[2] != "" is pan = balance_pan(f[2]) end
+    end
+    return pan
+end
+
+;; polecenie odtwarzające mowę z panoramą: espeak --stdout | sox … remix; "" gdy brak sox / espeak
+pub fn pan_command(cmd: string, pan: int) -> string is
+    if pan == 0 || string_find(cmd, "espeak") < 0 || process::which("sox") == "" is return "" end
+    let l: int = if pan > 0 then 100 - pan else 100
+    let r: int = if pan < 0 then 100 + pan else 100
+    return cmd + " --stdout | sox -q -t wav - -d remix 1v" + gain_str(l) + " 1v" + gain_str(r)
+end
+
+fn gain_str(pct: int) -> string is
+    if pct >= 100 is return "1" end
+    if pct <= 0 is return "0" end
+    return "0." + (if pct < 10 then "0" else "") + to_string(pct)
+end
+
+fn pop_stack(stack: string) -> string is
+    let ents: [string] = string_split(stack, "\u0002")
+    if array_len(ents) <= 1 is return "" end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(ents) - 1 is
+        out = if out == "" then ents[i] else out + "\u0002" + ents[i]
+        i += 1
+    end
+    return out
+end
+
+fn collect(d: dom::Dom, styles: [style::ComputedStyle], id: int) -> string is
+    let n: dom::DomNode = d.nodes[id]
+    if n.removed is return "" end
+    if n.tag == "text" is
+        return transform(n.text, parse_speak_as(props::xget(styles[id].xp, "speak-as")))
+    end
+    if styles[id].display == "none" || dom::has_attr(n, "hidden") || dom::get_attr(n, "aria-hidden") == "true" is return "" end
+    if n.tag == "script" || n.tag == "style" is return "" end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(n.children) is
+        let piece: string = collect(d, styles, n.children[i])
+        i += 1
+        if piece == "" is continue end
+        if out != "" is out = out + " " end
+        out = out + piece
+    end
+    if out == "" is return "" end
+    ;; 0.4: kolejność: pause-before, cue-before, rest-before, treść, rest-after, cue-after, pause-after
+    let xp: string = styles[id].xp
+    let pxp: string = if n.parent > 0 && n.parent < array_len(styles) then styles[n.parent].xp else ""
+    let vm: string = voice_mark(xp, pxp)
+    let head: string = pause_marker(xp, "pause", "before") + cue_marker(xp, "before") + pause_marker(xp, "rest", "before") + (if vm != "" then "\u0001V" + vm + "\u0001" else "")
+    let tail: string = (if vm != "" then "\u0001v\u0001" else "") + pause_marker(xp, "rest", "after") + cue_marker(xp, "after") + pause_marker(xp, "pause", "after")
+    if head == "" && tail == "" is return out end
+    return head + out + tail
+end
+
+;; ---------- 0.4: pause-*, rest-*, cue-* ----------
+fn time_ms(tok0: string) -> int is
+    let tok: string = string_lower(string_trim(tok0))
+    if tok == "none" || tok == "" is return 0 end
+    if tok == "x-weak" is return 100 end
+    if tok == "weak" is return 200 end
+    if tok == "medium" is return 400 end
+    if tok == "strong" is return 800 end
+    if tok == "x-strong" is return 1200 end
+    if string_ends_with(tok, "ms") && props::is_num(string_slice(tok, 0, string_len(tok) - 2)) is return str_to_int(string_slice(tok, 0, string_len(tok) - 2)) end
+    if string_ends_with(tok, "s") && props::is_num(string_slice(tok, 0, string_len(tok) - 1)) is
+        return conv::float_to_int(conv::str_to_float(string_slice(tok, 0, string_len(tok) - 1)) * 1000.0)
+    end
+    return 0
+end
+
+;; długość pauzy z `<name>-before|after` albo z skrótu `<name>` (jedna wartość = obie strony)
+fn pause_marker(xp: string, name: string, side: string) -> string is
+    let mut v: string = props::xget(xp, name + "-" + side)
+    if v == "" is
+        let sh: [string] = cssval::split_top(props::xget(xp, name))
+        if array_len(sh) >= 1 is
+            v = if side == "before" || array_len(sh) < 2 then sh[0] else sh[1]
+        end
+    end
+    let ms: int = time_ms(v)
+    if ms <= 0 is return "" end
+    return "\u0001P" + to_string(ms) + "\u0001"
+end
+
+fn cue_marker(xp: string, side: string) -> string is
+    let mut v: string = string_trim(props::xget(xp, "cue-" + side))
+    if v == "" is
+        let sh: [string] = cssval::split_top(props::xget(xp, "cue"))
+        if array_len(sh) >= 1 is
+            ;; skrót: <before> [<after>]; wartość url() może mieć liczbę głośności po sobie
+            let mut urls: [string] = []
+            let mut k: int = 0
+            while k < array_len(sh) is
+                if string_starts_with(string_lower(sh[k]), "url(") || string_lower(sh[k]) == "none" is urls = array_push(urls, sh[k]) end
+                k += 1
+            end
+            if array_len(urls) >= 1 is v = if side == "before" || array_len(urls) < 2 then urls[0] else urls[1] end end
+        end
+    end
+    let toks: [string] = cssval::split_top(v)
+    if array_len(toks) < 1 is return "" end
+    let u: string = string_trim(toks[0])
+    if !string_starts_with(string_lower(u), "url(") is return "" end
+    let mut path: string = string_slice(u, 4, string_len(u) - 1)
+    path = string_trim(path)
+    if string_len(path) >= 2 && (string_starts_with(path, "\"") || string_starts_with(path, "'")) is path = string_slice(path, 1, string_len(path) - 1) end
+    if path == "" || string_find(path, "'") >= 0 || string_find(path, "\u0001") >= 0 is return "" end
+    return "\u0001C" + path + "\u0001"
+end
+
+fn audio_player() -> string is
+    let custom: string = env::get_or("SILVER_AUDIO", "")
+    if custom != "" is return custom end
+    if process::which("paplay") != "" is return "paplay" end
+    if process::which("aplay") != "" is return "aplay -q" end
+    if process::which("afplay") != "" is return "afplay" end
+    if process::which("play") != "" is return "play -q" end
+    return ""
+end
+
+fn secs_str(ms: int) -> string is
+    let frac: int = ms % 1000
+    let pad: string = if frac < 10 then "00" elsif frac < 100 then "0" else ""
+    return to_string(ms / 1000) + "." + pad + to_string(frac)
+end
+
+;; Tekst do wypowiedzenia dla poddrzewa `root` (z `speak-as` każdego węzła tekstowego).
+pub fn spoken_text(d: dom::Dom, styles: [style::ComputedStyle], root: int) -> string is
+    if root < 0 || root >= array_len(d.nodes) is return "" end
+    return collect(d, styles, root)
+end
+
+;; Polecenie syntezatora z szablonu ("{{file}}" = plik z tekstem). Szablon z SILVER_TTS ma pierwszeństwo.
+pub fn tts_template() -> string is
+    let custom: string = env::get_or("SILVER_TTS", "")
+    if custom != "" is return custom end
+    if process::which("espeak-ng") != "" is return "espeak-ng {{opts}} -f {{file}}" end
+    if process::which("espeak") != "" is return "espeak {{opts}} -f {{file}}" end
+    if process::which("spd-say") != "" is return "spd-say -w -e < {{file}}" end
+    if process::which("say") != "" is return "say -f {{file}}" end
+    return ""
+end
+
+;; Wypowiada tekst szablonem `tmpl`; `wait` = czeka na koniec mowy. false, gdy brak syntezatora.
+pub fn speak_with(tmpl: string, text: string, wait: bool) -> bool is
+    return speak_with_opts(tmpl, text, "", wait)
+end
+
+;; 0.4: CSS Speech — voice-rate / voice-pitch / voice-volume / voice-family elementu na opcje espeak(-ng) ({{opts}} w szablonie).
+fn voice_rate_wpm(v: string) -> int is
+    if v == "x-slow" is return 80 end
+    if v == "slow" is return 120 end
+    if v == "medium" is return 175 end
+    if v == "fast" is return 250 end
+    if v == "x-fast" is return 350 end
+    if string_ends_with(v, "%") && props::is_num(string_slice(v, 0, string_len(v) - 1)) is
+        return 175 * str_to_int(string_slice(v, 0, string_len(v) - 1)) / 100
+    end
+    return 0
+end
+
+pub fn voice_opts(st: style::ComputedStyle) -> string is
+    return voice_opts_text(st, "")
+end
+
+;; 0.4: voice-duration: <czas> — tempo dobrane tak, by `text` zajął zadany czas (słowa × 60 / sekundy), nadpisuje voice-rate
+fn word_count(t: string) -> int is
+    let parts: [string] = string_split(string_trim(t), " ")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if parts[i] != "" && !string_starts_with(parts[i], "\u0001") is n += 1 end
+        i += 1
+    end
+    return n
+end
+
+pub fn voice_opts_text(st: style::ComputedStyle, text: string) -> string is
+    let mut o: string = ""
+    let mut rate: int = voice_rate_wpm(string_lower(string_trim(props::xget(st.xp, "voice-rate"))))
+    let dur_ms: int = time_ms(props::xget(st.xp, "voice-duration"))
+    if dur_ms > 0 && text != "" is
+        let words: int = word_count(text)
+        if words > 0 is rate = words * 60000 / dur_ms end
+        if rate < 80 is rate = 80 end
+        if rate > 450 is rate = 450 end
+    end
+    if rate >= 80 && rate <= 450 is o = o + " -s " + to_string(rate) end
+    let pv: string = string_lower(string_trim(props::xget(st.xp, "voice-pitch")))
+    let mut pitch: int = -1
+    if pv == "x-low" is pitch = 10 end
+    if pv == "low" is pitch = 30 end
+    if pv == "medium" is pitch = 50 end
+    if pv == "high" is pitch = 70 end
+    if pv == "x-high" is pitch = 90 end
+    if pitch >= 0 is o = o + " -p " + to_string(pitch) end
+    let vv: string = string_lower(string_trim(props::xget(st.xp, "voice-volume")))
+    let mut vol: int = -1
+    if vv == "silent" is vol = 0 end
+    if vv == "x-soft" is vol = 40 end
+    if vv == "soft" is vol = 70 end
+    if vv == "medium" is vol = 100 end
+    if vv == "loud" is vol = 140 end
+    if vv == "x-loud" is vol = 190 end
+    if vol >= 0 is o = o + " -a " + to_string(vol) end
+    let fam: [string] = cssval::split_top(string_lower(string_trim(props::xget(st.xp, "voice-family"))))
+    if array_len(fam) >= 1 is
+        let f: string = string_replace(string_replace(fam[0], ",", ""), "\"", "")
+        if f == "male" is o = o + " -v +m3"
+        elsif f == "female" is o = o + " -v +f3"
+        elsif f != "" && f != "preserve" && string_find(f, "'") < 0 && string_find(f, " ") < 0 is o = o + " -v " + f end
+    end
+    return o
+end
+
+pub fn speak_with_opts(tmpl: string, text: string, opts: string, wait: bool) -> bool is
+    if tmpl == "" || string_trim(text) == "" is return false end
+    if string_find(text, "\u0001") >= 0 is return speak_segments(tmpl, text, opts, wait) end
+    let file: string = "/tmp/silver-speech.txt"
+    fs::write(file, text)
+    let mut cmd: string = string_replace(tmpl, "{{opts}}", opts)
+    cmd = string_replace(cmd, "{{file}}", "'" + file + "'")
+    if wait is
+        process::run(cmd)
+    else is
+        process::spawn(cmd)
+    end
+    return true
+end
+
+;; Tekst ze znacznikami pauz/sygnałów (\u0001P<ms>\u0001, \u0001C<plik>\u0001): odcinki mowy, `sleep` i odtwarzacz w jednym łańcuchu poleceń.
+fn speak_segments(tmpl: string, text: string, opts: string, wait: bool) -> bool is
+    let parts: [string] = string_split(text, "\u0001")
+    let player: string = audio_player()
+    let mut chain: string = ""
+    let mut spoke: bool = false
+    let mut vstack: string = ""
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let part: string = parts[i]
+        let is_marker: bool = i % 2 == 1
+        i += 1
+        let mut cmd: string = ""
+        if !is_marker is
+            if string_trim(part) == "" is continue end
+            let file: string = "/tmp/silver-speech-" + to_string(i) + ".txt"
+            let wrapped: string = if string_find(tmpl, "espeak") >= 0 then ssml_wrap(vstack, part) else part
+            fs::write(file, wrapped)
+            let o2: string = if wrapped != part then opts + " -m" else opts
+            cmd = string_replace(string_replace(tmpl, "{{opts}}", o2), "{{file}}", "'" + file + "'")
+            let pc: string = pan_command(cmd, stack_pan(vstack))
+            if pc != "" is cmd = pc end
+            spoke = true
+        elsif string_starts_with(part, "V") is
+            vstack = if vstack == "" then string_slice(part, 1, string_len(part)) else vstack + "\u0002" + string_slice(part, 1, string_len(part))
+        elsif part == "v" is
+            vstack = pop_stack(vstack)
+        elsif string_starts_with(part, "P") && props::is_int(string_slice(part, 1, string_len(part))) is
+            cmd = "sleep " + secs_str(str_to_int(string_slice(part, 1, string_len(part))))
+        elsif string_starts_with(part, "C") && player != "" is
+            cmd = player + " '" + string_slice(part, 1, string_len(part)) + "'"
+        end
+        if cmd == "" is continue end
+        chain = if chain == "" then cmd else chain + "; " + cmd
+    end
+    if chain == "" is return false end
+    if wait is process::run("( " + chain + " )") else is process::spawn("( " + chain + " )") end
+    return spoke || chain != ""
+end
+
+pub fn speak_text(text: string, wait: bool) -> bool is
+    return speak_with(tts_template(), text, wait)
+end
+
+pub fn speak_text_opts(text: string, opts: string, wait: bool) -> bool is
+    return speak_with_opts(tts_template(), text, opts, wait)
+end
