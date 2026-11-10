@@ -247,7 +247,7 @@ fn draw_text_fill_stroke(win: int, x: int, y: int, text: string, st: style::Comp
         ffi_shim::silver_layer_begin(win, x, y, tw, th)
         let mut i: int = nfi - 1
         while i >= 0 is
-            draw_img_layer(win, st, "fill", i, fg[0], fg[1], fg[2], fg[3], 0, 0, 0, 0, 0, 0, whole)
+            draw_img_layer(win, st, "fill", i, whole[0], whole[1], whole[2], whole[3], 0, 0, 0, 0, 0, 0, whole)
             i -= 1
         end
         ffi_shim::silver_layer_begin(win, x, y, tw, th)
@@ -271,7 +271,7 @@ fn draw_text_fill_stroke(win: int, x: int, y: int, text: string, st: style::Comp
             ffi_shim::silver_layer_begin(win, sx, sy, sww, shh)
             let mut k: int = nsi - 1
             while k >= 0 is
-                draw_img_layer(win, st, "stroke", k, sg[0], sg[1], sg[2], sg[3], 0, 0, 0, 0, 0, 0, swhole)
+                draw_img_layer(win, st, "stroke", k, swhole[0], swhole[1], swhole[2], swhole[3], 0, 0, 0, 0, 0, 0, swhole)
                 k -= 1
             end
             ffi_shim::silver_layer_begin(win, sx, sy, sww, shh)
@@ -1583,18 +1583,18 @@ fn annotate_text_fragments(boxes: [layout::LayoutBox]) -> [layout::LayoutBox] is
     if !need is return boxes end
     let mut out: [layout::LayoutBox] = boxes
     i = 0
-    while i < array_len(boxes) is
-        let b: layout::LayoutBox = boxes[i]
+    while i < array_len(out) is
+        let b: layout::LayoutBox = out[i]
         if b.kind == "text" && b.text != "" is
             let mut xp: string = b.st.xp
             if props::xget(xp, "fill-image") != "" is
                 let fb: string = string_lower(string_trim(props::xget(xp, "fill-break")))
-                let a: string = frag_annot(boxes, i, if fb == "" then "bounding-box" else fb)
+                let a: string = frag_annot(out, i, if fb == "" then "bounding-box" else fb)
                 if a != "" is xp = props::xset(xp, "\u0001fr", a) end
             end
             if props::xget(xp, "stroke-image") != "" is
                 let sb: string = string_lower(string_trim(props::xget(xp, "stroke-break")))
-                let a2: string = frag_annot(boxes, i, if sb == "" then "bounding-box" else sb)
+                let a2: string = frag_annot(out, i, if sb == "" then "bounding-box" else sb)
                 if a2 != "" is xp = props::xset(xp, "\u0001sr", a2) end
             end
             out[i].st.xp = xp
