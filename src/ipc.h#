@@ -152,7 +152,8 @@ pub fn dispatch_from(router: Router, name: string, args_json: string, caller: st
         end
         i += 1
     end
-    return cmd.handler(args_json)
+    let h: fn(string) -> string = cmd.handler
+    return h(args_json)
 end
 
 pub fn dispatch(router: Router, name: string, args_json: string) -> string is
