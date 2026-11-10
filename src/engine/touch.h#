@@ -133,8 +133,9 @@ end
 
 fn pinch(ns: [int]) -> TouchOut is
     let d: int = dist(ns[1], ns[2], ns[8], ns[9])
+    let z2: int = clamp_zoom(ns[11] * d / ns[10])
     let mut s2: [int] = ns
-    s2[12] = clamp_zoom(ns[11] * d / ns[10])
+    s2[12] = z2
     let mut out: TouchOut = out0(s2)
     out.zoom = s2[12]
     return out
