@@ -126,7 +126,8 @@ pub fn build(v: string, rx: int, ry: int, rw: int, rh: int, margin: int, em: int
             let cl_y: int = if dt < db then dt else db
             let fa_x: int = if dl > dr then dl else dr
             let fa_y: int = if dt > db then dt else db
-            let rt: [string] = if ps[0] == "" then [] else cssval::split_top(string_lower(ps[0]))
+            let mut rt: [string] = []
+            if ps[0] != "" is rt = cssval::split_top(string_lower(ps[0])) end
             if name == "circle" is
                 let tok: string = if array_len(rt) >= 1 then rt[0] else "closest-side"
                 let cl: int = if cl_x < cl_y then cl_x else cl_y
