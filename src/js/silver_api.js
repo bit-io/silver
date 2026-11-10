@@ -135,6 +135,12 @@
       message: function (text, o) { o = o || {}; return invoke('__dialog', { kind: 'message', title: o.title || '', text: String(text), level: o.level || 'info' }).then(function () { }); },
       confirm: function (text, o) { o = o || {}; return invoke('__dialog', { kind: 'confirm', title: o.title || '', text: String(text) }).then(function (r) { return !!r.ok; }); }
     },
+    print: {
+      toPDF: function (path, o) { o = o || {}; return invoke('__print', { path: String(path), backgrounds: !!o.backgrounds }).then(function (r) { return r.pages; }); }
+    },
+    speech: {
+      speak: function (selector) { return invoke('__speak', { selector: String(selector || 'body') }); }
+    },
     clipboard: {
       readText: function () { return invoke('__clip', { op: 'get' }).then(function (r) { return r.text; }); },
       writeText: function (t) { return invoke('__clip', { op: 'set', text: String(t) }).then(function () { }); }
