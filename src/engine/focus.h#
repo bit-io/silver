@@ -1,0 +1,211 @@
+pub fn is_focusable(n: dom::DomNode) -> bool is
+    if n.removed || n.disabled is return false end
+    if n.tag == "input" is return string_lower(n.attr_type) != "hidden" end
+    if n.tag == "textarea" || n.tag == "select" || n.tag == "button" is return true end
+    if n.tag == "a" is return n.attr_href != "" || n.on_click != "" end
+    return dom::has_attr(n, "tabindex") && dom::get_attr(n, "tabindex") != "-1"
+end
+
+pub fn hidden_by_style(d: dom::Dom, boxes: [layout::LayoutBox], id: int) -> bool is
+    ;; element bez boxa w układzie (display:none u siebie lub przodka) nie bierze udziału w Tab
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is return false end
+        i += 1
+    end
+    return array_len(boxes) > 0
+end
+
+;; 0.4: reading-flow (flex-visual | flex-flow | grid-rows | grid-columns | grid-order) — kolejność fokusu dzieci kontenera flex/grid
+pub fn box_index_of(d: dom::Dom, boxes: [layout::LayoutBox], id: int) -> int is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn flow_mode_of(d: dom::Dom, boxes: [layout::LayoutBox], id: int) -> string is
+    let bi: int = box_index_of(d, boxes, id)
+    if bi < 0 is return "" end
+    let v: string = string_lower(string_trim(props::xget(boxes[bi].st.xp, "reading-flow")))
+    if v == "flex-visual" || v == "flex-flow" || v == "grid-rows" || v == "grid-columns" || v == "grid-order" is return v end
+    return ""
+end
+
+;; zwraca [id kontenera, klucz porządkowy dziecka] dla kandydata; kontener -1 = brak reading-flow
+pub fn flow_key_of(d: dom::Dom, boxes: [layout::LayoutBox], cand: int) -> [int] is
+    let mut child: int = cand
+    let mut cur: int = d.nodes[cand].parent
+    let mut guard: int = 0
+    while cur > 0 && guard < 64 is
+        let mode: string = flow_mode_of(d, boxes, cur)
+        if mode != "" is
+            let cb: int = box_index_of(d, boxes, child)
+            let kb: int = box_index_of(d, boxes, cur)
+            if cb < 0 || kb < 0 is return [-1, 0] end
+            let bx: int = boxes[cb].x
+            let by: int = boxes[cb].y
+            let ord: int = boxes[cb].st.order
+            let row: bool = boxes[kb].st.flex_dir == "row" || boxes[kb].st.flex_dir == "row-reverse"
+            let mut key: int = 0
+            if mode == "flex-flow" || mode == "grid-order" is key = ord
+            elsif mode == "grid-rows" is key = by * 100000 + bx
+            elsif mode == "grid-columns" is key = bx * 100000 + by
+            else is key = if row then bx else by end end
+            return [cur, key]
+        end
+        child = cur
+        cur = d.nodes[cur].parent
+        guard += 1
+    end
+    return [-1, 0]
+end
+
+pub fn apply_reading_flow(d: dom::Dom, boxes: [layout::LayoutBox], cands: [int]) -> [int] is
+    let n: int = array_len(cands)
+    let mut cont: [int] = []
+    let mut key: [int] = []
+    let mut any_flow: bool = false
+    let mut i: int = 0
+    while i < n is
+        let fk: [int] = flow_key_of(d, boxes, cands[i])
+        cont = array_push(cont, fk[0])
+        key = array_push(key, fk[1])
+        if fk[0] >= 0 is any_flow = true end
+        i += 1
+    end
+    if !any_flow is return cands end
+    let mut done: [bool] = []
+    i = 0
+    while i < n is
+        done = array_push(done, false)
+        i += 1
+    end
+    let mut out: [int] = []
+    i = 0
+    while i < n is
+        if done[i] is
+            i += 1
+            continue
+        end
+        if cont[i] < 0 is
+            out = array_push(out, cands[i])
+            done[i] = true
+            i += 1
+            continue
+        end
+        ;; grupa tego kontenera: stabilne sortowanie po kluczu dziecka
+        let mut gi: [int] = []
+        let mut j: int = i
+        while j < n is
+            if !done[j] && cont[j] == cont[i] is
+                let mut at: int = array_len(gi)
+                while at > 0 && key[gi[at - 1]] > key[j] is at -= 1 end
+                let mut ng: [int] = []
+                let mut q: int = 0
+                while q <= array_len(gi) is
+                    if q == at is ng = array_push(ng, j) end
+                    if q < array_len(gi) is ng = array_push(ng, gi[q]) end
+                    q += 1
+                end
+                gi = ng
+                done[j] = true
+            end
+            j += 1
+        end
+        let mut g: int = 0
+        while g < array_len(gi) is
+            out = array_push(out, cands[gi[g]])
+            g += 1
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn reading_key(d: dom::Dom, boxes: [layout::LayoutBox], id: int) -> int is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == id && boxes[i].kind == "box" is
+            let v: string = props::xget(boxes[i].st.xp, "reading-order")
+            if v != "" && props::is_int(v) is return str_to_int(v) end
+            return 0
+        end
+        i += 1
+    end
+    return 0
+end
+
+;; 0.4: nav-up/-down/-left/-right — jawny cel nawigacji strzałką ("#id" lub "#id nazwa-celu"; auto = zachowanie domyślne)
+pub fn nav_target(d: dom::Dom, boxes: [layout::LayoutBox], node: int, prop: string) -> int is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].node_id == node && boxes[i].kind == "box" is
+            let v: string = string_trim(props::xget(boxes[i].st.xp, prop))
+            if string_starts_with(v, "#") is
+                let parts: [string] = cssval::split_top(v)
+                let t: int = dom::find_by_id(d, string_slice(parts[0], 1, string_len(parts[0])))
+                if t > 0 && is_focusable(d.nodes[t]) && !hidden_by_style(d, boxes, t) is return t end
+            end
+            return -1
+        end
+        i += 1
+    end
+    return -1
+end
+
+;; kolejny/poprzedni element do fokusu w kolejności dokumentu
+pub fn next_focus(d: dom::Dom, boxes: [layout::LayoutBox], focused: int, forward: bool) -> int is
+    let order: [int] = dom::document_order(d)
+    let mut cands: [int] = []
+    let mut i: int = 0
+    while i < array_len(order) is
+        let id: int = order[i]
+        i += 1
+        if id > 0 && is_focusable(d.nodes[id]) && !hidden_by_style(d, boxes, id) is cands = array_push(cands, id) end
+    end
+    if array_len(cands) == 0 is return -1 end
+    cands = apply_reading_flow(d, boxes, cands)
+    ;; 0.4: reading-order — kolejność fokusu rosnąco po wartości (domyślnie 0), stabilnie względem kolejności dokumentu
+    let mut keys: [int] = []
+    i = 0
+    while i < array_len(cands) is
+        keys = array_push(keys, reading_key(d, boxes, cands[i]))
+        i += 1
+    end
+    let mut any_key: bool = false
+    i = 0
+    while i < array_len(keys) is
+        if keys[i] != 0 is any_key = true end
+        i += 1
+    end
+    if any_key is
+        let mut j: int = 1
+        while j < array_len(cands) is
+            let kc: int = cands[j]
+            let kk: int = keys[j]
+            let mut m: int = j - 1
+            while m >= 0 && keys[m] > kk is
+                cands[m + 1] = cands[m]
+                keys[m + 1] = keys[m]
+                m -= 1
+            end
+            cands[m + 1] = kc
+            keys[m + 1] = kk
+            j += 1
+        end
+    end
+    let mut pos: int = -1
+    i = 0
+    while i < array_len(cands) is
+        if cands[i] == focused is pos = i end
+        i += 1
+    end
+    if forward is
+        return cands[(pos + 1) % array_len(cands)]
+    end
+    if pos <= 0 is return cands[array_len(cands) - 1] end
+    return cands[pos - 1]
+end
