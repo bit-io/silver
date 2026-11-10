@@ -14,7 +14,6 @@ use "std -> conv" from "conv"
 use "std -> time"  from "time"
 use "std -> http"  from "http"
 use "std -> process" from "process"
-use "std -> async" from "async_"
 
 pub struct Anim is
     pub node:     int
@@ -23,6 +22,11 @@ pub struct Anim is
     pub from_bg:  style::Color
     pub from_fg:  style::Color
     pub from_op:  int
+end
+
+struct TaskPoll is
+    pub ready:  bool
+    pub output: string
 end
 
 pub struct Task is
@@ -1121,7 +1125,10 @@ end
 
 ;; Zdarzenie do hooka H# (on_event) — zawsze po stronie H#.
 fn fire_hook(app: App, name: string, payload: string) -> App is
-    return app.on_event(app, name, payload)
+    ;; Pole typu fn(...) trzeba najpierw wyciągnąć do zmiennej: `app.on_event(...)`
+    ;; backend C++ czyta jako wywołanie metody (hs_m_on_event) i nie kompiluje.
+    let hook: fn(App, string, string) -> App = app.on_event
+    return hook(app, name, payload)
 end
 
 ;; ---------- fokus / pola (deklaracje wyprzedzające są niepotrzebne w H#) ----------
@@ -3272,9 +3279,32 @@ end
 ;; i (opcjonalnie) wywołuje komendę routera z {"id","output"}.
 pub fn spawn_task(app: App, id: string, shell_command: string, done_command: string) -> App is
     let mut a: App = app
-    let handle: string = async_::spawn(shell_command)
+    ;; Zadanie to proces `sh -c` piszący stdout do pliku tymczasowego; znacznik
+    ;; `.done` pojawia się dopiero po zakończeniu. (`async_::spawn` zwraca w backendzie
+    ;; C++ hs::Task<Str>, którego nie da się trzymać w polu string.)
+    let base: string = fs::temp_file("silver-task-")
+    let wrapped: string = "( " + shell_command + "\n) > '" + base + ".out'; : > '" + base + ".done'"
+    let pid: int = process::spawn(wrapped)
+    let mut handle: string = base
+    if pid < 0 is
+        fs::write(base + ".out", "")
+        fs::write(base + ".done", "")
+    end
     a.tasks = array_push(a.tasks, Task { id: id, handle: handle, command: done_command })
     return a
+end
+
+;; Zwraca (ready, output) dla uchwytu zadania i sprząta pliki tymczasowe.
+fn task_poll(handle: string) -> TaskPoll is
+    if handle == "" || !fs::exists(handle + ".done") is
+        return TaskPoll { ready: false, output: "" }
+    end
+    let mut out: string = ""
+    if fs::exists(handle + ".out") is out = fs::read(handle + ".out") end
+    fs::remove(handle + ".out")
+    fs::remove(handle + ".done")
+    fs::remove(handle)
+    return TaskPoll { ready: true, output: out }
 end
 
 fn poll_tasks(a0: App) -> App is
@@ -3285,13 +3315,13 @@ fn poll_tasks(a0: App) -> App is
     while i < array_len(a.tasks) is
         let t: Task = a.tasks[i]
         i += 1
-        let r = async_::timeout(t.handle, 0)
+        let r: TaskPoll = task_poll(t.handle)
         if !r.ready is
             remaining = array_push(remaining, t)
             continue
         end
         let mut j: string = jsonlite::set_str(jsonlite::object(), "id", t.id)
-        j = jsonlite::set_str(j, "output", r.value)
+        j = jsonlite::set_str(j, "output", r.output)
         emit(a, "silver://task", j)
         a = fire_hook(a, "task", j)
         a.tasks = remaining
@@ -3308,7 +3338,8 @@ fn run_tick(a0: App, now: int) -> App is
     if a.tick_ms <= 0 is return a end
     if now - a.last_tick < a.tick_ms is return a end
     a.last_tick = now
-    return a.on_tick(a)
+    let hook: fn(App) -> App = a.on_tick
+    return hook(a)
 end
 
 ;; Ile ms można maksymalnie czekać na zdarzenie.
