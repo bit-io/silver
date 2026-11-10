@@ -250,6 +250,35 @@ fn is_emoji_cp(cp: int) -> bool is
 end
 
 ;; Główna funkcja: stosuje wszystkie cechy z `xp` do tekstu (po text-transform).
+;; 0.4: text-autospace — odstęp 1/8 em (cienka przerwa U+200A) między ideogramem a literą (ideograph-alpha) i/lub cyfrą (ideograph-numeric).
+;; Działa tylko przy jawnie ustawionej wartości (normal | auto | ideograph-alpha | ideograph-numeric); no-autospace i brak = bez zmian.
+fn autospace_mode(xp: string) -> int is
+    let v: string = string_lower(string_trim(props::xget(xp, "text-autospace")))
+    if v == "" || string_find(v, "no-autospace") >= 0 is return 0 end
+    let mut m: int = 0
+    if string_find(v, "ideograph-alpha") >= 0 is m = m + 1 end
+    if string_find(v, "ideograph-numeric") >= 0 is m = m + 2 end
+    if m == 0 && (string_find(v, "normal") >= 0 || string_find(v, "auto") >= 0) is m = 3 end
+    return m
+end
+
+;; 1 ideogram/kana, 2 litera (łacińska/grecka/cyrylica), 3 cyfra ASCII, 0 inne
+fn space_class(cp: int) -> int is
+    if (cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x20000 && cp <= 0x3FFFF) is return 1 end
+    if cp >= 0x30 && cp <= 0x39 is return 3 end
+    if (cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A) || (cp >= 0xC0 && cp <= 0x24F) || (cp >= 0x370 && cp <= 0x52F) is return 2 end
+    return 0
+end
+
+fn needs_autospace(prev: int, cls: int, mode: int) -> bool is
+    if prev == 0 || cls == 0 is return false end
+    let alpha_ok: bool = mode % 2 == 1
+    let num_ok: bool = (mode / 2) % 2 == 1
+    if prev == 1 && ((cls == 2 && alpha_ok) || (cls == 3 && num_ok)) is return true end
+    if cls == 1 && ((prev == 2 && alpha_ok) || (prev == 3 && num_ok)) is return true end
+    return false
+end
+
 pub fn shape(text: string, xp: string) -> string is
     if xp == "" || text == "" is return text end
     let lig_off: bool = ligatures_off(xp)
@@ -258,13 +287,16 @@ pub fn shape(text: string, xp: string) -> string is
     let zero: bool = wants(xp, "font-variant-numeric", "slashed-zero", "zero")
     let ordn: bool = wants(xp, "font-variant-numeric", "ordinal", "ordn")
     let emo: int = emoji_mode(xp)
-    if !lig_off && !fwid && fmode == 0 && !zero && !ordn && emo == 0 is return text end
+    let asp: int = autospace_mode(xp)
+    let wst: bool = string_find(string_lower(props::xget(xp, "word-space-transform")), "ideographic-space") >= 0
+    if !lig_off && !fwid && fmode == 0 && !zero && !ordn && emo == 0 && asp == 0 && !wst is return text end
     let mut t: string = text
     if fmode > 0 is t = apply_fractions(t) end
     if ordn is t = apply_ordinals(t) end
     let n: int = string_len(t)
     let mut out: string = ""
     let mut pos: int = 0
+    let mut prev_cls: int = 0
     while pos < n is
         let nx: int = ffi_shim::silver_utf8_next(t, pos)
         let step: int = if nx <= pos then pos + 1 else nx
@@ -272,6 +304,13 @@ pub fn shape(text: string, xp: string) -> string is
         let ch: string = string_slice(t, pos, end_i)
         pos = step
         let cp: int = str_to_char_code(ch)
+        let scls: int = space_class(cp)
+        if asp > 0 && needs_autospace(prev_cls, scls, asp) is out = out + "\u200a" end
+        prev_cls = scls
+        if wst && cp == 0x20 is
+            out = out + "\u3000"
+            continue
+        end
         if fwid && cp >= 0x21 && cp <= 0x7E is
             out = out + char_code_to_str(cp - 0x21 + 0xFF01)
             continue
