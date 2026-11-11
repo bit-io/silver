@@ -811,8 +811,14 @@ pub fn create_element(dom: Dom, tag: string) -> Dom is
 end
 
 pub fn create_text(dom: Dom, text: string) -> Dom is
-    let mut d: Dom = create_element(dom, "text")
-    d.nodes[array_len(d.nodes) - 1].text = text
+    ;; BUGFIX 0.4: create_element("text") przechodzi przez norm_tag → "svg-text" (element SVG),
+    ;; więc węzły tekstowe z JS (Svelte/React: createTextNode, szablony) nie były tekstem i
+    ;; statyczny tekst znikał z ekranu. Węzeł tekstowy ma tag "text" bez normalizacji.
+    let mut node: DomNode = blank_node(array_len(dom.nodes), -1, "text")
+    node.text = text
+    node.removed = true
+    let mut d: Dom = dom
+    d.nodes = array_push(d.nodes, node)
     return d
 end
 
