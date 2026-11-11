@@ -57,6 +57,7 @@ pub struct App is
     pub css_texts: [string]
     pub js_files:  [string]
     pub has_structural: bool       ;; w HTML są each= / if= → pełne odświeżenie przy zmianie stanu
+    pub has_bindings: bool         ;; HTML ma {{klucz}} lub each=/if= (bez tego set_state nie zmienia DOM-u)
     pub state_css:  bool           ;; arkusz ma :hover/:active/:focus (zmiana interakcji = nowy układ)
 
     pub scroll_y:    int
@@ -165,7 +166,7 @@ pub fn new(title: string, width: int, height: int) -> App is
         win: win, dom: dom::empty(), sheet: css::empty_sheet(), router: ipc::new_router(),
         font_path: "", font_size: 16, store: "{{}}", js_handle: -1, theme: "auto", dark: false, touch: touch::new_state(), zoom_pct: 100, forced: env::get_or("SILVER_FORCED_COLORS", "") == "1",
         bg: style::Color { r: 255, g: 255, b: 255, a: 255 },
-        html_src: "", html_path: "", css_files: [], css_texts: [], js_files: [], has_structural: false, state_css: false,
+        html_src: "", html_path: "", css_files: [], css_texts: [], js_files: [], has_structural: false, has_bindings: false, state_css: false,
         scroll_y: 0, elem_scroll: [], doc_h: 0, viewport_w: width, viewport_h: height,
         boxes: [], dirty_layout: true, dirty_paint: true,
         hovered_node: -1, active_node: -1, focused_node: -1, focus_value: "", cursor_pos: 0, anchor_pos: 0,
@@ -369,6 +370,9 @@ pub fn set_state(app: App, key: string, val: string) -> App is
     if a.has_structural is
         return rerender(a)
     end
+    ;; Bez wiązań w HTML zmiana stanu nic nie zmienia w DOM — pomijamy apply_state (przejście po wszystkich
+    ;; węzłach i atrybutach) i relayout. Backend C++ H# nie zwalnia pamięci, więc każdy zbędny układ to wyciek.
+    if !a.has_bindings is return a end
     a.dom = template::apply_state(a.dom, a.store)
     a.dirty_layout = true
     return a
@@ -381,6 +385,7 @@ pub fn set_state_json(app: App, key: string, raw_json: string) -> App is
     if a.has_structural is
         return rerender(a)
     end
+    if !a.has_bindings is return a end
     a.dom = template::apply_state(a.dom, a.store)
     a.dirty_layout = true
     return a
@@ -890,10 +895,32 @@ fn collect_mtimes(app: App) -> [int] is
     return out
 end
 
+;; HTML bez bloków <script>…</script>: kod JS (np. wbudowany bundle) zawiera `{{` i nie jest wiązaniem szablonu.
+fn strip_script_blocks(html: string) -> string is
+    let mut out: string = ""
+    let mut pos: int = 0
+    let n: int = string_len(html)
+    while pos < n is
+        let rest: string = string_slice(html, pos, n)
+        let s0: int = string_find(rest, "<script")
+        if s0 < 0 is
+            out = out + rest
+            break
+        end
+        out = out + string_slice(rest, 0, s0)
+        let tail: string = string_slice(rest, s0, string_len(rest))
+        let e0: int = string_find(tail, "</script>")
+        if e0 < 0 is break end
+        pos = pos + s0 + e0 + 9
+    end
+    return out
+end
+
 pub fn load_html_str(app: App, html: string) -> App is
     let mut a: App = app
     a.html_src = html
     a.has_structural = structural_in(html)
+    a.has_bindings = a.has_structural || string_find(strip_script_blocks(html), "{{") >= 0
     let parsed: dom::Dom = dom::parse(html)
     a.dom = template::expand(parsed, a.store)
     a = rebuild_sheet(a)
