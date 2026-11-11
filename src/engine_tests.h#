@@ -37,6 +37,26 @@ fn test_dom_parses_nested_tags() is
 end
 
 #[test]
+fn test_dom_create_text_is_text_node_not_svg_text() is
+    ;; regresja 0.4: create_text przechodził przez norm_tag("text") = "svg-text" i tekst z JS znikał
+    let mut d: dom::Dom = dom::parse("<body></body>")
+    let body: int = css::query_first(d, "body")
+    d = dom::create_text(d, "Hej")
+    let t: int = array_len(d.nodes) - 1
+    assert_eq(d.nodes[t].tag, "text")
+    assert_eq(d.nodes[t].text, "Hej")
+    d = dom::append_child(d, body, t, -1)
+    let boxes: [layout::LayoutBox] = layout::layout(d, css::parse(""), 400, -1)
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if boxes[i].text == "Hej" is found = true end
+        i += 1
+    end
+    assert(found)
+end
+
+#[test]
 fn test_dom_parses_attributes() is
     let d: dom::Dom = dom::parse("<div id=\"card\" class=\"a b\" on-click=\"go\"></div>")
     assert_eq(d.nodes[1].attr_id, "card")
