@@ -68,18 +68,19 @@ end
 ;; Rozbija tekst obiektu/tablicy na elementy najwyższego poziomu (surowe teksty).
 ;; Dla obiektu elementem jest "klucz:wartość" (klucz z cudzysłowami).
 fn split_top(body: string) -> [string] is
+    ;; Wycina kawałki (string_slice) zamiast sklejać je znak po znaku: `cur = cur + c` robiło O(n²) śmieci,
+    ;; a backend C++ H# nie zwalnia pamięci (każdy get_raw na kilkukilobajtowym store = MB wycieku).
     let n: int = string_len(body)
     let mut out: [string] = []
     let mut depth: int = 0
     let mut in_str: bool = false
     let mut esc: bool = false
-    let mut cur: string = ""
+    let mut start: int = 0
     let mut i: int = 0
     while i < n is
         let c: string = string_slice(body, i, i + 1)
         i += 1
         if in_str is
-            cur = cur + c
             if esc is
                 esc = false
             elsif c == "\\" is
@@ -91,21 +92,18 @@ fn split_top(body: string) -> [string] is
         end
         if c == "\"" is
             in_str = true
-            cur = cur + c
         elsif c == "[" || c == "{" is
             depth += 1
-            cur = cur + c
         elsif c == "]" || c == "}" is
             depth -= 1
-            cur = cur + c
         elsif c == "," && depth == 0 is
-            if string_trim(cur) != "" is out = array_push(out, string_trim(cur)) end
-            cur = ""
-        else is
-            cur = cur + c
+            let seg: string = string_trim(string_slice(body, start, i - 1))
+            if seg != "" is out = array_push(out, seg) end
+            start = i
         end
     end
-    if string_trim(cur) != "" is out = array_push(out, string_trim(cur)) end
+    let tail: string = string_trim(string_slice(body, start, n))
+    if tail != "" is out = array_push(out, tail) end
     return out
 end
 
