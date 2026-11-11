@@ -126,8 +126,14 @@ fn row_of(name: string) -> string is
     let idx: int = string_find(t, key)
     if idx < 0 is return "" end
     let start: int = idx + 1
-    let e: int = dom::find_from(t, "\u0002", start)
-    return string_slice(t, start, if e < 0 then string_len(t) else e)
+    ;; dom::find_from kopiuje CAŁY ogon tabeli (~40 KB) przy każdym wywołaniu; wiersz ma < 2 KB,
+    ;; więc szukamy końca w krótkim wycinku (backend C++ H# nie zwalnia pamięci → wyciek).
+    let total: int = string_len(t)
+    let hi: int = if start + 4096 > total then total else start + 4096
+    let chunk: string = string_slice(t, start, hi)
+    let e: int = string_find(chunk, "\u0002")
+    if e < 0 is return chunk end
+    return string_slice(chunk, 0, e)
 end
 
 pub fn known(name: string) -> bool is
@@ -142,7 +148,13 @@ fn field(name: string, n: int) -> string is
 end
 
 pub fn inherited(name: string) -> bool is
-    return field(name, 1) == "1"
+    ;; bez row_of/string_split: pole 1 wiersza to flaga dziedziczenia (jeden znak po pierwszym \u0001)
+    let key: string = "\u0002" + name + "\u0001"
+    let t: string = props_data::table()
+    let idx: int = string_find(t, key)
+    if idx < 0 is return false end
+    let at: int = idx + string_len(key)
+    return string_slice(t, at, at + 1) == "1"
 end
 
 pub fn initial(name: string) -> string is
