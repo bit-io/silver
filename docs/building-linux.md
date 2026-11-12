@@ -26,3 +26,18 @@ SDL2 jest linkowane dynamicznie, a archiwa Silvera (`.a`) statycznie.
 | `undefined reference to SDL_*`, `TTF_*`, `IMG_*` | brak SDL2 na linii linkera | `. native/env.sh` (plik `.pc`) |
 | `undefined reference to trunc/fmod/log...` | `-lm` przed archiwum (stary h#) | `.pc` albo przebudowany h# |
 | `module 'ffi_shim' not found` | ostrzezenie starego resolvera modulow | nieszkodliwe; naprawione w h# z tej paczki |
+
+## Aplikacja budowana przez `bit` (np. HackerDeck)
+
+Wystarczy samo `bit build --release` w projekcie aplikacji — bez zmiennych środowiskowych, bez `. native/env.sh static`
+i bez ręcznego `build-static-deps.sh`. Krok `native` silvera (`sh native/build.sh`) domyślnie:
+1. buduje statyczne SDL2/SDL2_ttf/SDL2_image (`build-static-deps.sh`),
+2. buduje `libsilvershim*.a`, `libsilverjs.a`, `libsilverdialogs.a`,
+3. składa `native/build/bit/` (`pack-bit.sh`): `libsilvershim.a` jest tam skryptem linkera
+   `GROUP ( …/libsilvershim_static.a …/libSDL2*.a -lfreetype -lX11 … )`, więc `bit` (który przekazuje linkerowi
+   tylko `LIBRARY_PATH`) linkuje aplikację w pełni statycznie, a `silver.hlib` (biblioteka współdzielona) też się buduje.
+
+Wymagane pakiety (Debian/Ubuntu):
+`apt install build-essential make curl file pkg-config libfreetype-dev libpng-dev zlib1g-dev libbz2-dev libbrotli-dev libx11-dev libxext-dev libxau-dev libxdmcp-dev libxcb1-dev libharfbuzz-dev`
+
+`SILVER_STATIC=0` (opcjonalnie) pomija statyczne SDL2 — tylko dla pracy z `h# compile --dynamic`.
