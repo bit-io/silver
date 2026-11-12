@@ -17,8 +17,9 @@ CC="${CC:-cc}"
 AR="${AR:-ar}"
 CFLAGS="${CFLAGS:--O2 -fPIC -Wall -Wextra -Wno-unused-parameter}"
 
-# SILVER_STATIC=1 → przy braku statycznych SDL2/SDL2_ttf/SDL2_image zbuduj je (native/build/deps)
-if [ "${SILVER_STATIC:-0}" = "1" ] && [ ! -f "$OUT/deps/lib/libSDL2.a" ]; then
+# Domyślnie (SILVER_STATIC=1): przy braku statycznych SDL2/SDL2_ttf/SDL2_image zbuduj je (native/build/deps),
+# bo `bit` linkuje zawsze statycznie. SILVER_STATIC=0 → tylko warianty dynamiczne.
+if [ "${SILVER_STATIC:-1}" = "1" ] && [ ! -f "$OUT/deps/lib/libSDL2.a" ]; then
     sh ./build-static-deps.sh
 fi
 
@@ -135,6 +136,8 @@ if [ -f "$OUT/static-libs.txt" ]; then
 else
     echo "[silver] (statyczny SDL2 niezbudowany: sh native/build-static-deps.sh — wymagane do h# compile bez --dynamic)"
 fi
+
+sh ./pack-bit.sh
 
 echo "[silver] gotowe: $(ls $OUT/*.a | tr '\n' ' ')"
 echo "[silver] pkg-config: . native/env.sh  (albo export PKG_CONFIG_PATH=$ABS_OUT/pkgconfig)"
