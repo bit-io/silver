@@ -12,8 +12,8 @@
 [build]
 -> link => static
 -> native          => sh native/build.sh
--> native-lib-path => native/build
--> native-skip-if  => native/build/libsilvershim.a
+-> native-lib-path => native/build/bit
+-> native-skip-if  => native/build/bit/libsilvershim.a
 
 [lib]
 -> output => hlib
@@ -24,7 +24,7 @@
 --> description => Typy H# + test natywny (SDL2/QuickJS/DOM) [+ run-js.sh gdy jest node]
 -> native
 --> run => sh native/build.sh
---> description => Zbuduj biblioteki natywne (libsilvershim.a, libsilverjs.a, libsilverdialogs.a)
+--> description => Zbuduj statyczne SDL2 + biblioteki natywne i złóż native/build/bit (samodzielne libsilvershim.a dla bit)
 -> native-static
 --> run => sh native/build-static-deps.sh
 --> description => Zbuduj statyczne SDL2/SDL2_ttf/SDL2_image (native/build/deps) do linkowania bez --dynamic
