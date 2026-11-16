@@ -48,6 +48,11 @@ pub struct App is
     pub dark:      bool
     pub touch:     [int]           ;; 0.4: stan gestów dotykowych (touch.h#)
     pub zoom_pct:  int             ;; 0.4: powiększenie strony gestem pinch-zoom (%)
+    pub drag_spec: string          ;; 0.5: obszary przeciągania okna (CSS app-region) przekazane do shima
+    pub resize_border: int         ;; 0.5: grubość uchwytu zmiany rozmiaru okna bez ramki (px, 0 = brak)
+    pub state_key: string          ;; 0.5: klucz zapisu pozycji/rozmiaru okna ("" = wyłączone)
+    pub state_last: int            ;; 0.5: czas ostatniego zapisu stanu okna
+    pub state_json: string         ;; 0.5: ostatnio zapisany stan okna
     pub forced:    bool            ;; 0.4: tryb wymuszonych kolorów (forced-colors: active, forced-color-adjust)
     pub bg:        style::Color
 
@@ -154,7 +159,7 @@ fn identity_event(a: App, name: string, payload: string) -> App is
 end
 
 pub fn version() -> string is
-    return "0.4.0"
+    return "0.5.0"
 end
 
 pub fn new(title: string, width: int, height: int) -> App is
@@ -164,7 +169,7 @@ pub fn new(title: string, width: int, height: int) -> App is
     end
     return App {
         win: win, dom: dom::empty(), sheet: css::empty_sheet(), router: ipc::new_router(),
-        font_path: "", font_size: 16, store: "{{}}", js_handle: -1, theme: "auto", dark: false, touch: touch::new_state(), zoom_pct: 100, forced: env::get_or("SILVER_FORCED_COLORS", "") == "1",
+        font_path: "", font_size: 16, store: "{{}}", js_handle: -1, theme: "auto", dark: false, touch: touch::new_state(), zoom_pct: 100, drag_spec: "", resize_border: 0, state_key: "", state_last: 0, state_json: "", forced: env::get_or("SILVER_FORCED_COLORS", "") == "1",
         bg: style::Color { r: 255, g: 255, b: 255, a: 255 },
         html_src: "", html_path: "", css_files: [], css_texts: [], js_files: [], has_structural: false, has_bindings: false, state_css: false,
         scroll_y: 0, elem_scroll: [], doc_h: 0, viewport_w: width, viewport_h: height,
@@ -256,6 +261,7 @@ end
 pub fn enable_hot_reload(app: App) -> App is
     let mut a: App = app
     a.dev_mode = true
+    ffi_shim::silver_vfs_set_embedded_first(0)     ;; tryb dev: plik na dysku wygrywa z wbudowanym (gdy istnieje)
     return a
 end
 
@@ -407,11 +413,71 @@ fn dir_of(path: string) -> string is
 end
 
 fn read_file_or_empty(path: string) -> string is
+    ;; 0.5: najpierw zasoby wbudowane w binarkę (`silver embed`), potem dysk
+    if ffi_shim::silver_vfs_has(path) is return ffi_shim::silver_vfs_text(path) end
     if !fs::exists(path) is
         log::warn("silver: brak pliku " + path)
         return ""
     end
     return fs::read(path)
+end
+
+;; ---------- 0.5: zasoby wbudowane w binarkę ----------
+;; Wywoływane z wygenerowanego `assets_gen.h#` (silver embed): rejestruje plik (base64) w VFS.
+pub fn register_asset(path: string, b64: string) -> bool is
+    return ffi_shim::silver_vfs_add(path, b64) == 1
+end
+
+;; Ile plików frontendu jest wbudowanych w tę binarkę.
+pub fn embedded_count() -> int is
+    return ffi_shim::silver_vfs_count()
+end
+
+;; Czy plik istnieje jako zasób wbudowany.
+pub fn has_embedded(path: string) -> bool is
+    return ffi_shim::silver_vfs_has(path)
+end
+
+;; Treść wbudowanego pliku tekstowego ("" gdy brak) albo odczyt z dysku.
+pub fn read_asset(path: string) -> string is
+    return read_file_or_empty(path)
+end
+
+;; ---------- 0.5: backend wideo ----------
+;; "wayland" (domyślnie; zapas X11), "wayland-only", "x11", "auto". Wołaj PRZED app::new.
+;; Zmienna SILVER_BACKEND i SDL_VIDEODRIVER mają pierwszeństwo. Zwraca nazwę żądanego backendu.
+pub fn set_backend(name: string) -> string is
+    ffi_shim::silver_set_backend(name)
+    return name
+end
+
+;; Nazwa faktycznie użytego sterownika wideo ("wayland", "x11", "dummy", …).
+pub fn backend() -> string is
+    return ffi_shim::silver_video_driver()
+end
+
+;; app_id (Wayland) / WM_CLASS (X11): musi pasować do nazwy pliku .desktop (bez .desktop). Wołaj PRZED app::new.
+pub fn set_app_id(id: string) -> bool is
+    return ffi_shim::silver_set_app_id(id) == 1
+end
+
+;; Wersja biblioteki natywnej (shim).
+pub fn native_version() -> string is
+    return ffi_shim::silver_native_version()
+end
+
+;; ---------- 0.5: pojedyncza instancja ----------
+;; true = to pierwsza instancja (kontynuuj); false = inna już działa, argumenty zostały jej
+;; przekazane (zdarzenie "second_instance") — zakończ proces. Wołaj PRZED app::new.
+pub fn single_instance(id: string, args: [string]) -> bool is
+    let mut joined: string = ""
+    let mut i: int = 0
+    while i < array_len(args) is
+        if i > 0 is joined = joined + "\n" end
+        joined = joined + args[i]
+        i += 1
+    end
+    return ffi_shim::silver_single_instance(id, joined) == 1
 end
 
 ;; Diagnostyka: SILVER_DEBUG=<cokolwiek> → app::load_html / relayout wypisują liczniki (stdout).
@@ -572,7 +638,7 @@ fn dump_layout(a: App, res: layout::LayoutResult) is
 end
 
 fn mtime_or_zero(path: string) -> int is
-    if path == "" || !fs::exists(path) is return 0 end
+    if path == "" || !fs::exists(path) is return 0 end   ;; pliki wbudowane nie mają mtime (brak hot reload)
     return fs::modified_time(path)
 end
 
@@ -617,7 +683,7 @@ end
 ;; Składa arkusz: <link rel=stylesheet>, <style> z HTML, potem pliki i teksty aplikacji.
 fn rebuild_sheet(app: App) -> App is
     let mut a: App = app
-    let mut sheet: css::Stylesheet = css::empty_sheet()
+    let mut sheet: css::Stylesheet = css::parse(css::ua_sheet_text())   ;; 0.5: UA dla details/summary/dialog/[hidden]
     let base: string = dir_of(a.html_path)
     let mut i: int = 0
     while i < array_len(a.dom.stylesheets) is
@@ -1898,6 +1964,13 @@ fn fetch_local(url: string, base: string) -> string is
     if h >= 0 is path = string_slice(path, 0, h) end
     if !string_starts_with(path, "/") && base != "" is path = base + path end
     let mut r: string = jsonlite::object()
+    if ffi_shim::silver_vfs_has(path) is
+        r = jsonlite::set_int(r, "status", 200)
+        r = jsonlite::set_bool(r, "ok", true)
+        r = jsonlite::set_str(r, "body", ffi_shim::silver_vfs_text(path))
+        r = jsonlite::set_raw(r, "headers", "{\"content-type\":\"" + netutil::local_mime(path) + "\"}")
+        return r
+    end
     if !fs::exists(path) || fs::is_dir(path) is
         r = jsonlite::set_int(r, "status", 404)
         r = jsonlite::set_bool(r, "ok", false)
@@ -2006,6 +2079,9 @@ fn builtin_window(a0: App, args: string) -> App is
         window::set_always_on_top(a.win, jsonlite::get_bool(args, "on"))
     elsif op == "decorations" is
         window::set_decorations(a.win, jsonlite::get_bool(args, "on"))
+    elsif op == "frameless" is
+        let b: int = jsonlite::get_int(args, "border")
+        a = set_frameless(a, if b <= 0 then 6 else b)
     elsif op == "notify" is
         window::notify(jsonlite::get_str(args, "title"), jsonlite::get_str(args, "body"))
     end
@@ -2088,6 +2164,14 @@ fn handle_js_invoke(a0: App, raw: string) -> App is
     end
     if cmd == "__dialog" is
         js::js_resolve(h, call_id, builtin_dialog(args))
+        return a
+    end
+    if cmd == "__info" is
+        ;; 0.5: informacje o środowisku uruchomieniowym (silver.info())
+        let mut r: string = jsonlite::set_str(jsonlite::object(), "backend", ffi_shim::silver_video_driver())
+        r = jsonlite::set_str(r, "version", ffi_shim::silver_native_version())
+        r = jsonlite::set_int(r, "embeddedAssets", ffi_shim::silver_vfs_count())
+        js::js_resolve(h, call_id, r)
         return a
     end
     if cmd == "__print" is
@@ -2400,6 +2484,17 @@ fn do_click(a0: App, hit: int, x: int, y: int) -> App is
         let n: dom::DomNode = a.dom.nodes[cur]
         if n.disabled is return a end
         let kind: string = string_lower(n.attr_type)
+        if n.tag == "summary" && n.parent >= 0 && a.dom.nodes[n.parent].tag == "details" is
+            ;; 0.5: <details>/<summary> — przełącz atrybut open
+            let pd: int = n.parent
+            if dom::has_attr(a.dom.nodes[pd], "open") is
+                a.dom = dom::remove_attr(a.dom, pd, "open")
+            else is
+                a.dom = dom::set_attr(a.dom, pd, "open", "")
+            end
+            a.dirty_layout = true
+            return invoke_html(a, n.on_click, event_args(a, cur, "", ""))
+        end
         if n.tag == "input" && (kind == "checkbox" || kind == "radio") is
             a = focus_node(a, cur)
             a = toggle_check(a, cur)
@@ -3218,6 +3313,7 @@ pub fn relayout(a0: App, now: int) -> App is
     a.dirty_paint = true
     a = detect_transitions(a, now)
     a = push_layout(a)
+    a = sync_drag_regions(a)
     ;; IME: podpowiedz pozycję pola
     if a.focused_node >= 0 && a.focused_node < array_len(a.dom.nodes) is
         let b: layout::LayoutBox = box_of(a, a.focused_node)
@@ -3404,6 +3500,7 @@ pub fn step(a0: App, wait_ms: int) -> App is
     let now: int = ffi_shim::silver_ticks()
     a = pump_js(a)
     a = poll_tasks(a)
+    a = poll_second_instance(a)
     a = run_tick(a, now)
     a = smooth_scroll_step(a)
     a = update_theme(a, now)
@@ -3411,6 +3508,7 @@ pub fn step(a0: App, wait_ms: int) -> App is
     a = pump_js(a)
     if a.anim_busy is a.dirty_layout = true end
     a = storage_flush(a, now, false)
+    a = window_state_flush(a, now, false)
     if a.dirty_layout is a = relayout(a, now) end
     let blink_changed: bool = a.focused_node >= 0 && a.has_focus && (((now - a.caret_t0) / 530) % 2 == 0) != a.caret_phase
     if a.dirty_paint || array_len(a.anims) > 0 || blink_changed is
@@ -3437,6 +3535,8 @@ end
 fn finish(a0: App) -> App is
     let mut a: App = a0
     a = storage_flush(a, 0, true)
+    a = window_state_flush(a, 0, true)
+    ffi_shim::silver_single_release()
     if a.js_handle >= 0 is
         js::js_shutdown(a.js_handle)
         a.js_handle = -1
@@ -3491,6 +3591,107 @@ pub fn run_all(apps: [App]) -> [App] is
         end
     end
     return list
+end
+
+;; ---------- 0.5: druga instancja ----------
+fn poll_second_instance(a0: App) -> App is
+    let mut a: App = a0
+    let msg: string = ffi_shim::silver_single_poll()
+    if msg == "" is return a end
+    let payload: string = jsonlite::set_str(jsonlite::object(), "args", msg)
+    window::raise(a.win)
+    emit(a, "silver://second-instance", payload)
+    return fire_hook(a, "second_instance", payload)
+end
+
+;; ---------- 0.5: okna bez ramki — obszary przeciągania z CSS (`app-region: drag|no-drag`) ----------
+;; Zbiera prostokąty z układu i przekazuje do shima (SDL_SetWindowHitTest: przesuwanie i zmiana rozmiaru
+;; działają natywnie na Waylandzie i X11). Wywoływane po każdym układzie; do shima trafia tylko zmiana.
+fn sync_drag_regions(a0: App) -> App is
+    let mut a: App = a0
+    let mut spec: string = ""
+    let mut i: int = 0
+    while i < array_len(a.boxes) is
+        let b: layout::LayoutBox = a.boxes[i]
+        i += 1
+        if b.kind != "box" || b.w <= 0 || b.h <= 0 is continue end
+        let v1: string = string_lower(props::xget(b.st.xp, "app-region"))
+        let r: string = if v1 != "" then v1 else string_lower(props::xget(b.st.xp, "-webkit-app-region"))
+        if r != "drag" && r != "no-drag" is continue end
+        if spec != "" is spec = spec + ";" end
+        let by: int = if b.fixed then b.y else b.y - a.scroll_y
+        spec = spec + to_string(b.x) + "," + to_string(by) + "," + to_string(b.w) + "," + to_string(b.h) + "," + (if r == "drag" then "0" else "1")
+    end
+    if spec != a.drag_spec is
+        a.drag_spec = spec
+        ffi_shim::silver_set_drag_regions(a.win.handle, spec, a.resize_border)
+    end
+    return a
+end
+
+;; Okno bez systemowej ramki z własnym paskiem tytułu w HTML. Pasek oznacz w CSS `app-region: drag`
+;; (przyciski w nim: `app-region: no-drag`). `border` = grubość uchwytu zmiany rozmiaru (px, np. 6).
+pub fn set_frameless(app: App, border: int) -> App is
+    let mut a: App = app
+    window::set_decorations(a.win, false)
+    a.resize_border = border
+    a.drag_spec = "@@force@@"
+    return sync_drag_regions(a)
+end
+
+;; ---------- 0.5: zapamiętywanie pozycji i rozmiaru okna ----------
+;; Zapisuje {x,y,w,h,max} w $XDG_DATA_HOME/silver/<klucz>/window.json (przy zmianie, co ≥ 1 s i przy zamknięciu).
+fn window_state_dir(key: string) -> string is
+    let base: string = env::get_or("XDG_DATA_HOME", env::get_or("HOME", ".") + "/.local/share")
+    return base + "/silver/" + key
+end
+
+fn window_state_path(key: string) -> string is
+    let base: string = env::get_or("XDG_DATA_HOME", env::get_or("HOME", ".") + "/.local/share")
+    return base + "/silver/" + key + "/window.json"
+end
+
+;; Przywraca rozmiar i położenie z poprzedniego uruchomienia (wołaj zaraz po app::new) i włącza zapis.
+;; Na Waylandzie pozycja okna jest ustalana przez kompozytor — przywracany jest tylko rozmiar.
+pub fn remember_window(app: App, key: string) -> App is
+    let mut a: App = app
+    a.state_key = key
+    let p: string = window_state_path(key)
+    if fs::exists(p) is
+        let raw: string = fs::read(p)
+        let w: int = jsonlite::get_int(raw, "w")
+        let h: int = jsonlite::get_int(raw, "h")
+        let x: int = jsonlite::get_int(raw, "x")
+        let y: int = jsonlite::get_int(raw, "y")
+        let has_pos: bool = jsonlite::get_int(raw, "pos") == 1
+        if w >= 200 && h >= 150 && w <= 16000 && h <= 16000 is
+            window::set_size(a.win, w, h)
+            a.viewport_w = w
+            a.viewport_h = h
+            if has_pos && ffi_shim::silver_video_driver() != "wayland" is window::set_position(a.win, x, y) end
+        end
+        a.state_json = raw
+    end
+    return a
+end
+
+fn window_state_flush(a0: App, now: int, force: bool) -> App is
+    let mut a: App = a0
+    if a.state_key == "" || !a.win.open is return a end
+    if !force && now - a.state_last < 1000 is return a end
+    a.state_last = now
+    let mut j: string = jsonlite::object()
+    j = jsonlite::set_int(j, "w", window::ffi_width(a.win))
+    j = jsonlite::set_int(j, "h", window::ffi_height(a.win))
+    j = jsonlite::set_int(j, "x", window::pos_x(a.win))
+    j = jsonlite::set_int(j, "y", window::pos_y(a.win))
+    j = jsonlite::set_int(j, "pos", 1)
+    if j == a.state_json is return a end
+    let p: string = window_state_path(a.state_key)
+    mkdir_chain(window_state_dir(a.state_key))
+    fs::write(p, j)
+    a.state_json = j
+    return a
 end
 
 ;; ---------- API okna i systemu ----------
