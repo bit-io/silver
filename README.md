@@ -1,4 +1,4 @@
-# Silver 0.4
+# Silver 0.5
 
 Framework okienkowy w stylu Tauri **bez WebView**: frontend w HTML/CSS/JS (albo TypeScript, React, Vue, Solid, Preact, Svelte),
 backend w [H#](https://github.com/HackerOS-Linux-System/H-Sharp). Własny silnik układu i rysowania na SDL2,
@@ -51,7 +51,7 @@ document.querySelector('#btn').addEventListener('click', async () => {
 });
 ```
 
-## Co potrafi (0.4)
+## Co potrafi (0.5)
 
 | Obszar | Zakres |
 |---|---|
@@ -60,7 +60,7 @@ document.querySelector('#btn').addEventListener('click', async () => {
 | **Układ** | blok z `float` i zwijaniem marginesów, inline, inline-block, flexbox (`align-content`), grid (obszary, linie, auto-placement), **prawdziwe tabele** (`colspan`, `rowspan`), `position`, listy, przewijanie kontenerów |
 | **Interakcja** | edycja pól (kursor, zaznaczenie, schowek, UTF-8, IME), Tab, kursory CSS, drag & drop plików, `on-click/input/change/submit/keydown/hover` |
 | **JS** | QuickJS ES2020+: moduły ES, `await`, timery, `fetch` z nagłówkami, lustro DOM z układem (`getBoundingClientRect`, `getComputedStyle`), obserwatory, synchroniczne `preventDefault`, `Intl`, trwały `localStorage`, `Worker`, `WebSocket`, Shadow DOM, Custom Elements, source mapy → [docs/javascript.md](docs/javascript.md) |
-| **TypeScript / frameworki** | esbuild + npm; `silver.d.ts`; sprawdzone: TypeScript, Preact, Svelte 4/5, React 18, Vue 3, Solid → [docs/typescript.md](docs/typescript.md) |
+| **TypeScript / frameworki** | esbuild + npm; typy z npm (`@hackeros/silver-types`); sprawdzone: TypeScript, Preact, Svelte 4/5, React 18, Vue 3, Solid → [docs/typescript.md](docs/typescript.md) |
 | **Backend H#** | komendy z uprawnieniami (`capabilities`), dyrektywy UI (`ui.h#`), szablony `{{klucz}}`/`if`/`each`, zadania w tle, wiele okien, cykliczny `on_tick` |
 | **System** | schowek, powiadomienia, dialogi plików, ikona, pełny ekran, motyw jasny/ciemny |
 | **Dystrybucja** | `silver bundle`: AppImage, `.deb`, `.app`/`.dmg`, Windows `.zip`/instalator → [docs/packaging.md](docs/packaging.md) |
@@ -69,6 +69,8 @@ document.querySelector('#btn').addEventListener('click', async () => {
 
 ```
 silver new <nazwa> [--template <szablon>] [--ts] [--svelte]
+silver embed [--dir frontend]   # wbuduj frontend w binarkę (src/assets_gen.h#)
+silver run --x11 | --backend <wayland|wayland-only|x11|auto>
 silver list | doctor | version
 silver dev                 # frontend --watch + aplikacja z hot reload
 silver build | run         # npm (jeśli jest frontend/package.json) + bit build | bit run
@@ -95,24 +97,22 @@ silver bundle <appimage|deb|macos|dmg|windows>
 - [docs/typescript.md](docs/typescript.md) — TypeScript, npm, Preact, Svelte
 - [docs/css.md](docs/css.md) — obsługiwany CSS i HTML
 - [docs/packaging.md](docs/packaging.md) — AppImage, deb, macOS, Windows
+- [docs/backends.md](docs/backends.md) — Wayland (domyślnie) / X11, `SILVER_BACKEND`, dekoracje okien
+- [docs/embedding.md](docs/embedding.md) — frontend wbudowany w binarkę (`silver embed`)
+- [docs/npm.md](docs/npm.md) — typy `@hackeros/silver-types` i publikacja na npm
 - [native/README.md](native/README.md) — warstwa natywna (SDL2, QuickJS, dialogi)
 - [ROADMAP.md](ROADMAP.md) — czego jeszcze nie ma · [CHANGELOG.md](CHANGELOG.md)
 
-## Co jest zweryfikowane, a co nie
+## Co jest zweryfikowane, a co nie (0.5)
 
-Środowisko, w którym powstało 0.4, nie miało kompilatora H# (LLVM), więc:
+**Sprawdzone realnie** (kompilator H# i `bit 0.3.0` były dostępne):
 
-- **Sprawdzone realnie:**
-  - parsowanie i sprawdzanie typów całej biblioteki parserem i type-checkerem H# (w tym `app.h#`, `paint.h#`);
-  - **382 testy silnika** + **35 testów end-to-end rysowania** (DOM, CSS, style, układ, tabele, grid, kolumny, `@container`, zagnieżdżanie, transformacje, animacje, pseudo-elementy, szablony, edycja, IPC)
-    wykonanych interpreterem H# (`tools/run_engine_tests.sh`): wszystkie przechodzą — wymaga interpretera H# z poprawkami z `CHANGELOG.md` (sekcja 0.4);
-  - **warstwy transformacji, `backdrop blur` i dekoder WOFF** sprawdzone na pikselach / bajtach (`native/tests/run-layer.sh`, `run-woff.sh`; renderer programowy SDL);
-  - warstwa natywna: SDL2 pod Xvfb (`native/tests/run.sh`), rodziny czcionek na prawdziwym SDL_ttf (`fonts_test.c`), QuickJS z DOM, polyfillami, modułami ES,
-    **WebSocket względem prawdziwego serwera**, 20 kontroli API JS, frontendy TypeScript/Preact/Svelte oraz **React 18, Vue 3, Solid** zbudowane
-    prawdziwym npm + esbuild i uruchomione w QuickJS (`native/tests/run-all.sh`, `run-js.sh`, `run-ext.sh`).
-- **Niesprawdzone:** skompilowanie i uruchomienie całej aplikacji H# z oknem (`h# compile`), więc **rysowanie** (`paint.h#`: m.in. ramki `dashed/dotted`,
-  nowe: obrócone poddrzewa, `text-underline-offset`, `background-origin/clip`, `object-position`, `caret-color`, `scrollbar-*`, płynne przewijanie, kotwice `#id`; warstwa natywna pod nimi jest przetestowana,
-  ale połączenie H# → shim nie było uruchomione,
-  `text-shadow`, `letter-spacing`, tło z powtarzaniem, `sticky`) i **integracja animacji w `app.h#`** przeszły parser i type-checker, ale nigdy nie zostały
-  wyrenderowane; działanie na macOS/Windows (CI buduje shimy, nie uruchamia okien), skrypty pakujące poza `.deb`, `curl` jako klient `fetch` w pakietach.
-  Oczekuj pierwszych poprawek po pierwszym `bit build`.
+- pełny `bit build` biblioteki i aplikacji (szablon `counter`, zależność przez ścieżkę) → jedna statyczna binarka z wbudowanym frontendem;
+- start z pustego katalogu (bez `frontend/`) na **Waylandzie** (weston headless) i na **X11** (Xvfb), wybór backendu `SILVER_BACKEND`;
+- `silver embed` → `src/assets_gen.h#` → binarka serwuje HTML/CSS/JS/obrazy z pamięci (bez plików obok);
+- **599 testów silnika** (`sh tools/run_engine_tests.sh`; kolejnych 12 wymaga fixtur/HarfBuzz — `SILVER_TEST_FULL=1`);
+- test natywny (`sh native/tests/run.sh`), type-check `@hackeros/silver-types` (`tsc`), `.deb` z jedną binarką.
+
+**Niesprawdzone / ograniczenia** — patrz [ROADMAP.md](ROADMAP.md): statyczny SDL nie ma libdecor (na GNOME/Wayland użyj `frameless` +
+`app-region` albo budowy dynamicznej), `wss://` nie było testowane na prawdziwym serwerze, macOS/Windows nie były uruchamiane,
+ścieżka pobierania źródeł wayland/xkbcommon z gitlaba nie była sprawdzona (przetestowano tarballe Ubuntu).
