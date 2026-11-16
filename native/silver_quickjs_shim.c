@@ -1,10 +1,16 @@
 #include <quickjs.h>
 #include "silver_api_embed.h"
+#include "silver_vfs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#ifdef SILVER_TLS
+#  include <openssl/ssl.h>
+#  include <openssl/err.h>
+#  include <openssl/x509v3.h>
+#endif
 #ifndef _WIN32
 #  include <sys/types.h>
 #  include <sys/socket.h>
@@ -57,6 +63,9 @@ typedef struct {
     int     used, id, fd, state;      /* state: 0 łączenie, 1 handshake wysłany, 2 otwarte, 3 zamykanie */
     char    key[32];
     char    host[256];
+    int     tls;                      /* 0.5: wss:// (SILVER_TLS) */
+    void   *ssl;                      /* SSL* */
+    char    sni[256];
     char   *rbuf; size_t rlen, rcap;
     char   *msg;  size_t mlen; int msg_op;
     int64_t t0;
@@ -396,7 +405,7 @@ int js_set_memory_limit_mb(int h, int mb) {
 }
 
 static char *read_whole_file(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = vfs_fopen_rb(path);          /* 0.5: najpierw zasoby wbudowane w binarkę */
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
@@ -660,19 +669,74 @@ static void b64enc(const unsigned char *in, size_t n, char *out) {
 
 #ifndef _WIN32
 static void ws_free(SilverWs *w) {
+#ifdef SILVER_TLS
+    if (w->ssl) { SSL_shutdown((SSL *)w->ssl); SSL_free((SSL *)w->ssl); w->ssl = NULL; }
+#endif
     if (w->fd >= 0) close(w->fd);
     free(w->rbuf); free(w->msg);
     memset(w, 0, sizeof *w);
     w->fd = -1;
 }
 
-static int ws_send_all(int fd, const unsigned char *d, size_t n) {
+#ifdef SILVER_TLS
+static SSL_CTX *g_tls_ctx = NULL;
+static SSL_CTX *tls_ctx(void) {
+    if (g_tls_ctx) return g_tls_ctx;
+    SSL_library_init();
+    g_tls_ctx = SSL_CTX_new(TLS_client_method());
+    if (!g_tls_ctx) return NULL;
+    SSL_CTX_set_min_proto_version(g_tls_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_verify(g_tls_ctx, SSL_VERIFY_PEER, NULL);
+    const char *env_ca = getenv("SSL_CERT_FILE");
+    int ok = 0;
+    if (env_ca && env_ca[0]) ok = SSL_CTX_load_verify_locations(g_tls_ctx, env_ca, NULL);
+    if (!ok) ok = SSL_CTX_set_default_verify_paths(g_tls_ctx);
+    static const char *bundles[] = { "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem", "/usr/local/share/certs/ca-root-nss.crt", NULL };
+    for (int i = 0; bundles[i]; i++) SSL_CTX_load_verify_locations(g_tls_ctx, bundles[i], NULL);
+    return g_tls_ctx;
+}
+#endif
+
+/* nieblokujące I/O z opcjonalnym TLS: >0 bajty, 0 EOF, -1 EAGAIN, -2 błąd */
+static ssize_t ws_io_recv(SilverWs *w, void *buf, size_t n) {
+#ifdef SILVER_TLS
+    if (w->ssl) {
+        int r = SSL_read((SSL *)w->ssl, buf, (int)n);
+        if (r > 0) return r;
+        int e = SSL_get_error((SSL *)w->ssl, r);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) return -1;
+        if (e == SSL_ERROR_ZERO_RETURN) return 0;
+        return -2;
+    }
+#endif
+    ssize_t r = recv(w->fd, buf, n, 0);
+    if (r >= 0) return r;
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return -1;
+    return -2;
+}
+
+static int ws_send_all(SilverWs *w, const unsigned char *d, size_t n) {
     size_t off = 0;
     int spins = 0;
+    int fd = w->fd;
     while (off < n) {
-        ssize_t r = send(fd, d + off, n - off, 0);
+        ssize_t r; int again;
+#ifdef SILVER_TLS
+        if (w->ssl) {
+            int sr = SSL_write((SSL *)w->ssl, d + off, (int)(n - off));
+            r = sr;
+            int e = sr > 0 ? 0 : SSL_get_error((SSL *)w->ssl, sr);
+            again = (sr <= 0) && (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE);
+            if (sr <= 0 && !again) return 0;
+        } else
+#endif
+        {
+            r = send(fd, d + off, n - off, MSG_NOSIGNAL);
+            again = (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        }
         if (r > 0) { off += (size_t)r; spins = 0; continue; }
-        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && spins++ < 2000) {
+        if (again && spins++ < 2000) {
             fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
             struct timeval tv = { 0, 5000 };
             select(fd + 1, NULL, &wf, NULL, &tv);
@@ -696,7 +760,7 @@ static int ws_send_frame(SilverWs *w, int op, const unsigned char *data, size_t 
     for (int i = 0; i < 4; i++) mask[i] = (unsigned char)(rand() & 0xff);
     memcpy(f + p, mask, 4); p += 4;
     for (size_t i = 0; i < len; i++) f[p + i] = data[i] ^ mask[i & 3];
-    int ok = ws_send_all(w->fd, f, p + len);
+    int ok = ws_send_all(w, f, p + len);
     free(f);
     return ok;
 }
@@ -790,19 +854,8 @@ static void ws_parse_frames(SilverJsCtx *sc, SilverWs *w) {
     }
 }
 
-static void ws_poll(SilverJsCtx *sc) {
-    for (int i = 0; i < SILVER_MAX_WS; i++) {
-        SilverWs *w = &sc->ws[i];
-        if (!w->used) continue;
-        if (w->state < 0) { ws_fail(sc, w, "wss:// (TLS) nie jest obsługiwane w tej wersji"); continue; }
-        if (w->state == 0) {
-            fd_set wf; FD_ZERO(&wf); FD_SET(w->fd, &wf);
-            struct timeval tv = { 0, 0 };
-            if (select(w->fd + 1, NULL, &wf, NULL, &tv) > 0) {
-                int err = 0; socklen_t el = sizeof err;
-                getsockopt(w->fd, SOL_SOCKET, SO_ERROR, &err, &el);
-                if (err) { ws_fail(sc, w, "nie można połączyć"); continue; }
-                char req[1400];
+static void ws_send_handshake(SilverJsCtx *sc, SilverWs *w) {
+    char req[1400];
                 const char *slash = strchr(w->host, '/');
                 char hostonly[256]; size_t hl = slash ? (size_t)(slash - w->host) : strlen(w->host);
                 memcpy(hostonly, w->host, hl); hostonly[hl] = 0;
@@ -810,11 +863,63 @@ static void ws_poll(SilverJsCtx *sc) {
                     "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                     "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
                     slash ? slash : "/", hostonly, w->key);
-                if (!ws_send_all(w->fd, (const unsigned char *)req, strlen(req))) { ws_fail(sc, w, "błąd wysyłania handshake"); continue; }
+                if (!ws_send_all(w, (const unsigned char *)req, strlen(req))) { ws_fail(sc, w, "błąd wysyłania handshake"); return; }
                 w->state = 1; w->t0 = now_ms();
-            } else if (now_ms() - w->t0 > 10000) { ws_fail(sc, w, "przekroczono czas łączenia"); }
+            }
+
+static void ws_poll(SilverJsCtx *sc) {
+    for (int i = 0; i < SILVER_MAX_WS; i++) {
+        SilverWs *w = &sc->ws[i];
+        if (!w->used) continue;
+        if (w->state < 0) {
+#ifdef SILVER_TLS
+            ws_fail(sc, w, "nie można połączyć (adres lub schemat)");
+#else
+            ws_fail(sc, w, "wss:// (TLS) niedostępne: zbuduj z OpenSSL (libssl-dev, SILVER_TLS=1)");
+#endif
             continue;
         }
+        if (w->state == 0) {
+            fd_set wf; FD_ZERO(&wf); FD_SET(w->fd, &wf);
+            struct timeval tv = { 0, 0 };
+            if (select(w->fd + 1, NULL, &wf, NULL, &tv) > 0) {
+                int err = 0; socklen_t el = sizeof err;
+                getsockopt(w->fd, SOL_SOCKET, SO_ERROR, &err, &el);
+                if (err) { ws_fail(sc, w, "nie można połączyć"); continue; }
+#ifdef SILVER_TLS
+                if (w->tls) {
+                    SSL_CTX *tc = tls_ctx();
+                    SSL *ssl = tc ? SSL_new(tc) : NULL;
+                    if (!ssl) { ws_fail(sc, w, "TLS: brak kontekstu"); continue; }
+                    SSL_set_fd(ssl, w->fd);
+                    SSL_set_tlsext_host_name(ssl, w->sni);
+                    SSL_set1_host(ssl, w->sni);
+                    SSL_set_connect_state(ssl);
+                    w->ssl = ssl; w->state = 4; w->t0 = now_ms();
+                    continue;
+                }
+#endif
+                ws_send_handshake(sc, w);
+} else if (now_ms() - w->t0 > 10000) { ws_fail(sc, w, "przekroczono czas łączenia"); }
+            continue;
+        }
+#ifdef SILVER_TLS
+        if (w->state == 4) {            /* uścisk dłoni TLS (nieblokujący) */
+            int hr = SSL_do_handshake((SSL *)w->ssl);
+            if (hr == 1) { ws_send_handshake(sc, w); }
+            else {
+                int e = SSL_get_error((SSL *)w->ssl, hr);
+                if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+                    long vr = SSL_get_verify_result((SSL *)w->ssl);
+                    char m[200];
+                    if (vr != X509_V_OK) snprintf(m, sizeof m, "TLS: certyfikat odrzucony (%s)", X509_verify_cert_error_string(vr));
+                    else snprintf(m, sizeof m, "TLS: błąd uścisku dłoni");
+                    ws_fail(sc, w, m);
+                } else if (now_ms() - w->t0 > 10000) ws_fail(sc, w, "TLS: przekroczono czas");
+            }
+            continue;
+        }
+#endif
         /* odczyt dostępnych danych */
         int eof = 0;
         for (int round = 0; round < 8 && w->used; round++) {
@@ -824,10 +929,10 @@ static void ws_poll(SilverJsCtx *sc) {
                 if (!nb) { ws_fail(sc, w, "brak pamięci"); break; }
                 w->rbuf = nb; w->rcap = nc;
             }
-            ssize_t r = recv(w->fd, w->rbuf + w->rlen, w->rcap - w->rlen - 1, 0);
+            ssize_t r = ws_io_recv(w, w->rbuf + w->rlen, w->rcap - w->rlen - 1);
             if (r > 0) { w->rlen += (size_t)r; continue; }
             if (r == 0) { eof = 1; break; }   /* najpierw sparsuj ramki (np. close), potem obsłuż EOF */
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
+            if (r == -1) break;
             ws_fail(sc, w, "błąd odczytu"); break;
         }
         if (!w->used) continue;
@@ -860,16 +965,22 @@ static JSValue native_ws_open(JSContext *ctx, JSValueConst this_val, int argc, J
     if (!w) { JS_FreeCString(ctx, url); return JS_FALSE; }
     memset(w, 0, sizeof *w);
     w->used = 1; w->id = id; w->fd = -1; w->t0 = now_ms();
-    if (strncmp(url, "ws://", 5) != 0) { w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
-    const char *hp = url + 5;
+    int is_wss = strncmp(url, "wss://", 6) == 0;
+    if (strncmp(url, "ws://", 5) != 0 && !is_wss) { w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
+#ifndef SILVER_TLS
+    if (is_wss) { w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
+#endif
+    w->tls = is_wss;
+    const char *hp = url + (is_wss ? 6 : 5);
     snprintf(w->host, sizeof w->host, "%s", hp);
     char hostbuf[256]; const char *slash = strchr(hp, '/');
     size_t hl = slash ? (size_t)(slash - hp) : strlen(hp);
     if (hl >= sizeof hostbuf) hl = sizeof hostbuf - 1;
     memcpy(hostbuf, hp, hl); hostbuf[hl] = 0;
-    char port[8] = "80";
+    char port[8]; snprintf(port, sizeof port, "%s", is_wss ? "443" : "80");
     char *colon = strrchr(hostbuf, ':');
-    if (colon) { *colon = 0; snprintf(port, sizeof port, "%s", colon + 1); }
+    if (colon && !strchr(colon, ']')) { *colon = 0; snprintf(port, sizeof port, "%s", colon + 1); }
+    snprintf(w->sni, sizeof w->sni, "%s", hostbuf);
     unsigned char rnd[16];
     for (int i = 0; i < 16; i++) rnd[i] = (unsigned char)(rand() & 0xff);
     b64enc(rnd, 16, w->key);
