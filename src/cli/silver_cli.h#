@@ -4,7 +4,17 @@ use "std -> env"     from "env"
 use "std -> process" from "process"
 
 fn version() -> string is
-    return "0.4.0"
+    return "0.5.0"
+end
+
+;; Nazwa pakietu npm z typami TypeScript dla window.silver (docs/npm.md). Jedno miejsce do zmiany.
+fn types_pkg() -> string is
+    return "@hackeros/silver-types"
+end
+
+;; Wersja biblioteki wpisywana do nowych projektów (Bit.hk: silver => ^…)
+fn lib_req() -> string is
+    return "^0.5"
 end
 
 ;; ---------- pomocnicze ----------
@@ -23,7 +33,8 @@ end
 
 fn replace_all_name(text: string, name: string) -> string is
     let title: string = name
-    return string_replace(string_replace(text, "__NAME__", name), "__TITLE__", title)
+    let t1: string = string_replace(string_replace(text, "__NAME__", name), "__TITLE__", title)
+    return string_replace(string_replace(t1, "__TYPES_PKG__", types_pkg()), "__SILVER_REQ__", lib_req())
 end
 
 fn parent_dir(path: string) -> string is
@@ -72,7 +83,7 @@ fn project_name() -> string is
 end
 
 fn project_version() -> string is
-    if !fs::exists("Bit.hk") is return "0.4.0" end
+    if !fs::exists("Bit.hk") is return "0.5.0" end
     let lines: [string] = string_split(fs::read("Bit.hk"), "\n")
     let mut i: int = 0
     while i < array_len(lines) is
@@ -83,7 +94,7 @@ fn project_version() -> string is
             if eq > 0 is return string_trim(string_slice(l, eq + 2, string_len(l))) end
         end
     end
-    return "0.4.0"
+    return "0.5.0"
 end
 
 fn has_frontend_build() -> bool is
@@ -102,6 +113,129 @@ fn build_frontend() -> bool is
         if !sh("cd frontend && npm install --no-audit --no-fund") is return false end
     end
     return sh("cd frontend && npm run build")
+end
+
+;; ---------- 0.5: silver embed — frontend wbudowany w binarkę ----------
+;; Zamienia katalog frontend/ w src/assets_gen.h# (pliki jako base64). Przy starcie aplikacja woła
+;; assets_gen::install() i wszystkie odczyty (HTML, CSS, JS, moduły, obrazy, czcionki) idą z pamięci:
+;; gotowa aplikacja to jeden statyczny plik — bez katalogu frontend/ obok. Wołane automatycznie przez
+;; `silver build|run|bundle` i hook pre-build z Bit.hk, więc w praktyce nie trzeba robić nic.
+fn q(path: string) -> string is
+    return "'" + string_replace(path, "'", "'\\''") + "'"
+end
+
+fn find_assets_cmd(dir: string) -> string is
+    let spa: bool = fs::exists(dir + "/package.json")
+    let mut c: string = "cd " + q(dir) + " && find . -type f ! -path '*/node_modules/*' ! -path '*/.git/*' ! -name '*.map' ! -name '.DS_Store' ! -name '.silverignore'"
+    if spa is
+        ;; projekt z bundlerem: osadzamy wynik (dist/…), nie źródła ani konfigurację
+        c = c + " ! -path './src/*' ! -name package.json ! -name package-lock.json ! -name 'tsconfig*.json' ! -name build.mjs ! -name 'vite.config.*' ! -name 'svelte.config.*' ! -name 'pnpm-lock.yaml' ! -name yarn.lock"
+    end
+    if fs::exists(dir + "/.silverignore") is
+        let lines: [string] = string_split(fs::read(dir + "/.silverignore"), "\n")
+        let mut i: int = 0
+        while i < array_len(lines) is
+            let l: string = string_trim(lines[i])
+            i += 1
+            if l == "" || string_starts_with(l, "#") is continue end
+            c = c + " ! -path " + q("./" + l) + " ! -path " + q("./" + l + "/*")
+        end
+    end
+    return c + " | LC_ALL=C sort"
+end
+
+pub fn cmd_embed(args: [string]) -> int is
+    let mut dir: string = "frontend"
+    let mut out: string = "src/assets_gen.h#"
+    let mut quiet: bool = false
+    let mut i: int = 0
+    while i < array_len(args) is
+        let a: string = args[i]
+        i += 1
+        if a == "--dir" && i < array_len(args) is
+            dir = args[i]
+            i += 1
+        elsif a == "--out" && i < array_len(args) is
+            out = args[i]
+            i += 1
+        elsif a == "--quiet" || a == "-q" is
+            quiet = true
+        else is
+            write("użycie: silver embed [--dir frontend] [--out src/assets_gen.h#] [--quiet]")
+            return 1
+        end
+    end
+    ;; projekt bez assets_gen.h# nie włączył wbudowywania — pomiń po cichu (np. hook pre-build)
+    if quiet && !fs::exists(out) is return 0 end
+    if !fs::exists(dir) is
+        if quiet is return 0 end
+        write("błąd: brak katalogu '" + dir + "'")
+        return 1
+    end
+    let listing: string = process::shell(find_assets_cmd(dir))
+    let files: [string] = string_split(listing, "\n")
+    let mut body: string = ""
+    let mut count: int = 0
+    let mut b64_total: int = 0
+    let mut k: int = 0
+    while k < array_len(files) is
+        let f0: string = string_trim(files[k])
+        k += 1
+        if f0 == "" is continue end
+        let rel: string = if string_starts_with(f0, "./") then string_slice(f0, 2, string_len(f0)) else f0
+        let full: string = dir + "/" + rel
+        let b64: string = string_trim(process::shell("base64 < " + q(full) + " | tr -d '\\n'"))
+        if b64 == "" && string_len(fs::read(full)) > 0 is
+            write("błąd: base64 nie zadziałało dla " + full + " (brak polecenia base64?)")
+            return 1
+        end
+        body = body + "    app::register_asset(\"" + dir + "/" + rel + "\", \"" + b64 + "\")\n"
+        count += 1
+        b64_total += string_len(b64)
+    end
+    let header: string = ";; GENEROWANY przez `silver embed` (silver " + version() + ") — nie edytuj ręcznie.\n;; Źródło: " + dir + "/ (" + to_string(count) + " plików). Wołaj assets_gen::install() na początku main().\nuse \"bit -> silver\" from \"silver\"\n\n"
+    let text: string = header + "pub fn install() -> int is\n" + body + "    return app::embedded_count()\nend\n"
+    mkdirs(parent_dir(out))
+    if fs::exists(out) && fs::read(out) == text is
+        if !quiet is write("[silver] embed: bez zmian (" + to_string(count) + " plików, " + to_string(b64_total / 1024) + " KiB base64)") end
+        return 0
+    end
+    fs::write(out, text)
+    write("[silver] embed: " + to_string(count) + " plików z " + dir + "/ → " + out + " (" + to_string(b64_total / 1024) + " KiB base64)")
+    if b64_total > 64 * 1024 * 1024 is write("uwaga: ponad 64 MiB zasobów — rozważ wczytywanie dużych plików z dysku (.silverignore)") end
+    return 0
+end
+
+;; Wywołanie przed kompilacją, gdy projekt włączył wbudowywanie (istnieje src/assets_gen.h#).
+fn embed_if_enabled() -> bool is
+    if !fs::exists("src/assets_gen.h#") is return true end
+    return cmd_embed(["--quiet"]) == 0
+end
+
+;; ---------- 0.5: backend wideo ----------
+;; Zwraca prefiks zmiennej środowiskowej dla `silver run|dev` ("" = domyślny Wayland z zapasem X11).
+fn backend_env(args: [string]) -> string is
+    let mut i: int = 0
+    while i < array_len(args) is
+        let a: string = args[i]
+        i += 1
+        if a == "--x11" is return "SILVER_BACKEND=x11 " end
+        if a == "--wayland" is return "SILVER_BACKEND=wayland-only " end
+        if a == "--backend" && i < array_len(args) is return "SILVER_BACKEND=" + args[i] + " " end
+    end
+    return ""
+end
+
+;; Sprawdza, czy binarka jest w pełni statyczna (ldd) — ostrzega, gdy nie.
+fn verify_static(bin: string) -> bool is
+    if !has_tool("ldd") is return true end
+    let o: string = process::shell("ldd " + q(bin) + " 2>&1")
+    if string_find(o, "not a dynamic") >= 0 || string_find(o, "statically linked") >= 0 is
+        write("[silver] binarka statyczna: " + bin)
+        return true
+    end
+    write("[silver] UWAGA: " + bin + " jest dynamiczna — zależy od bibliotek systemu (patrz `silver doctor`, native/build-static-deps.sh)")
+    return false
 end
 
 ;; ---------- silver new ----------
@@ -187,7 +321,7 @@ pub fn cmd_new(args: [string]) -> int is
 end
 
 fn cmd_list() -> int is
-    write("Szablony Silver 0.3:")
+    write("Szablony Silver 0.5:")
     let names: [string] = templates_data::names()
     let mut i: int = 0
     while i < array_len(names) is
@@ -196,6 +330,34 @@ fn cmd_list() -> int is
     end
     write("")
     write("silver new <nazwa> --template <szablon>   (skróty: --ts, --svelte)")
+    return 0
+end
+
+;; ---------- 0.5: typy TypeScript jako pakiet npm ----------
+;; silver types            → npm i -D @hackeros/silver-types w frontend/ (i dopisanie do tsconfig "types")
+;; silver types --vendor   → kopia silver.d.ts do frontend/src/ (tryb offline, jak w 0.4)
+pub fn cmd_types(args: [string]) -> int is
+    if !fs::exists("frontend") is
+        write("błąd: brak katalogu frontend/")
+        return 1
+    end
+    if contains(args, "--vendor") is
+        let nm: string = "frontend/node_modules/" + types_pkg() + "/index.d.ts"
+        if !fs::exists(nm) is
+            write("najpierw: silver types (instaluje pakiet), potem --vendor kopiuje z node_modules")
+            return 1
+        end
+        mkdirs("frontend/src")
+        fs::write("frontend/src/silver.d.ts", fs::read(nm))
+        write("[silver] skopiowano typy do frontend/src/silver.d.ts")
+        return 0
+    end
+    if !has_tool("npm") is
+        write("błąd: brak npm (zainstaluj Node.js)")
+        return 1
+    end
+    if !sh("cd frontend && npm install --save-dev " + types_pkg() + " --no-audit --no-fund") is return 1 end
+    write("[silver] zainstalowano " + types_pkg() + " — dodaj w tsconfig.json: \"types\": [\"" + types_pkg() + "\"]")
     return 0
 end
 
@@ -211,20 +373,24 @@ end
 fn cmd_build() -> int is
     if !require_project() is return 1 end
     if !build_frontend() is return 1 end
+    if !embed_if_enabled() is return 1 end
     if !sh("bit build") is return 1 end
+    let n: string = project_name()
+    if n != "" && binary_path(n) != "" is verify_static(binary_path(n)) end
     write("[silver] gotowe")
     return 0
 end
 
-fn cmd_run() -> int is
+fn cmd_run(args: [string]) -> int is
     if !require_project() is return 1 end
     if !build_frontend() is return 1 end
-    if sh("bit run") is return 0 end
+    if !embed_if_enabled() is return 1 end
+    if sh(backend_env(args) + "bit run") is return 0 end
     return 1
 end
 
 ;; Tryb dev: watcher frontendu w tle + aplikacja z hot reload (app::enable_hot_reload).
-fn cmd_dev() -> int is
+fn cmd_dev(args: [string]) -> int is
     if !require_project() is return 1 end
     let mut pid: int = -1
     if has_frontend_build() is
@@ -232,7 +398,7 @@ fn cmd_dev() -> int is
         write("[silver] dev: uruchamiam `npm run watch` w tle")
         pid = process::spawn("cd frontend && npm run watch")
     end
-    let ok: bool = sh("bit run")
+    let ok: bool = sh(backend_env(args) + "bit run")
     if pid >= 0 is process::kill(pid) end
     if ok is return 0 end
     return 1
@@ -262,6 +428,7 @@ fn cmd_bundle(args: [string]) -> int is
         return 1
     end
     if !build_frontend() is return 1 end
+    if !embed_if_enabled() is return 1 end
     write("[silver] bit build (release)")
     if !sh("bit build") is return 1 end
     let bin: string = binary_path(name)
@@ -269,6 +436,7 @@ fn cmd_bundle(args: [string]) -> int is
         write("błąd: nie znaleziono binarki (oczekiwano cache/build/release/" + name + ")")
         return 1
     end
+    verify_static(bin)
     let ver: string = project_version()
     if target == "appimage" is
         return if sh("sh packaging/linux/make-appimage.sh " + name + " " + bin + " " + ver) then 0 else 1
@@ -307,7 +475,8 @@ fn cmd_doctor() -> int is
     if !check("h#", "h#", "kompilator H# (HackerOS)") is bad += 1 end
     if !check("cc", "cc", "kompilator C potrzebny do native/build.sh (gcc/clang)") is bad += 1 end
     if !check("sdl2-config", "sdl2-config", "SDL2 dev (apt: libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev)") is bad += 1 end
-    if !check("git", "git", "pobiera QuickJS i zależności bit") is bad += 1 end
+    if !check("git", "git", "pobiera zależności bit i źródła SDL2") is bad += 1 end
+    if !check("base64", "base64", "silver embed (coreutils)") is bad += 1 end
     let node: bool = has_tool("node")
     if has_frontend_build() is
         if !check("node", "node", "wymagany przez frontend/package.json") is bad += 1 end
@@ -315,6 +484,22 @@ fn cmd_doctor() -> int is
     else is
         write("  (info)  node/npm potrzebne tylko dla szablonów TypeScript/Svelte" + (if node then " — jest" else ""))
     end
+    ;; 0.5: backend wideo
+    let wl: string = env::get_or("WAYLAND_DISPLAY", "")
+    let xd: string = env::get_or("DISPLAY", "")
+    let want: string = env::get_or("SILVER_BACKEND", "wayland")
+    if wl != "" is
+        write("  ok      sesja Wayland (" + wl + ") — aplikacje Silver użyją Waylanda (SILVER_BACKEND=" + want + ")")
+    elsif xd != "" is
+        write("  info    sesja X11 (" + xd + ") — brak Waylanda, aplikacje użyją X11")
+    else is
+        write("  uwaga   brak WAYLAND_DISPLAY i DISPLAY — nie wykryto sesji graficznej")
+    end
+    if fs::exists("native/build/wayland.flag") is
+        let f: string = string_trim(fs::read("native/build/wayland.flag"))
+        write("  " + (if f == "1" then "ok     " else "uwaga  ") + " statyczny SDL2: " + (if f == "1" then "Wayland + X11 wlinkowane" else "tylko X11 (przebuduj: FORCE=1 sh native/build-static-deps.sh; potrzebne meson, ninja)"))
+    end
+    if !has_tool("meson") is write("  info    brak meson/ninja — statyczny Wayland nie zbuduje się ze źródeł (apt install meson ninja-build)") end
     let has_dialog: bool = has_tool("zenity") || has_tool("kdialog") || has_tool("osascript")
     if has_dialog is
         write("  ok      dialogi natywne (zenity/kdialog/osascript)")
@@ -339,9 +524,11 @@ pub fn main() is
         write("użycie:")
         write("  silver new <nazwa> [--template <szablon>] [--ts] [--svelte]")
         write("  silver list                szablony")
-        write("  silver dev                 frontend --watch + aplikacja z hot reload")
-        write("  silver build               frontend (npm) + bit build")
-        write("  silver run                 frontend (npm) + bit run")
+        write("  silver dev  [--x11]        frontend --watch + aplikacja z hot reload")
+        write("  silver build               frontend (npm) + embed + bit build")
+        write("  silver run  [--x11]        frontend (npm) + embed + bit run  (domyślnie Wayland, --x11 = X11)")
+        write("  silver embed               wbudowanie frontend/ w binarkę (src/assets_gen.h#)")
+        write("  silver types               pakiet npm z typami window.silver (TypeScript)")
         write("  silver bundle <cel>        appimage | deb | macos | dmg | windows")
         write("  silver doctor              diagnostyka środowiska")
         write("  silver version")
@@ -358,12 +545,16 @@ pub fn main() is
         cmd_new(rest)
     elsif sub == "list" is
         cmd_list()
+    elsif sub == "embed" is
+        cmd_embed(rest)
+    elsif sub == "types" is
+        cmd_types(rest)
     elsif sub == "dev" is
-        cmd_dev()
+        cmd_dev(rest)
     elsif sub == "build" is
         cmd_build()
     elsif sub == "run" is
-        cmd_run()
+        cmd_run(rest)
     elsif sub == "bundle" is
         cmd_bundle(rest)
     elsif sub == "doctor" is
