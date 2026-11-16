@@ -1444,3 +1444,44 @@ fn t17_footnote_policy_block_keeps_the_call_block_whole_on_one_page() is
     assert_true(blk.pages[0].y1 <= 340)
     assert_eq(blk.notes[0], 1)
 end
+
+;; ---------- 0.5: <details>/<summary>/<dialog>/[hidden] (arkusz UA) ----------
+fn has_text_box(boxes: [layout::LayoutBox], needle: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(boxes) is
+        if string_find(boxes[i].text, needle) >= 0 is return true end
+        i += 1
+    end
+    return false
+end
+
+#[test]
+fn test_ua_details_closed_hides_body_but_shows_summary() is
+    let boxes: [layout::LayoutBox] = lay("<details><summary>Tytul</summary><p>Tresc ukryta</p></details>", css::ua_sheet_text(), 400)
+    assert_true(has_text_box(boxes, "Tytul"))
+    assert_true(!has_text_box(boxes, "Tresc"))
+end
+
+#[test]
+fn test_ua_details_open_shows_body() is
+    let boxes: [layout::LayoutBox] = lay("<details open><summary>Tytul</summary><p>Tresc widoczna</p></details>", css::ua_sheet_text(), 400)
+    assert_true(has_text_box(boxes, "Tytul"))
+    assert_true(has_text_box(boxes, "Tresc"))
+end
+
+#[test]
+fn test_ua_hidden_attribute_and_closed_dialog_are_not_rendered() is
+    let boxes: [layout::LayoutBox] = lay("<p hidden>ukryty</p><dialog>okno</dialog><p>widoczny</p>", css::ua_sheet_text(), 400)
+    assert_true(!has_text_box(boxes, "ukryty"))
+    assert_true(!has_text_box(boxes, "okno"))
+    assert_true(has_text_box(boxes, "widoczny"))
+    let open: [layout::LayoutBox] = lay("<dialog open>okno</dialog>", css::ua_sheet_text(), 400)
+    assert_true(has_text_box(open, "okno"))
+end
+
+#[test]
+fn test_ua_sheet_does_not_override_page_css() is
+    ;; arkusz strony jest później w kaskadzie — strona może pokazać zawartość <details> bez open
+    let boxes: [layout::LayoutBox] = lay("<details><summary>S</summary><p>Tresc</p></details>", css::ua_sheet_text() + " details > p { display: block !important; }", 400)
+    assert_true(has_text_box(boxes, "Tresc"))
+end
