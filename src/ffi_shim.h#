@@ -111,4 +111,21 @@ extern static [c, "silvershim"] is
     fn silver_present(h: int) -> bool
     fn silver_delay(ms: int) -> bool
     fn silver_ticks() -> int
+
+    ;; 0.5: backend wideo (wayland domyślnie, x11 opcjonalnie), app_id, okna bez ramki, pojedyncza instancja
+    fn silver_set_backend(name: string) -> int
+    fn silver_set_app_id(id: string) -> int
+    fn silver_video_driver() -> string
+    fn silver_native_version() -> string
+    fn silver_set_drag_regions(h: int, spec: string, resize_border: int) -> bool
+    fn silver_single_instance(id: string, args: string) -> int
+    fn silver_single_poll() -> string
+    fn silver_single_release() -> int
+
+    ;; 0.5: wbudowane zasoby frontendu (VFS) — `silver embed` → assets_gen.h#
+    fn silver_vfs_add(path: string, b64: string) -> int
+    fn silver_vfs_has(path: string) -> bool
+    fn silver_vfs_count() -> int
+    fn silver_vfs_text(path: string) -> string
+    fn silver_vfs_set_embedded_first(on: int) -> int
 end
