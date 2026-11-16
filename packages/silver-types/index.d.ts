@@ -1,5 +1,5 @@
 // Typy TypeScript dla window.silver — biblioteka Silver (silnik HTML/CSS/JS bez WebView).
-// Wersja pakietu odpowiada wersji biblioteki Silver. Źródło: https://github.com/HackerOS-Linux-System/silver
+// Wersja pakietu odpowiada wersji biblioteki Silver. Źródło: https://github.com/bit-io/silver
 
 interface SilverDialogFilter {
   title?: string;
