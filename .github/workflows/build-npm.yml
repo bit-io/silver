@@ -1,1 +1,107 @@
+name: build-npm
 
+# Buduje, testuje i publikuje paczkę typów @hackeros/silver-types (packages/silver-types) na npm.
+# Sekret repozytorium: SILVER_NPM  (token npm typu "Automation" albo "Granular" z prawem zapisu do @hackeros).
+#
+#  - pull request / push do main: tylko build + testy + `npm pack` (bez publikacji),
+#  - tag `v*` (np. v0.5.1) albo ręczne uruchomienie z zaznaczonym "publish": publikacja na npm.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "packages/silver-types/**"
+      - ".github/workflows/build-npm.yml"
+  pull_request:
+    paths:
+      - "packages/silver-types/**"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Opublikować na npm?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write   # provenance
+
+concurrency:
+  group: build-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/silver-types
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Zainstaluj zależności
+        run: npm install --no-audit --no-fund
+
+      - name: Type-check (test/usage.ts)
+        run: npm test
+
+      - name: Sprawdź, że wersja paczki = VERSION
+        run: |
+          PKG="$(node -p "require('./package.json').version")"
+          WANT="$(tr -d '[:space:]' < ../../VERSION)"
+          echo "package.json=$PKG VERSION=$WANT"
+          [ "$PKG" = "$WANT" ] || { echo "::error::wersja paczki ($PKG) różni się od VERSION ($WANT)"; exit 1; }
+
+      - name: Sprawdź zawartość paczki
+        run: npm pack --dry-run
+
+      - name: Zbuduj tarball
+        run: npm pack
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silver-types-tarball
+          path: packages/silver-types/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    environment: npm
+    defaults:
+      run:
+        working-directory: packages/silver-types
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Czy ta wersja jest już na npm?
+        id: exists
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.SILVER_NPM }}
+        run: |
+          NAME="$(node -p "require('./package.json').name")"
+          VER="$(node -p "require('./package.json').version")"
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER już istnieje — pomijam publikację"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publikuj na npm
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.SILVER_NPM }}
+        run: npm publish --access public --provenance
