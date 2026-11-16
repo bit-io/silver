@@ -60,7 +60,24 @@ $AR rcs "$OUT/libsilverdialogs.a" "$OUT/silver_dialogs_shim.o"
 # --- JS: QuickJS wbudowany w repo -------------------------------------------------------------
 echo "[silver] libsilverjs.a (QuickJS wbudowany)"
 QJS="${QUICKJS_DIR:-third_party/quickjs-ng}"
-[ -f "$QJS/quickjs.h" ] || { echo "[silver] BŁĄD: brak $QJS/quickjs.h (QUICKJS_DIR?)" >&2; exit 1; }
+if [ ! -f "$QJS/quickjs.h" ]; then
+    # Nie trzeba kopiować QuickJS ręcznie: gdy w repo brakuje third_party/quickjs-ng, pobieramy przypięty tag.
+    QJS_REF="${QUICKJS_REF:-v0.10.1}"
+    QJS="$OUT/quickjs-ng-src"
+    if [ ! -f "$QJS/quickjs.h" ]; then
+        echo "[silver] brak third_party/quickjs-ng — pobieram quickjs-ng $QJS_REF…"
+        rm -rf "$QJS"; mkdir -p "$OUT"
+        if command -v git >/dev/null 2>&1 && git clone -q --depth 1 --branch "$QJS_REF" https://github.com/quickjs-ng/quickjs.git "$QJS" 2>/dev/null; then :
+        else
+            rm -rf "$QJS"; mkdir -p "$QJS"
+            TARURL="https://github.com/quickjs-ng/quickjs/archive/refs/tags/$QJS_REF.tar.gz"
+            if command -v curl >/dev/null 2>&1; then curl -fsSL "$TARURL" | tar xz --strip-components=1 -C "$QJS"
+            elif command -v wget >/dev/null 2>&1; then wget -qO- "$TARURL" | tar xz --strip-components=1 -C "$QJS"
+            fi
+        fi
+    fi
+    [ -f "$QJS/quickjs.h" ] || { echo "[silver] BŁĄD: nie udało się pobrać quickjs-ng (git/curl/wget + dostęp do github.com) — ustaw QUICKJS_DIR" >&2; exit 1; }
+fi
 [ -f ../src/js/silver_api.js ] && command -v python3 >/dev/null 2>&1 && python3 gen_api_embed.py >/dev/null
 
 # TLS (wss://): statyczny OpenSSL, jeśli jest dostępny
