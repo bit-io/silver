@@ -107,8 +107,9 @@
     return invoke('__window', a);
   }
   var silver = {
-    version: '0.4.0',
+    version: '0.5.0',
     invoke: invoke,
+    info: function () { return invoke('__info', {}); },
     listen: listen,
     once: once,
     window: {
@@ -125,6 +126,7 @@
       setOpacity: function (pct) { return win('opacity', { pct: pct | 0 }); },
       setAlwaysOnTop: function (on) { return win('always_on_top', { on: !!on }); },
       setDecorations: function (on) { return win('decorations', { on: !!on }); },
+      setFrameless: function (border) { return win('frameless', { border: border | 0 }); },
       notify: function (title, body) { return win('notify', { title: String(title), body: String(body || '') }); }
     },
     dialog: {
@@ -848,7 +850,7 @@
   g.innerHeight = 0;
   g.devicePixelRatio = 1;
   g.location = { href: 'silver://app', origin: 'silver://app', pathname: '/', search: '', hash: '', protocol: 'silver:' };
-  g.navigator = { userAgent: 'Silver/0.4.0', platform: 'silver', language: 'pl-PL', onLine: true };
+  g.navigator = { userAgent: 'Silver/0.5.0', platform: 'silver', language: 'pl-PL', onLine: true };
   g.matchMedia = function (q) {
     var dark = /prefers-color-scheme\s*:\s*dark/.test(q) ? winInfo.dark : /prefers-color-scheme\s*:\s*light/.test(q) ? !winInfo.dark : false;
     return { matches: !!dark, media: q, addEventListener: function () { }, removeEventListener: function () { }, addListener: function () { }, removeListener: function () { } };
@@ -1691,7 +1693,7 @@
     });
   };
   silver.registerSourceMap = function (name, json) { g.__silver_register_map(name, typeof json === 'string' ? json : JSON.stringify(json), '0'); };
-  silver.version = '0.4.0';
-  g.navigator.userAgent = 'Silver/0.4.0';
+  silver.version = '0.5.0';
+  g.navigator.userAgent = 'Silver/0.5.0';
 
 })(globalThis);
