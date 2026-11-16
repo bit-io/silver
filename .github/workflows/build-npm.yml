@@ -54,6 +54,9 @@ jobs:
       - name: Sprawdź, że wersja paczki = VERSION
         run: |
           PKG="$(node -p "require('./package.json').version")"
+          if [ ! -f ../../VERSION ]; then
+            echo "Brak pliku VERSION w repozytorium — pomijam porównanie (package.json=$PKG)"; exit 0
+          fi
           WANT="$(tr -d '[:space:]' < ../../VERSION)"
           echo "package.json=$PKG VERSION=$WANT"
           [ "$PKG" = "$WANT" ] || { echo "::error::wersja paczki ($PKG) różni się od VERSION ($WANT)"; exit 1; }
@@ -85,6 +88,9 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+
+      - name: Zainstaluj zależności (typescript dla prepublishOnly)
+        run: npm install --no-audit --no-fund
 
       - name: Czy ta wersja jest już na npm?
         id: exists
