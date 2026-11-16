@@ -184,6 +184,8 @@ pub fn set_min_size(win: Window, w: int, h: int) -> bool is return ffi_shim::sil
 pub fn set_max_size(win: Window, w: int, h: int) -> bool is return ffi_shim::silver_set_max_size(win.handle, w, h) end
 pub fn set_size(win: Window, w: int, h: int) -> bool is return ffi_shim::silver_set_size(win.handle, w, h) end
 pub fn set_position(win: Window, x: int, y: int) -> bool is return ffi_shim::silver_set_position(win.handle, x, y) end
+pub fn pos_x(win: Window) -> int is return ffi_shim::silver_get_x(win.handle) end
+pub fn pos_y(win: Window) -> int is return ffi_shim::silver_get_y(win.handle) end
 pub fn set_fullscreen(win: Window, on: bool) -> bool is return ffi_shim::silver_set_fullscreen(win.handle, if on then 1 else 0) end
 pub fn is_fullscreen(win: Window) -> bool is return ffi_shim::silver_is_fullscreen(win.handle) end
 pub fn set_resizable(win: Window, on: bool) -> bool is return ffi_shim::silver_set_resizable(win.handle, if on then 1 else 0) end
