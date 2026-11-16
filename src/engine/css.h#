@@ -2113,3 +2113,20 @@ pub fn has_pseudo_elements(sheet: Stylesheet) -> bool is
     end
     return false
 end
+
+;; ---------- 0.5: arkusz agenta użytkownika dla elementów interaktywnych ----------
+;; Dołączany PRZED arkuszami strony (strona może go nadpisać). `<details>`: bez atrybutu `open` widoczny jest tylko
+;; `<summary>`; kliknięcie w summary przełącza `open` (app.h#: do_click). `<dialog>`: ukryty bez `open`, otwarty
+;; jest wyśrodkowaną warstwą (position: fixed).
+pub fn ua_sheet_text() -> string is
+    return "[hidden] {{ display: none; }} " +
+           "details {{ display: block; }} " +
+           "details:not([open]) > :not(summary) {{ display: none; }} " +
+           "summary {{ display: block; cursor: pointer; font-weight: bold; padding: 4px 0; }} " +
+           "summary::before {{ content: \"\u25B8  \"; }} " +
+           "details[open] > summary::before {{ content: \"\u25BE  \"; }} " +
+           "dialog {{ display: none; }} " +
+           "dialog[open] {{ display: block; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); " +
+           "background: canvas; color: canvastext; border: 1px solid #888888; border-radius: 8px; padding: 16px; " +
+           "box-shadow: 0 8px 32px rgba(0,0,0,0.35); max-width: 90%; z-index: 2147483000; }}"
+end
