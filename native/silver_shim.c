@@ -9,7 +9,14 @@
 #include <string.h>
 #include <math.h>
 #include <stdarg.h>
+#include <ctype.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include "silver_fx.h"
+#include "silver_vfs.h"
 #define NANOSVG_IMPLEMENTATION
 #define NANOSVGRAST_IMPLEMENTATION
 #include "third_party/nanosvg/nanosvg.h"
@@ -76,17 +83,113 @@ static char        *g_clip_buf = NULL;
 
 #define VALID(h) ((h) >= 0 && (h) < SILVER_MAX_WINDOWS && g_windows[(h)].used)
 
+/* ====================================================================
+ *  0.5 — wybór backendu wideo (Wayland domyślnie, X11 opcjonalnie)
+ *
+ *  SILVER_BACKEND / silver_set_backend():
+ *    "wayland"       (domyślnie) Wayland, a gdy niedostępny — X11 (XWayland)
+ *    "wayland-only"  tylko Wayland (błąd, gdy brak kompozytora)
+ *    "x11"           tylko X11 (także XWayland)
+ *    "auto"          wybór SDL (nie ingerujemy)
+ *  SDL_VIDEODRIVER ustawione przez użytkownika ma zawsze pierwszeństwo.
+ * ==================================================================== */
+static char g_backend_pref[24] = "";
+static char g_app_id[96] = "";
+
+int silver_set_backend(const char *b) {
+    if (b) snprintf(g_backend_pref, sizeof g_backend_pref, "%s", b);
+    return 1;
+}
+
+/* app_id (Wayland) / WM_CLASS (X11): dopasowanie do pliku .desktop, ikona i grupowanie okien */
+int silver_set_app_id(const char *id) {
+    if (!id || !id[0]) return 0;
+    snprintf(g_app_id, sizeof g_app_id, "%s", id);
+    setenv("SDL_VIDEO_WAYLAND_WMCLASS", g_app_id, 1);
+    setenv("SDL_VIDEO_X11_WMCLASS", g_app_id, 1);
+    SDL_SetHint(SDL_HINT_APP_NAME, g_app_id);
+    return 1;
+}
+
+static void apply_backend_pref(void) {
+    if (getenv("SDL_VIDEODRIVER") && getenv("SDL_VIDEODRIVER")[0]) return;
+    const char *pref = getenv("SILVER_BACKEND");
+    if (!pref || !pref[0]) pref = g_backend_pref[0] ? g_backend_pref : "wayland";
+    if (strcmp(pref, "auto") == 0) return;
+    if (strcmp(pref, "x11") == 0 || strcmp(pref, "xorg") == 0) { SDL_SetHint(SDL_HINT_VIDEODRIVER, "x11"); return; }
+    if (strcmp(pref, "wayland-only") == 0) { SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland"); return; }
+    if (strcmp(pref, "wayland") == 0) {
+        /* bez kompozytora Wayland (np. czysty X11) SDL przejdzie na X11 */
+        SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland,x11");
+        return;
+    }
+    fprintf(stderr, "[silver] UWAGA: nieznany SILVER_BACKEND='%s' (wayland|wayland-only|x11|auto) — używam wayland\n", pref);
+    SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland,x11");
+}
+
+/* nazwa użytego sterownika: "wayland" | "x11" | "dummy" | … | "" */
+const char *silver_video_driver(void) {
+    const char *d = SDL_GetCurrentVideoDriver();
+    return d ? d : "";
+}
+
 static int ensure_sdl(void) {
     if (g_sdl_ready) return 1;
+    apply_backend_pref();
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
     SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) return 0;
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "[silver] BŁĄD: SDL_Init(VIDEO): %s\n", SDL_GetError());
+        const char *pref = getenv("SILVER_BACKEND");
+        if (pref && strcmp(pref, "wayland-only") == 0)
+            fprintf(stderr, "[silver]   brak kompozytora Wayland (WAYLAND_DISPLAY='%s', XDG_RUNTIME_DIR='%s'). "
+                            "Użyj SILVER_BACKEND=wayland (z zapasem X11) albo x11.\n",
+                    getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "", getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "");
+        return 0;
+    }
+    if (getenv("SILVER_DEBUG")) {
+        const char *want = SDL_GetHint(SDL_HINT_VIDEODRIVER);
+        fprintf(stderr, "[silver] backend: żądany=%s użyty=%s\n", want ? want : "(auto)", SDL_GetCurrentVideoDriver());
+    }
+    {   /* czytelna informacja o zapasie X11 */
+        const char *vd = SDL_GetCurrentVideoDriver();
+        const char *pref = getenv("SILVER_BACKEND");
+        if (vd && strcmp(vd, "x11") == 0 && (!pref || strcmp(pref, "wayland") == 0) && !getenv("SDL_VIDEODRIVER")
+            && getenv("WAYLAND_DISPLAY") && getenv("WAYLAND_DISPLAY")[0])
+            fprintf(stderr, "[silver] UWAGA: sesja Wayland (WAYLAND_DISPLAY=%s), ale SDL użył X11 (XWayland). "
+                            "Ten build nie ma wlinkowanego Waylanda — przebuduj: sh native/build-static-deps.sh (FORCE=1)\n",
+                    getenv("WAYLAND_DISPLAY"));
+    }
     if (TTF_Init() != 0) return 0;
     IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG | IMG_INIT_WEBP);
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
     SDL_EventState(SDL_DROPTEXT, SDL_ENABLE);
     g_sdl_ready = 1;
     return 1;
+}
+
+/* ====================================================================
+ *  0.5 — wbudowane zasoby frontendu (VFS) — patrz silver_vfs.h
+ * ==================================================================== */
+static SDL_Surface *silver_img_load(const char *path) {
+    const SilverVfsEnt *e = vfs_get(path);
+    if (e) { SDL_RWops *rw = SDL_RWFromConstMem(e->data, (int)e->len); return rw ? IMG_Load_RW(rw, 1) : NULL; }
+    return IMG_Load(path);
+}
+int silver_vfs_add(const char *path, const char *b64) { return vfs_add_b64(path, b64); }
+int silver_vfs_has(const char *path) { return vfs_get(path) != NULL; }
+int silver_vfs_count(void) { return g_silver_vfs.n; }
+/* treść pliku wbudowanego jako C-string ("" gdy brak) — dla HTML/CSS/JS/SVG/JSON */
+const char *silver_vfs_text(const char *path) { const SilverVfsEnt *e = vfs_get(path); return e ? (const char *)e->data : ""; }
+/* 1 = wbudowane wygrywają (domyślnie), 0 = plik na dysku wygrywa (tryb dev / hot reload) */
+int silver_vfs_set_embedded_first(int on) { vfs_init_once(); g_silver_vfs.embedded_first = on ? 1 : 0; return 1; }
+/* nazwa i wersja biblioteki natywnej */
+const char *silver_native_version(void) {
+#ifdef SILVER_VERSION
+    return SILVER_VERSION;
+#else
+    return "0.5.0";
+#endif
 }
 
 /* ====================================================================
@@ -291,7 +394,10 @@ static TTF_Font *get_font_tag(SilverWindow *w, int size, int tag, const char *pa
         memmove(&w->fonts[0], &w->fonts[1], sizeof(SilverFontSlot) * (SILVER_MAX_FONTS - 1));
         w->font_count--;
     }
-    TTF_Font *f = TTF_OpenFont(path, phys);
+    TTF_Font *f = NULL;
+    { const SilverVfsEnt *ve = vfs_get(path);
+      if (ve) f = TTF_OpenFontRW(SDL_RWFromConstMem(ve->data, (int)ve->len), 1, phys);
+      else f = TTF_OpenFont(path, phys); }
     if (!f) return NULL;
     w->fonts[w->font_count].size = phys;
     w->fonts[w->font_count].tag = tag;
@@ -618,7 +724,7 @@ static void put16(unsigned char *p, unsigned v) { p[0] = v >> 8; p[1] = v; }
 
 /* Konwertuje plik WOFF 1.0 `in_path` na SFNT w `out_path`. 1 = ok, 0 = błąd / nie WOFF / WOFF2. */
 int silver_woff_to_sfnt(const char *in_path, const char *out_path) {
-    FILE *f = fopen(in_path, "rb");
+    FILE *f = vfs_fopen_rb(in_path);
     if (!f) return 0;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     if (n < 44 || n > 64 * 1024 * 1024) { fclose(f); return 0; }
@@ -656,7 +762,7 @@ int silver_woff_to_sfnt(const char *in_path, const char *out_path) {
 
 /* Jeśli `path` to WOFF — zdekoduj do pliku tymczasowego i zwróć jego ścieżkę (strdup); inaczej strdup(path). */
 static char *woff_resolve(const char *path) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = vfs_fopen_rb(path);
     unsigned char magic[4] = {0};
     if (f) { size_t r = fread(magic, 1, 4, f); (void)r; fclose(f); }
     if (memcmp(magic, "wOF2", 4) == 0) return NULL;   /* WOFF2: wymaga Brotli — odrzucone, silnik wybierze inny wpis src */
@@ -674,7 +780,7 @@ static char *woff_resolve(const char *path) {
 int silver_font_register(int h, int key, const char *path, int bold, int italic) {
     if (!VALID(h) || key <= 0 || key > 0x7FFF || !path || !path[0]) return 0;
     SilverWindow *w = &g_windows[h];
-    FILE *probe = fopen(path, "rb");
+    FILE *probe = vfs_fopen_rb(path);
     if (!probe) return 0;
     fclose(probe);
     int fi = -1;
@@ -752,6 +858,145 @@ int silver_set_bordered(int h, int on) {
     if (!VALID(h)) return 0;
     SDL_SetWindowBordered(g_windows[h].win, on ? SDL_TRUE : SDL_FALSE); return 1;
 }
+/* ====================================================================
+ *  0.5 — okna bez ramki: obszary przeciągania (CSS `app-region: drag|no-drag`)
+ *  i uchwyty zmiany rozmiaru. Działa na Waylandzie (xdg_toplevel_move/resize)
+ *  i X11 (_NET_WM_MOVERESIZE) przez SDL_SetWindowHitTest.
+ *  spec: "x,y,w,h,k;x,y,w,h,k;…"  (k: 0 = przeciąganie, 1 = bez przeciągania)
+ * ==================================================================== */
+#define SILVER_MAX_DRAG 48
+typedef struct { int n; int rect[SILVER_MAX_DRAG][5]; int resize_border; } SilverDrag;
+static SilverDrag g_drag[SILVER_MAX_WINDOWS];
+
+static SDL_HitTestResult SDLCALL drag_hit(SDL_Window *win, const SDL_Point *p, void *data) {
+    SilverDrag *d = (SilverDrag *)data;
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(win, &ww, &wh);
+    int rb = d->resize_border;
+    if (rb > 0 && !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) &&
+        (SDL_GetWindowFlags(win) & SDL_WINDOW_RESIZABLE)) {
+        int l = p->x < rb, r = p->x >= ww - rb, t = p->y < rb, b = p->y >= wh - rb;
+        if (t && l) return SDL_HITTEST_RESIZE_TOPLEFT;
+        if (t && r) return SDL_HITTEST_RESIZE_TOPRIGHT;
+        if (b && l) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+        if (b && r) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+        if (t) return SDL_HITTEST_RESIZE_TOP;
+        if (b) return SDL_HITTEST_RESIZE_BOTTOM;
+        if (l) return SDL_HITTEST_RESIZE_LEFT;
+        if (r) return SDL_HITTEST_RESIZE_RIGHT;
+    }
+    int drag = 0;
+    for (int i = 0; i < d->n; i++) {
+        const int *q = d->rect[i];
+        if (p->x >= q[0] && p->y >= q[1] && p->x < q[0] + q[2] && p->y < q[1] + q[3]) {
+            if (q[4] == 1) return SDL_HITTEST_NORMAL;   /* no-drag wygrywa */
+            drag = 1;
+        }
+    }
+    return drag ? SDL_HITTEST_DRAGGABLE : SDL_HITTEST_NORMAL;
+}
+
+/* resize_border: grubość uchwytu zmiany rozmiaru w px (0 = brak) */
+int silver_set_drag_regions(int h, const char *spec, int resize_border) {
+    if (!VALID(h)) return 0;
+    SilverDrag *d = &g_drag[h];
+    d->n = 0; d->resize_border = resize_border < 0 ? 0 : resize_border;
+    if (spec) {
+        const char *c = spec;
+        while (*c && d->n < SILVER_MAX_DRAG) {
+            int v[5] = {0,0,0,0,0}, got = 0;
+            char *e;
+            for (; got < 5; got++) {
+                v[got] = (int)strtol(c, &e, 10);
+                if (e == c) break;
+                c = e; if (*c == ',') c++; else break;
+            }
+            if (got >= 3) { memcpy(d->rect[d->n], v, sizeof v); d->n++; }
+            while (*c && *c != ';') c++;
+            if (*c == ';') c++;
+        }
+    }
+    if (d->n == 0 && d->resize_border == 0) return SDL_SetWindowHitTest(g_windows[h].win, NULL, NULL) == 0;
+    return SDL_SetWindowHitTest(g_windows[h].win, drag_hit, d) == 0;
+}
+
+/* ====================================================================
+ *  0.5 — pojedyncza instancja aplikacji (gniazdo UNIX w $XDG_RUNTIME_DIR)
+ *  silver_single_instance(id, args): 1 = jesteśmy pierwszą instancją (nasłuchujemy),
+ *  0 = istnieje już instancja — `args` (argv rozdzielone \n) zostały jej przekazane.
+ *  silver_single_poll(): "" albo argumenty kolejnego uruchomienia (do zdarzenia second_instance).
+ * ==================================================================== */
+static int  g_si_fd = -1;
+static char g_si_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static char g_si_buf[4096];
+
+static int si_path(const char *id) {
+    const char *rd = getenv("XDG_RUNTIME_DIR");
+    if (!rd || !rd[0]) rd = "/tmp";
+    char clean[64]; int n = 0;
+    for (const char *c = id; *c && n < 60; c++) clean[n++] = (isalnum((unsigned char)*c) || *c == '.' || *c == '-' || *c == '_') ? *c : '_';
+    clean[n] = 0;
+    int r = snprintf(g_si_path, sizeof g_si_path, "%s/silver-%s-%u.sock", rd, clean, (unsigned)getuid());
+    return r > 0 && (size_t)r < sizeof g_si_path;
+}
+
+int silver_single_instance(const char *id, const char *args) {
+#ifdef _WIN32
+    (void)id; (void)args; return 1;
+#else
+    if (!id || !id[0] || !si_path(id)) return 1;
+    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", g_si_path);
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (c >= 0 && connect(c, (struct sockaddr *)&a, sizeof a) == 0) {
+        const char *m = args ? args : "";
+        size_t len = strlen(m), off = 0;
+        while (off < len) { ssize_t w = write(c, m + off, len - off); if (w <= 0) break; off += (size_t)w; }
+        close(c);
+        return 0;                                   /* inna instancja żyje */
+    }
+    if (c >= 0) close(c);
+    unlink(g_si_path);                              /* martwe gniazdo po awarii */
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return 1;
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0 || listen(s, 4) != 0) { close(s); return 1; }
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+    g_si_fd = s;
+    return 1;
+#endif
+}
+
+const char *silver_single_poll(void) {
+#ifndef _WIN32
+    g_si_buf[0] = 0;
+    if (g_si_fd < 0) return g_si_buf;
+    int c = accept(g_si_fd, NULL, NULL);
+    if (c < 0) return g_si_buf;
+    fcntl(c, F_SETFL, fcntl(c, F_GETFL, 0) | O_NONBLOCK);
+    size_t n = 0;
+    for (int tries = 0; tries < 50 && n < sizeof g_si_buf - 1; tries++) {   /* ≤ ~50 ms na klienta */
+        ssize_t r = read(c, g_si_buf + n, sizeof g_si_buf - 1 - n);
+        if (r > 0) { n += (size_t)r; continue; }
+        if (r == 0) break;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { SDL_Delay(1); continue; }
+        break;
+    }
+    g_si_buf[n] = 0;
+    close(c);
+#else
+    g_si_buf[0] = 0;
+#endif
+    return g_si_buf;
+}
+
+int silver_single_release(void) {
+#ifndef _WIN32
+    if (g_si_fd >= 0) { close(g_si_fd); g_si_fd = -1; unlink(g_si_path); }
+#endif
+    return 1;
+}
+
 int silver_set_always_on_top(int h, int on) {
 #if SDL_VERSION_ATLEAST(2, 0, 16)
     if (!VALID(h)) return 0;
@@ -775,7 +1020,7 @@ int silver_hide(int h)     { if (!VALID(h)) return 0; SDL_HideWindow(g_windows[h
 
 int silver_set_icon(int h, const char *path) {
     if (!VALID(h) || !path || !path[0]) return 0;
-    SDL_Surface *s = IMG_Load(path);
+    SDL_Surface *s = silver_img_load(path);
     if (!s) return 0;
     SDL_SetWindowIcon(g_windows[h].win, s);
     SDL_FreeSurface(s);
@@ -1665,7 +1910,7 @@ int silver_set_text_input_rect(int h, int x, int y, int w, int hh) {
 /* ---- obrazki: cache LRU kluczowany pełną ścieżką ---- */
 /* 0.4: orientacja EXIF (tag 0x0112) z nagłówka JPEG; 1 gdy brak / nie JPEG */
 static int read_exif_orientation(const char *path) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = vfs_fopen_rb(path);
     if (!f) return 1;
     unsigned char hdr[2];
     int res = 1;
@@ -1719,7 +1964,7 @@ static SilverImage *find_or_load_image(int h, const char *path) {
         if (!im->path && free_slot < 0) free_slot = i;
         if (im->path && im->used < w->images[oldest].used) oldest = i;
     }
-    SDL_Surface *surf = IMG_Load(path);
+    SDL_Surface *surf = silver_img_load(path);
     if (!surf) return NULL;
     SDL_Texture *tex = SDL_CreateTextureFromSurface(w->ren, surf);
     int iw = surf->w, ih = surf->h;
@@ -2339,7 +2584,7 @@ int silver_image_alpha_band(int h, const char *path, int bands, int band, int th
     if (!sf || strcmp(cached, path) != 0) {
         if (sf) { SDL_FreeSurface(sf); sf = NULL; }
         cached[0] = 0;
-        SDL_Surface *raw = IMG_Load(path);
+        SDL_Surface *raw = silver_img_load(path);
         if (!raw) return -1;
         sf = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_RGBA32, 0);
         SDL_FreeSurface(raw);
@@ -2700,7 +2945,7 @@ int silver_pdf_end(const char *path) {
         }
     }
     int info = pdf_obj();
-    pdf_printf("<< /Producer (Silver 0.4) >>\nendobj\n");
+    pdf_printf("<< /Producer (Silver 0.5) >>\nendobj\n");
     long xref = (long)g_pdf_len;
     pdf_printf("xref\n0 %d\n0000000000 65535 f \n", g_pdf_nobj + 1);
     for (int i = 1; i <= g_pdf_nobj; i++) pdf_printf("%010ld 00000 n \n", g_pdf_off[i]);
