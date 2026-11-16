@@ -23,12 +23,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/HackerOS-Linux-System/silver.git",
+    "url": "git+https://github.com/bit-io/silver.git",
     "directory": "packages/silver-types"
   },
-  "homepage": "https://github.com/HackerOS-Linux-System/silver#readme",
+  "homepage": "https://github.com/bit-io/silver#readme",
   "bugs": {
-    "url": "https://github.com/HackerOS-Linux-System/silver/issues"
+    "url": "https://github.com/bit-io/silver/issues"
   },
   "publishConfig": {
     "access": "public"
