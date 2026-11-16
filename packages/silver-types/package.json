@@ -1,0 +1,43 @@
+{
+  "name": "@hackeros/silver-types",
+  "version": "0.5.0",
+  "description": "Typy TypeScript dla window.silver (Silver — silnik HTML/CSS/JS bez WebView, H#/Bit)",
+  "types": "index.d.ts",
+  "main": "",
+  "sideEffects": false,
+  "files": [
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "silver",
+    "h-sharp",
+    "bit",
+    "hackeros",
+    "typescript",
+    "types",
+    "desktop",
+    "webview"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HackerOS-Linux-System/silver.git",
+    "directory": "packages/silver-types"
+  },
+  "homepage": "https://github.com/HackerOS-Linux-System/silver#readme",
+  "bugs": {
+    "url": "https://github.com/HackerOS-Linux-System/silver/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "tsc -p test/tsconfig.json",
+    "prepublishOnly": "npm test"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
