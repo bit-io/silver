@@ -119,6 +119,7 @@ pub struct App is
     pub tr_delay:  [int]
     pub tr_ease:   [string]
     pub anim_busy: bool
+    pub anim_wait_ms: int     ;; odstęp między klatkami animacji (ms); domyślnie 16 ≈ 60 fps, patrz set_animation_fps
     pub scroll_goal: int      ;; 0.3: cel płynnego przewijania (scroll-behavior: smooth); -1 = brak
     pub has_motion: bool
 
@@ -179,7 +180,7 @@ pub fn new(title: string, width: int, height: int) -> App is
         cur_cursor: "default", has_focus: true, text_input_on: false,
         prev_bg: [], prev_fg: [], prev_op: [], anims: [],
         kf_nodes: [], kf_start: [], kf_pause: [], trg: [], kf_name: [], prev_st: [], has_tl: false, tr_ids: [], tr_from: [], tr_start: [], tr_dur: [], tr_delay: [], tr_ease: [],
-        anim_busy: false, scroll_goal: -1, has_motion: false,
+        anim_busy: false, anim_wait_ms: 16, scroll_goal: -1, has_motion: false,
         js_layout_watch: false, js_watch_ids: [], js_last_layout: "", storage_path: "", storage_data: "{{}}", storage_dirty: false, storage_last: 0,
         dev_mode: false, mtimes: [], last_dev: 0, tick_ms: 100, last_tick: 0, last_theme: 0,
         running: false, title_set: false, js_map: [], js_loaded: 0, js_inline_done: false, js_ready: false, js_pending: 0, tasks: [],
@@ -193,6 +194,18 @@ pub fn on_tick(app: App, hook: fn(App) -> App) -> App is
     a.on_tick = hook
     return a
 end
+
+;; Limit klatek animacji (CSS @keyframes / transition): każda klatka to pełny relayout, więc na słabszym sprzęcie
+;; lub w długo działających aplikacjach (ekran logowania) warto obniżyć. Domyślnie 60 fps; zakres 1..120.
+pub fn set_animation_fps(app: App, fps: int) -> App is
+    let mut a: App = app
+    let mut f: int = fps
+    if f < 1 is f = 1 end
+    if f > 120 is f = 120 end
+    a.anim_wait_ms = 1000 / f
+    return a
+end
+
 
 ;; Co ile ms wołać on_tick (domyślnie 100). 0 = tylko przy zdarzeniach.
 pub fn set_tick_interval(app: App, ms: int) -> App is
@@ -3469,8 +3482,8 @@ end
 pub fn next_wait_ms(a: App, now: int) -> int is
     let mut wait: int = 500
     if a.tick_ms > 0 && a.tick_ms < wait is wait = a.tick_ms end
-    if array_len(a.anims) > 0 is wait = 8 end
-    if a.anim_busy is wait = 12 end
+    if array_len(a.anims) > 0 is wait = a.anim_wait_ms end
+    if a.anim_busy is wait = a.anim_wait_ms end
     if a.scroll_goal >= 0 is wait = 8 end
     if a.focused_node >= 0 && a.has_focus && wait > 60 is wait = 60 end
     if a.dev_mode && wait > 200 is wait = 200 end
