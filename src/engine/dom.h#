@@ -655,8 +655,14 @@ pub fn find_by_id(dom: Dom, attr_id: string) -> int is
 end
 
 pub fn has_class(node: DomNode, cls: string) -> bool is
-    if node.attr_class == "" is return false end
-    let parts: [string] = string_split(node.attr_class, " ")
+    let c: string = node.attr_class
+    if c == "" || cls == "" is return false end
+    if c == cls is return true end
+    ;; Szybka ścieżka bez alokacji: H# nie ma GC, a string_split zostawiał tablicę i kopie każdego tokenu
+    ;; (wołane dla każdego węzła × każdej reguły × każdej klatki animacji → wzrost pamięci o setki MB/s).
+    ;; Brak podciągu = na pewno brak klasy; dopiero trafienie wymaga sprawdzenia granic tokenów.
+    if string_find(c, cls) < 0 is return false end
+    let parts: [string] = string_split(c, " ")
     let mut i: int = 0
     while i < array_len(parts) is
         if parts[i] == cls is return true end
