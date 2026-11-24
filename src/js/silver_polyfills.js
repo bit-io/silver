@@ -70,6 +70,7 @@
     g.TextEncoder = function TextEncoder() { this.encoding = 'utf-8'; };
     g.TextEncoder.prototype.encode = function (s) {
       s = String(s === undefined ? '' : s);
+      if (typeof g.__silver_utf8_encode === 'function') { var ab = g.__silver_utf8_encode(s); if (ab) return new Uint8Array(ab); }
       var out = [];
       for (var i = 0; i < s.length; i++) {
         var c = s.codePointAt(i);
@@ -85,6 +86,10 @@
   if (typeof g.TextDecoder !== 'function') {
     g.TextDecoder = function TextDecoder(enc) { this.encoding = (enc || 'utf-8').toLowerCase(); };
     g.TextDecoder.prototype.decode = function (buf) {
+      if (typeof g.__silver_utf8_decode === 'function' && buf) {
+        var ab = buf instanceof ArrayBuffer ? buf : (buf.buffer ? buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) : null);
+        if (ab) { var r = g.__silver_utf8_decode(ab); if (typeof r === 'string') return r; }
+      }
       var b = buf instanceof ArrayBuffer ? new Uint8Array(buf) : (buf && buf.buffer ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : new Uint8Array(0));
       var s = '', i = 0;
       while (i < b.length) {
