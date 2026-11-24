@@ -61,6 +61,9 @@ typedef struct {
     int           open;
     SDL_Window   *win;
     SDL_Renderer *ren;
+    void         *wl;                  /* 0.5: prezenter Wayland (wl_shm) dla renderera programowego — patrz silver_wlshm */
+    SDL_Surface  *wl_dummy;            /* powierzchnia 1×1, na której stoi programowy renderer w trybie wl_shm */
+    SDL_Texture  *wl_tgt;              /* tekstura docelowa o rozmiarze okna, do której rysuje silnik w trybie wl_shm */
     Uint32        win_id;
     char         *font_path;
     int           font_base;           /* rozmiar logiczny */
@@ -151,13 +154,31 @@ static int ensure_sdl(void) {
         const char *want = SDL_GetHint(SDL_HINT_VIDEODRIVER);
         fprintf(stderr, "[silver] backend: żądany=%s użyty=%s\n", want ? want : "(auto)", SDL_GetCurrentVideoDriver());
     }
+    {   /* 0.5: diagnostyka — czy ten binarek w ogóle ma sterownik Wayland? (zawsze, nie tylko przy SILVER_DEBUG) */
+        int has_wl = 0; char drivers[256] = "";
+        for (int i = 0; i < SDL_GetNumVideoDrivers(); i++) {
+            const char *dn = SDL_GetVideoDriver(i);
+            if (!dn) continue;
+            if (strcmp(dn, "wayland") == 0) has_wl = 1;
+            if (strlen(drivers) + strlen(dn) + 2 < sizeof drivers) { if (drivers[0]) strcat(drivers, ","); strcat(drivers, dn); }
+        }
+        const char *pref0 = getenv("SILVER_BACKEND"); if (!pref0 || !pref0[0]) pref0 = g_backend_pref[0] ? g_backend_pref : "wayland";
+        const char *vd0 = SDL_GetCurrentVideoDriver();
+        int wants_wl = (strcmp(pref0, "wayland") == 0 || strcmp(pref0, "wayland-only") == 0) && !getenv("SDL_VIDEODRIVER");
+        if (wants_wl && !has_wl && !getenv("SILVER_QUIET"))
+            fprintf(stderr, "[silver] UWAGA: ten binarek NIE MA sterownika Wayland (wkompilowane: %s) — okno działa przez %s.\n"
+                            "         Statyczny SDL zbudowano bez Waylanda (brak meson/ninja/bison/libexpat/libffi albo stary cache).\n"
+                            "         Napraw: doinstaluj pakiety i  FORCE=1 sh native/build-static-deps.sh  (potem przebuduj aplikację).\n"
+                            "         Zmienna SILVER_QUIET=1 wycisza to ostrzeżenie.\n", drivers, vd0 ? vd0 : "?");
+        if (getenv("SILVER_DEBUG")) fprintf(stderr, "[silver] sterowniki wideo w binarku: %s (wayland: %s)\n", drivers, has_wl ? "tak" : "NIE");
+    }
     {   /* czytelna informacja o zapasie X11 */
         const char *vd = SDL_GetCurrentVideoDriver();
         const char *pref = getenv("SILVER_BACKEND");
         if (vd && strcmp(vd, "x11") == 0 && (!pref || strcmp(pref, "wayland") == 0) && !getenv("SDL_VIDEODRIVER")
             && getenv("WAYLAND_DISPLAY") && getenv("WAYLAND_DISPLAY")[0])
             fprintf(stderr, "[silver] UWAGA: sesja Wayland (WAYLAND_DISPLAY=%s), ale SDL użył X11 (XWayland). "
-                            "Ten build nie ma wlinkowanego Waylanda — przebuduj: sh native/build-static-deps.sh (FORCE=1)\n",
+                            "Sprawdź XDG_RUNTIME_DIR i WAYLAND_DISPLAY (SDL nie połączył się z kompozytorem); jeśli binarek nie ma Waylanda — FORCE=1 sh native/build-static-deps.sh\n",
                     getenv("WAYLAND_DISPLAY"));
     }
     if (TTF_Init() != 0) return 0;
@@ -242,6 +263,231 @@ static int silver_is_static_exe(void) {
     return dyn == NULL;
 #endif
 }
+
+
+/* ====================================================================
+ *  0.5: SILVER_RENDERER=auto — sonda akcelerowanego renderera w OSOBNYM procesie.
+ *  Zły sterownik GL (albo statyczny glibc, który nie potrafi dlopen) kończy się SIGSEGV w
+ *  SDL_CreateRenderer — nie da się tego złapać w tym samym procesie. Dlatego proces uruchamia
+ *  się ponownie (/proc/self/exe) z SILVER_GL_PROBE=1: konstruktor poniżej (działa przed main
+ *  aplikacji) próbuje utworzyć ukryte okno i renderer akcelerowany i kończy się kodem 0 przy
+ *  sukcesie. Wynik jest buforowany w ~/.cache/silver/gl-probe (klucz: exe+mtime+sterownik+DISPLAY).
+ * ==================================================================== */
+#if !defined(_WIN32) && !defined(__APPLE__)
+#include <spawn.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <unistd.h>
+extern char **environ;
+static void __attribute__((constructor)) silver_probe_ctor(void) {
+    const char *p = getenv("SILVER_GL_PROBE");
+    if (!p || p[0] != '1') return;
+    int rc = 3;
+    if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+        SDL_Window *w = SDL_CreateWindow("", 0, 0, 64, 64, SDL_WINDOW_HIDDEN);
+        if (w) {
+            SDL_Renderer *r = SDL_CreateRenderer(w, -1, SDL_RENDERER_ACCELERATED);
+            if (r) { SDL_RendererInfo ri; rc = (SDL_GetRendererInfo(r, &ri) == 0 && !(ri.flags & SDL_RENDERER_SOFTWARE)) ? 0 : 4; SDL_DestroyRenderer(r); }
+            SDL_DestroyWindow(w);
+        }
+        SDL_Quit();
+    }
+    _exit(rc);
+}
+static int silver_gl_probe(void) {                /* 1 = renderer akcelerowany działa */
+    char exe[1024]; ssize_t en = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (en <= 0) return 0;
+    exe[en] = 0;
+    struct stat st; long mt = stat(exe, &st) == 0 ? (long)st.st_mtime : 0;
+    char key[1400];
+    snprintf(key, sizeof key, "%s|%ld|%s|%s|%s", exe, mt, SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "",
+             getenv("DISPLAY") ? getenv("DISPLAY") : "", getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "");
+    char cache[1200] = ""; const char *home = getenv("XDG_CACHE_HOME"), *hm = getenv("HOME");
+    if (home && home[0]) snprintf(cache, sizeof cache, "%s/silver", home); else if (hm && hm[0]) snprintf(cache, sizeof cache, "%s/.cache/silver", hm);
+    char cfile[1300] = "";
+    if (cache[0]) { snprintf(cfile, sizeof cfile, "%s/gl-probe", cache); FILE *f = fopen(cfile, "r"); if (f) { char line[1500]; while (fgets(line, sizeof line, f)) { size_t kl = strlen(key); if (strncmp(line, key, kl) == 0 && line[kl] == '=') { fclose(f); return line[kl + 1] == '1'; } } fclose(f); } }
+    char *envs[256]; int ne = 0;
+    for (char **e = environ; *e && ne < 250; e++) if (strncmp(*e, "SILVER_GL_PROBE=", 16) != 0) envs[ne++] = *e;
+    envs[ne++] = (char *)"SILVER_GL_PROBE=1"; envs[ne] = NULL;
+    char *argv[2] = { exe, NULL };
+    pid_t pid; int ok = 0;
+    if (posix_spawn(&pid, exe, NULL, NULL, argv, envs) == 0) {
+        int status = 0; int64_t until = (int64_t)SDL_GetTicks() + 4000; int done = 0;
+        while (!done) {
+            pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid) done = 1;
+            else if ((int64_t)SDL_GetTicks() > until) { kill(pid, SIGKILL); waitpid(pid, &status, 0); done = 2; }
+            else SDL_Delay(10);
+        }
+        ok = done == 1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    if (cfile[0]) { mkdir(cache, 0755); FILE *f = fopen(cfile, "a"); if (f) { fprintf(f, "%s=%d\n", key, ok); fclose(f); } }
+    if (getenv("SILVER_DEBUG")) fprintf(stderr, "[silver] sonda GL: %s\n", ok ? "akcelerowany działa" : "tylko programowy");
+    return ok;
+}
+#else
+static int silver_gl_probe(void) { return 1; }
+#endif
+
+
+/* ====================================================================
+ *  0.5: prezenter programowy przez wl_shm (Wayland bez OpenGL)
+ *
+ *  SDL2 nie ma renderera programowego dla okien Wayland (brak SDL_GetWindowSurface), a w pełni statyczny
+ *  plik nie potrafi użyć OpenGL/EGL (dlopen sterowników hosta → SIGSEGV). Bez tego aplikacja ze statycznego
+ *  buildu NIE STARTUJE na Waylandzie ("Couldn't find matching render driver") albo — gdy SDL ma tylko X11 —
+ *  działa przez XWayland. Rozwiązanie: silnik rysuje programowym rendererem SDL do tekstury docelowej o rozmiarze
+ *  okna, a ta funkcja kopiuje piksele do bufora wl_shm (memfd) i dołącza go do wl_surface okna SDL
+ *  (SDL_GetWindowWMInfo). wl_shm wiązany jest na własnej kolejce zdarzeń, więc nie wchodzi w drogę pętli SDL.
+ *  Kompiluje się tylko, gdy dostępne są nagłówki wayland-client.h i SDL_syswm.h z obsługą Wayland.
+ * ==================================================================== */
+#if defined(__has_include)
+#  if __has_include(<wayland-client.h>) && !defined(SILVER_NO_WLSHM) && !defined(_WIN32) && !defined(__APPLE__)
+#    include <SDL_syswm.h>
+#    include <wayland-client.h>
+#    include <sys/mman.h>
+#    include <unistd.h>
+#    ifdef SDL_VIDEO_DRIVER_WAYLAND
+#      define SILVER_WLSHM 1
+#    endif
+#  endif
+#endif
+
+#ifdef SILVER_WLSHM
+typedef struct {
+    struct wl_display *dpy; struct wl_surface *surf; struct wl_event_queue *q; struct wl_shm *shm;
+    struct wl_shm_pool *pool; struct wl_buffer *buf[2]; int busy[2];
+    unsigned char *map; size_t map_size; int fd;
+    int w, h, stride, scale, next;
+    long frames;
+} SilverWl;
+
+static void wl_reg_global(void *data, struct wl_registry *reg, uint32_t name, const char *iface, uint32_t ver) {
+    SilverWl *L = (SilverWl *)data;
+    if (strcmp(iface, "wl_shm") == 0) L->shm = (struct wl_shm *)wl_registry_bind(reg, name, &wl_shm_interface, 1);
+}
+static void wl_reg_remove(void *data, struct wl_registry *reg, uint32_t name) { (void)data; (void)reg; (void)name; }
+static const struct wl_registry_listener g_wl_reg_l = { wl_reg_global, wl_reg_remove };
+static void wl_buf_release(void *data, struct wl_buffer *b) {
+    SilverWl *L = (SilverWl *)data;
+    for (int i = 0; i < 2; i++) if (L->buf[i] == b) L->busy[i] = 0;
+}
+static const struct wl_buffer_listener g_wl_buf_l = { wl_buf_release };
+
+static void silver_wl_free_buffers(SilverWl *L) {
+    for (int i = 0; i < 2; i++) { if (L->buf[i]) wl_buffer_destroy(L->buf[i]); L->buf[i] = NULL; L->busy[i] = 0; }
+    if (L->pool) { wl_shm_pool_destroy(L->pool); L->pool = NULL; }
+    if (L->map) { munmap(L->map, L->map_size); L->map = NULL; }
+    if (L->fd >= 0) { close(L->fd); L->fd = -1; }
+}
+
+static int silver_wl_alloc(SilverWl *L, int w, int h) {
+    silver_wl_free_buffers(L);
+    L->w = w; L->h = h; L->stride = w * 4;
+    size_t one = (size_t)L->stride * (size_t)h; L->map_size = one * 2;
+    int fd = -1;
+#ifdef MFD_CLOEXEC
+    fd = memfd_create("silver-shm", MFD_CLOEXEC);
+#endif
+    if (fd < 0) {
+        char nm[64]; snprintf(nm, sizeof nm, "/silver-shm-%d-%ld", (int)getpid(), (long)L->frames);
+        fd = shm_open(nm, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) shm_unlink(nm);
+    }
+    if (fd < 0 || ftruncate(fd, (off_t)L->map_size) != 0) { if (fd >= 0) close(fd); return 0; }
+    L->fd = fd;
+    L->map = (unsigned char *)mmap(NULL, L->map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (L->map == MAP_FAILED) { L->map = NULL; close(fd); L->fd = -1; return 0; }
+    L->pool = wl_shm_create_pool(L->shm, fd, (int)L->map_size);
+    for (int i = 0; i < 2; i++) {
+        L->buf[i] = wl_shm_pool_create_buffer(L->pool, (int32_t)(one * (size_t)i), w, h, L->stride, WL_SHM_FORMAT_XRGB8888);
+        wl_buffer_add_listener(L->buf[i], &g_wl_buf_l, L);
+    }
+    return 1;
+}
+
+/* dopasowuje teksturę docelową i bufory do aktualnego rozmiaru okna (w pikselach); 1 = ok */
+static int silver_wl_sync(SilverWindow *w) {
+    SilverWl *L = (SilverWl *)w->wl;
+    if (!L) return 0;
+    int ww = 0, wh = 0, pw = 0, ph = 0;
+    SDL_GetWindowSize(w->win, &ww, &wh);
+    SDL_GetWindowSizeInPixels(w->win, &pw, &ph);
+    if (pw <= 0 || ph <= 0) { pw = ww; ph = wh; }
+    if (pw <= 0 || ph <= 0) return 0;
+    if (w->wl_tgt && L->w == pw && L->h == ph) return 1;
+    SDL_Texture *nt = SDL_CreateTexture(w->ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, pw, ph);
+    if (!nt) return 0;
+    SDL_Texture *prev = SDL_GetRenderTarget(w->ren);
+    SDL_SetRenderTarget(w->ren, nt);
+    SDL_SetRenderDrawColor(w->ren, 255, 255, 255, 255); SDL_RenderClear(w->ren);
+    if (w->wl_tgt && prev == w->wl_tgt) { /* zastąp bieżący cel */ } 
+    if (w->wl_tgt) SDL_DestroyTexture(w->wl_tgt);
+    w->wl_tgt = nt;
+    L->scale = (ww > 0 && pw % ww == 0) ? pw / ww : 1;
+    if (L->scale < 1) L->scale = 1;
+    wl_surface_set_buffer_scale(L->surf, L->scale);
+    return silver_wl_alloc(L, pw, ph);
+}
+
+static int silver_wl_init(SilverWindow *w) {
+    SDL_SysWMinfo info; SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(w->win, &info) || info.subsystem != SDL_SYSWM_WAYLAND) return 0;
+    SilverWl *L = (SilverWl *)calloc(1, sizeof *L);
+    if (!L) return 0;
+    L->fd = -1; L->dpy = info.info.wl.display; L->surf = info.info.wl.surface;
+    if (!L->dpy || !L->surf) { free(L); return 0; }
+    L->q = wl_display_create_queue(L->dpy);
+    struct wl_display *wrap = (struct wl_display *)wl_proxy_create_wrapper(L->dpy);
+    wl_proxy_set_queue((struct wl_proxy *)wrap, L->q);
+    struct wl_registry *reg = wl_display_get_registry(wrap);
+    wl_registry_add_listener(reg, &g_wl_reg_l, L);
+    wl_display_roundtrip_queue(L->dpy, L->q);
+    wl_proxy_wrapper_destroy(wrap);
+    if (!L->shm) { fprintf(stderr, "[silver] wl_shm: kompozytor nie udostępnia wl_shm\n"); wl_registry_destroy(reg); wl_event_queue_destroy(L->q); free(L); return 0; }
+    wl_registry_destroy(reg);
+    w->wl = L;
+    return 1;
+}
+
+static void silver_wl_present(SilverWindow *w) {
+    SilverWl *L = (SilverWl *)w->wl;
+    if (!L) return;
+    wl_display_dispatch_queue_pending(L->dpy, L->q);
+    if (!silver_wl_sync(w)) return;
+    int i = L->next;
+    if (L->busy[i]) i = 1 - i;
+    if (L->busy[i]) { wl_display_flush(L->dpy); wl_display_dispatch_queue_pending(L->dpy, L->q); if (L->busy[i]) return; }   /* oba bufory zajęte: pomiń klatkę */
+    unsigned char *dst = L->map + (size_t)i * (size_t)L->stride * (size_t)L->h;
+    if (SDL_RenderReadPixels(w->ren, NULL, SDL_PIXELFORMAT_ARGB8888, dst, L->stride) != 0) return;
+    { const char *dump = getenv("SILVER_WL_DUMP");      /* debug: zapis klatki nr 5 jako PPM (sprawdzenie, co trafia do kompozytora) */
+      if (dump && dump[0] && L->frames == 5) {
+          FILE *df = fopen(dump, "wb");
+          if (df) { fprintf(df, "P6\n%d %d\n255\n", L->w, L->h);
+              for (int y = 0; y < L->h; y++) for (int x = 0; x < L->w; x++) { const unsigned char *px = dst + (size_t)y * (size_t)L->stride + (size_t)x * 4; fputc(px[2], df); fputc(px[1], df); fputc(px[0], df); }
+              fclose(df); }
+      } }
+    wl_surface_attach(L->surf, L->buf[i], 0, 0);
+    wl_surface_damage_buffer(L->surf, 0, 0, L->w, L->h);
+    wl_surface_commit(L->surf);
+    wl_display_flush(L->dpy);
+    L->busy[i] = 1; L->next = 1 - i; L->frames++;
+}
+
+static void silver_wl_destroy(SilverWindow *w) {
+    SilverWl *L = (SilverWl *)w->wl;
+    if (!L) return;
+    silver_wl_free_buffers(L);
+    if (L->shm) wl_shm_destroy(L->shm);
+    if (L->q) wl_event_queue_destroy(L->q);
+    free(L); w->wl = NULL;
+}
+#else
+static int silver_wl_init(SilverWindow *w) { (void)w; return 0; }
+static int silver_wl_sync(SilverWindow *w) { (void)w; return 0; }
+static void silver_wl_present(SilverWindow *w) { (void)w; }
+static void silver_wl_destroy(SilverWindow *w) { (void)w; }
+#endif
 
 /* ====================================================================
  *  Fonty i skala
@@ -473,9 +719,9 @@ int silver_window_create(const char *title, int w, int h) {
     SDL_Window *win = SDL_CreateWindow(
         title ? title : "", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         w, h, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    if (!win) return -1;
+    if (!win) { fprintf(stderr, "[silver] BŁĄD: SDL_CreateWindow (%s): %s\n", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?", SDL_GetError()); return -1; }
 
-    /* Wybór renderera. SILVER_RENDERER=software|accelerated nadpisuje domyślne zachowanie.
+    /* Wybór renderera. SILVER_RENDERER=software|accelerated|auto nadpisuje domyślne zachowanie (auto: sonda GL w osobnym procesie).
      * Domyślnie: akcelerowany (GL), a w buildzie W PEŁNI STATYCZNYM (-DSILVER_STATIC_BUILD)
      * programowy — statyczny glibc nie potrafi dlopen-ować sterowników GL hosta (Mesa/libLLVM)
      * i kończy się to SIGSEGV / "double free or corruption". */
@@ -484,6 +730,7 @@ int silver_window_create(const char *title, int w, int h) {
     if (silver_is_static_exe()) want_sw = 1;
     if (rpref && strcmp(rpref, "software") == 0) want_sw = 1;
     if (rpref && strcmp(rpref, "accelerated") == 0) want_sw = 0;
+    if (rpref && strcmp(rpref, "auto") == 0) want_sw = !silver_gl_probe();   /* 0.5: sonda w osobnym procesie */
 
     /* Renderer programowy: wyłącz też framebuffer z akcelerowanej tekstury. Domyślnie SDL przy
      * SDL_GetWindowSurface próbuje najpierw renderera GL (dlopen sterowników hosta) — w buildzie
@@ -494,10 +741,22 @@ int silver_window_create(const char *title, int w, int h) {
     }
 
     SDL_Renderer *ren = NULL;
+    SDL_Surface *wl_dummy = NULL;
+    int is_wl = SDL_GetCurrentVideoDriver() && strcmp(SDL_GetCurrentVideoDriver(), "wayland") == 0;
     if (!want_sw)
         ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
-    if (!ren) { SDL_DestroyWindow(win); return -1; }
+    if (!ren && !is_wl) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    if (!ren && is_wl) {
+        /* 0.5: SDL2 nie ma renderera programowego dla okien Wayland → rysujemy do tekstury, a prezenter wl_shm wysyła piksele */
+        wl_dummy = SDL_CreateRGBSurfaceWithFormat(0, 1, 1, 32, SDL_PIXELFORMAT_ARGB8888);
+        if (wl_dummy) ren = SDL_CreateSoftwareRenderer(wl_dummy);
+        if (getenv("SILVER_DEBUG")) fprintf(stderr, "[silver] Wayland bez OpenGL: renderer programowy + prezenter wl_shm\n");
+    }
+    if (!ren) {
+        fprintf(stderr, "[silver] BŁĄD: SDL_CreateRenderer (%s): %s\n", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?", SDL_GetError());
+        if (wl_dummy) SDL_FreeSurface(wl_dummy);
+        SDL_DestroyWindow(win); return -1;
+    }
 
     if (getenv("SILVER_DEBUG")) {
         SDL_RendererInfo ri; const char *rn = "?";
@@ -507,6 +766,26 @@ int silver_window_create(const char *title, int w, int h) {
     SilverWindow *sw = &g_windows[slot];
     memset(sw, 0, sizeof(*sw));
     sw->used = 1; sw->open = 1; sw->win = win; sw->ren = ren;
+    if (wl_dummy) {
+        sw->wl_dummy = wl_dummy;
+        if (!silver_wl_init(sw) || !silver_wl_sync(sw)) {
+            fprintf(stderr, "[silver] BŁĄD: prezenter Wayland (wl_shm) nie wystartował\n");
+            int others = 0; for (int k = 0; k < SILVER_MAX_WINDOWS; k++) if (g_windows[k].used && k != slot) others++;
+            silver_wl_destroy(sw);
+            if (sw->wl_tgt) SDL_DestroyTexture(sw->wl_tgt);
+            SDL_DestroyRenderer(ren); SDL_FreeSurface(wl_dummy); SDL_DestroyWindow(win);
+            memset(sw, 0, sizeof(*sw));
+            static int fallback_done = 0;
+            if (!fallback_done && !others && !getenv("SILVER_NO_X11_FALLBACK")) {
+                fallback_done = 1;
+                fprintf(stderr, "[silver] UWAGA: wracam do X11 (XWayland) — okno Wayland nie dało się utworzyć. Wyłącz zapas: SILVER_NO_X11_FALLBACK=1\n");
+                SDL_QuitSubSystem(SDL_INIT_VIDEO);
+                SDL_SetHint(SDL_HINT_VIDEODRIVER, "x11");
+                if (SDL_InitSubSystem(SDL_INIT_VIDEO) == 0) return silver_window_create(title, w, h);
+            }
+            return -1;
+        }
+    }
     sw->win_id = SDL_GetWindowID(win);
     sw->scale_pct = 100;
     sw->font_base = 14;
@@ -598,9 +877,10 @@ int silver_backdrop_blur(int h, int x, int y, int w, int hh, int radius) {
 /* ====================================================================
  *  0.3: WOFF 1.0 → SFNT (TTF/OTF). SDL_ttf nie czyta WOFF, więc przy rejestracji kroju plik
  *  jest dekompresowany (własny, mały inflate — bez zależności od zlib) do pliku tymczasowego.
- *  WOFF2 wymaga Brotli i transformacji glifów — nieobsługiwane (rejestracja zwraca 0,
- *  a silnik wybiera inny wpis `src`).
+ *  0.5: WOFF2 — silver_woff2.h (Brotli + transformacje glyf/loca/hmtx); przy buildzie bez libbrotlidec
+ *  (SILVER_WOFF2 niezdefiniowane) rejestracja WOFF2 zwraca 0, a silnik wybiera inny wpis `src`.
  * ==================================================================== */
+#include "silver_woff2.h"
 typedef struct { const unsigned char *in; size_t inlen, pos; int bit, bitcnt; unsigned char *out; size_t outlen, outpos; int err; } Inf;
 
 static int inf_bit(Inf *s) {
@@ -765,7 +1045,27 @@ static char *woff_resolve(const char *path) {
     FILE *f = vfs_fopen_rb(path);
     unsigned char magic[4] = {0};
     if (f) { size_t r = fread(magic, 1, 4, f); (void)r; fclose(f); }
-    if (memcmp(magic, "wOF2", 4) == 0) return NULL;   /* WOFF2: wymaga Brotli — odrzucone, silnik wybierze inny wpis src */
+    if (memcmp(magic, "wOF2", 4) == 0) {                /* 0.5: WOFF2 → SFNT (Brotli); bez SILVER_WOFF2 zwraca NULL */
+        FILE *wf = vfs_fopen_rb(path);
+        if (!wf) return NULL;
+        fseek(wf, 0, SEEK_END); long wn = ftell(wf); fseek(wf, 0, SEEK_SET);
+        if (wn < 48 || wn > 64 * 1024 * 1024) { fclose(wf); return NULL; }
+        unsigned char *wb = (unsigned char *)malloc((size_t)wn), *sf = NULL; size_t sn = 0;
+        if (!wb || fread(wb, 1, (size_t)wn, wf) != (size_t)wn) { free(wb); fclose(wf); return NULL; }
+        fclose(wf);
+        int dok = silver_woff2_decode(wb, (size_t)wn, &sf, &sn);
+        free(wb);
+        if (!dok) return NULL;
+        char wtmp[1100];
+        const char *wdir = getenv("TMPDIR"); if (!wdir || !wdir[0]) wdir = "/tmp";
+        Uint32 wh = 2166136261u; for (const char *c = path; *c; c++) { wh ^= (unsigned char)*c; wh *= 16777619u; }
+        snprintf(wtmp, sizeof wtmp, "%s/silver-woff2-%08x.ttf", wdir, (unsigned)wh);
+        FILE *wo = fopen(wtmp, "wb");
+        int wok = wo && fwrite(sf, 1, sn, wo) == sn;
+        if (wo) fclose(wo);
+        free(sf);
+        return wok ? strdup(wtmp) : NULL;
+    }
     if (memcmp(magic, "wOFF", 4) != 0) return strdup(path);
     char tmp[1100];
     const char *dir = getenv("TMPDIR"); if (!dir || !dir[0]) dir = "/tmp";
@@ -1044,7 +1344,10 @@ int silver_window_close(int h) {
     free(w->font_path);
     for (int fi = 0; fi < w->fam_count; fi++)
         for (int vi = 0; vi < 4; vi++) free(w->fams[fi].paths[vi]);
+    silver_wl_destroy(w);
+    if (w->wl_tgt) SDL_DestroyTexture(w->wl_tgt);
     SDL_DestroyRenderer(w->ren);
+    if (w->wl_dummy) SDL_FreeSurface(w->wl_dummy);
     SDL_DestroyWindow(w->win);
     memset(w, 0, sizeof(*w));
     return 1;
@@ -1180,6 +1483,7 @@ static void route(SDL_Event *e) {
             push_ev(w, 1, "0|0|0"); break;
         case SDL_WINDOWEVENT_SIZE_CHANGED:
         case SDL_WINDOWEVENT_DISPLAY_CHANGED:
+            if (w->wl) silver_wl_sync(w);          /* 0.5: tekstura docelowa i bufory wl_shm zgodne z nowym rozmiarem */
             update_scale(w);
             push_ev(w, 6, "%d|%d|%d", silver_get_width((int)(w - g_windows)),
                     silver_get_height((int)(w - g_windows)), w->scale_pct);
@@ -1893,7 +2197,7 @@ int silver_present(int h) {
     }
     g_dbg_frame++;
     g_cnt_clear = g_cnt_rect = g_cnt_text = g_cnt_image = g_cnt_other = 0;
-    SDL_RenderPresent(g_windows[h].ren);
+    if (g_windows[h].wl) silver_wl_present(&g_windows[h]); else SDL_RenderPresent(g_windows[h].ren);
     return 1;
 }
 
@@ -2745,7 +3049,7 @@ static SDL_Texture *g_print_tgt = NULL;
 int silver_target_begin(int h, int w, int ht) {
     if (!VALID(h) || w < 1 || ht < 1) return 0;
     SilverWindow *sw = &g_windows[h];
-    if (g_print_tgt) { SDL_SetRenderTarget(sw->ren, NULL); SDL_DestroyTexture(g_print_tgt); g_print_tgt = NULL; }
+    if (g_print_tgt) { SDL_SetRenderTarget(sw->ren, sw->wl_tgt); SDL_DestroyTexture(g_print_tgt); g_print_tgt = NULL; }
     g_print_tgt = SDL_CreateTexture(sw->ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, w, ht);
     if (!g_print_tgt) return 0;
     SDL_SetRenderTarget(sw->ren, g_print_tgt);
@@ -2755,7 +3059,7 @@ int silver_target_begin(int h, int w, int ht) {
 }
 int silver_target_end(int h) {
     if (!VALID(h)) return 0;
-    SDL_SetRenderTarget(g_windows[h].ren, NULL);
+    SDL_SetRenderTarget(g_windows[h].ren, g_windows[h].wl_tgt);
     if (g_print_tgt) { SDL_DestroyTexture(g_print_tgt); g_print_tgt = NULL; }
     return 1;
 }
