@@ -6,36 +6,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
-#ifdef SILVER_TLS
-#  include <openssl/ssl.h>
-#  include <openssl/err.h>
-#  include <openssl/x509v3.h>
-#endif
-#ifndef _WIN32
-#  include <sys/types.h>
-#  include <sys/socket.h>
-#  include <netdb.h>
-#  include <unistd.h>
-#  include <fcntl.h>
-#  include <netinet/in.h>
-#  include <netinet/tcp.h>
-#endif
+#include "silver_net.h"      /* 0.5: gniazda (POSIX/Winsock), TLS, klient HTTP(S), wątki */
 
-#if defined(_WIN32)
-#  include <windows.h>
-static int64_t now_ms(void) {
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
-    return (int64_t)(c.QuadPart * 1000 / f.QuadPart);
-}
-#else
-#  include <time.h>
-static int64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-#endif
+static int64_t now_ms(void) { return net_now_ms(); }
 
 #define SILVER_MAX_CTX        8
 #define SILVER_QUEUE_LEN      4096
@@ -60,7 +33,8 @@ typedef struct {
 /* 0.3: klient WebSocket (ws://, bez TLS) obsługiwany z pętli js_tick */
 #define SILVER_MAX_WS 16
 typedef struct {
-    int     used, id, fd, state;      /* state: 0 łączenie, 1 handshake wysłany, 2 otwarte, 3 zamykanie */
+    int     used, id, state;          /* state: 0 łączenie, 1 handshake wysłany, 2 otwarte, 3 zamykanie */
+    net_sock_t fd;
     char    key[32];
     char    host[256];
     int     tls;                      /* 0.5: wss:// (SILVER_TLS) */
@@ -87,9 +61,23 @@ typedef struct {
     char    last_error[2048];
     char   *poll_buf;      /* ważny do następnego js_poll_invoke */
     SilverWs ws[SILVER_MAX_WS];
+    uint64_t gen;          /* 0.5: unikalna generacja (zadania sieciowe i Workery wskazują właściciela) */
 } SilverJsCtx;
 
 static SilverJsCtx g_ctx[SILVER_MAX_CTX];
+static uint64_t g_gen_counter = 0;
+static JSValue native_fetch_start(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue native_fetch_cancel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue native_read_text(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue native_worker_spawn(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv);
+static JSValue native_worker_post(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv);
+static JSValue native_worker_terminate(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv);
+static JSValue native_utf8_decode(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv);
+static JSValue native_utf8_encode(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv);
+static void fetch_deliver(SilverJsCtx *sc);
+static void wk_pump(SilverJsCtx *sc);
+static void wk_shutdown(SilverJsCtx *sc);
+static int wk_any(SilverJsCtx *sc);
 static int eval_buf(SilverJsCtx *sc, const char *src, size_t len, const char *name);
 static int eval_module_buf(SilverJsCtx *sc, const char *src, size_t len, const char *name);
 static int looks_like_module(const char *src, size_t len, const char *name);
@@ -100,6 +88,11 @@ static JSValue native_ws_open(JSContext *ctx, JSValueConst this_val, int argc, J
 static JSValue native_ws_send(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue native_ws_close(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static char *mod_normalize(JSContext *ctx, const char *base, const char *name, void *opaque);
+static char *read_whole_file(const char *path, size_t *out_len);
+static void set_fn(JSContext *ctx, JSValue global, const char *name, JSCFunction *fn, int nargs);
+static void enter_js(SilverJsCtx *sc);
+static void leave_js(SilverJsCtx *sc);
+static void report_exception(SilverJsCtx *sc, const char *where);
 static JSModuleDef *mod_loader(JSContext *ctx, const char *name, void *opaque);
 
 static SilverJsCtx *by_ctx(JSContext *ctx) {
@@ -364,6 +357,7 @@ int js_init(int win_handle) {
     SilverJsCtx *sc = &g_ctx[slot];
     memset(sc, 0, sizeof(*sc));
     sc->used = 1; sc->rt = rt; sc->ctx = ctx;
+    sc->gen = ++g_gen_counter;
     sc->budget_ms = SILVER_DEFAULT_BUDGET;
     JS_SetInterruptHandler(rt, (JSInterruptHandler *)interrupt_cb, sc);
     JS_SetHostPromiseRejectionTracker(rt, promise_rejection_cb, NULL);
@@ -377,6 +371,14 @@ int js_init(int win_handle) {
     set_fn(ctx, sc->global, "__silver_ws_open",       native_ws_open, 2);
     set_fn(ctx, sc->global, "__silver_ws_send",       native_ws_send, 2);
     set_fn(ctx, sc->global, "__silver_ws_close",      native_ws_close, 2);
+    set_fn(ctx, sc->global, "__silver_fetch_start",   native_fetch_start, 7);
+    set_fn(ctx, sc->global, "__silver_fetch_cancel",  native_fetch_cancel, 1);
+    set_fn(ctx, sc->global, "__silver_read_text",     native_read_text, 1);
+    set_fn(ctx, sc->global, "__silver_utf8_decode",   native_utf8_decode, 1);
+    set_fn(ctx, sc->global, "__silver_utf8_encode",   native_utf8_encode, 1);
+    set_fn(ctx, sc->global, "__silver_worker_spawn",  native_worker_spawn, 5);
+    set_fn(ctx, sc->global, "__silver_worker_post",   native_worker_post, 2);
+    set_fn(ctx, sc->global, "__silver_worker_terminate", native_worker_terminate, 1);
     JS_SetModuleLoaderFunc(rt, mod_normalize, mod_loader, NULL);
 
     /* wbudowane API (console, timery, fetch, silver.*, DOM) */
@@ -667,39 +669,19 @@ static void b64enc(const unsigned char *in, size_t n, char *out) {
     out[o] = 0;
 }
 
-#ifndef _WIN32
 static void ws_free(SilverWs *w) {
 #ifdef SILVER_TLS
     if (w->ssl) { SSL_shutdown((SSL *)w->ssl); SSL_free((SSL *)w->ssl); w->ssl = NULL; }
 #endif
-    if (w->fd >= 0) close(w->fd);
+    if (w->fd != NET_INVALID) net_close(w->fd);
     free(w->rbuf); free(w->msg);
     memset(w, 0, sizeof *w);
-    w->fd = -1;
+    w->fd = NET_INVALID;
 }
 
-#ifdef SILVER_TLS
-static SSL_CTX *g_tls_ctx = NULL;
-static SSL_CTX *tls_ctx(void) {
-    if (g_tls_ctx) return g_tls_ctx;
-    SSL_library_init();
-    g_tls_ctx = SSL_CTX_new(TLS_client_method());
-    if (!g_tls_ctx) return NULL;
-    SSL_CTX_set_min_proto_version(g_tls_ctx, TLS1_2_VERSION);
-    SSL_CTX_set_verify(g_tls_ctx, SSL_VERIFY_PEER, NULL);
-    const char *env_ca = getenv("SSL_CERT_FILE");
-    int ok = 0;
-    if (env_ca && env_ca[0]) ok = SSL_CTX_load_verify_locations(g_tls_ctx, env_ca, NULL);
-    if (!ok) ok = SSL_CTX_set_default_verify_paths(g_tls_ctx);
-    static const char *bundles[] = { "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
-        "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem", "/usr/local/share/certs/ca-root-nss.crt", NULL };
-    for (int i = 0; bundles[i]; i++) SSL_CTX_load_verify_locations(g_tls_ctx, bundles[i], NULL);
-    return g_tls_ctx;
-}
-#endif
 
 /* nieblokujące I/O z opcjonalnym TLS: >0 bajty, 0 EOF, -1 EAGAIN, -2 błąd */
-static ssize_t ws_io_recv(SilverWs *w, void *buf, size_t n) {
+static net_ssize_t ws_io_recv(SilverWs *w, void *buf, size_t n) {
 #ifdef SILVER_TLS
     if (w->ssl) {
         int r = SSL_read((SSL *)w->ssl, buf, (int)n);
@@ -710,18 +692,18 @@ static ssize_t ws_io_recv(SilverWs *w, void *buf, size_t n) {
         return -2;
     }
 #endif
-    ssize_t r = recv(w->fd, buf, n, 0);
+    net_ssize_t r = recv(w->fd, (char *)buf, (int)n, 0);
     if (r >= 0) return r;
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return -1;
+    if (net_would_block()) return -1;
     return -2;
 }
 
 static int ws_send_all(SilverWs *w, const unsigned char *d, size_t n) {
     size_t off = 0;
     int spins = 0;
-    int fd = w->fd;
+    net_sock_t fd = w->fd;
     while (off < n) {
-        ssize_t r; int again;
+        net_ssize_t r; int again;
 #ifdef SILVER_TLS
         if (w->ssl) {
             int sr = SSL_write((SSL *)w->ssl, d + off, (int)(n - off));
@@ -732,14 +714,14 @@ static int ws_send_all(SilverWs *w, const unsigned char *d, size_t n) {
         } else
 #endif
         {
-            r = send(fd, d + off, n - off, MSG_NOSIGNAL);
-            again = (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+            r = send(fd, (const char *)d + off, (int)(n - off), NET_SEND_FLAGS);
+            again = (r < 0 && net_would_block());
         }
         if (r > 0) { off += (size_t)r; spins = 0; continue; }
         if (again && spins++ < 2000) {
             fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
             struct timeval tv = { 0, 5000 };
-            select(fd + 1, NULL, &wf, NULL, &tv);
+            select((int)fd + 1, NULL, &wf, NULL, &tv);
             continue;
         }
         return 0;
@@ -882,13 +864,13 @@ static void ws_poll(SilverJsCtx *sc) {
         if (w->state == 0) {
             fd_set wf; FD_ZERO(&wf); FD_SET(w->fd, &wf);
             struct timeval tv = { 0, 0 };
-            if (select(w->fd + 1, NULL, &wf, NULL, &tv) > 0) {
+            if (select((int)w->fd + 1, NULL, &wf, NULL, &tv) > 0) {
                 int err = 0; socklen_t el = sizeof err;
-                getsockopt(w->fd, SOL_SOCKET, SO_ERROR, &err, &el);
+                getsockopt(w->fd, SOL_SOCKET, SO_ERROR, (char *)&err, &el);
                 if (err) { ws_fail(sc, w, "nie można połączyć"); continue; }
 #ifdef SILVER_TLS
                 if (w->tls) {
-                    SSL_CTX *tc = tls_ctx();
+                    SSL_CTX *tc = net_tls_ctx();
                     SSL *ssl = tc ? SSL_new(tc) : NULL;
                     if (!ssl) { ws_fail(sc, w, "TLS: brak kontekstu"); continue; }
                     SSL_set_fd(ssl, w->fd);
@@ -929,7 +911,7 @@ static void ws_poll(SilverJsCtx *sc) {
                 if (!nb) { ws_fail(sc, w, "brak pamięci"); break; }
                 w->rbuf = nb; w->rcap = nc;
             }
-            ssize_t r = ws_io_recv(w, w->rbuf + w->rlen, w->rcap - w->rlen - 1);
+            net_ssize_t r = ws_io_recv(w, w->rbuf + w->rlen, w->rcap - w->rlen - 1);
             if (r > 0) { w->rlen += (size_t)r; continue; }
             if (r == 0) { eof = 1; break; }   /* najpierw sparsuj ramki (np. close), potem obsłuż EOF */
             if (r == -1) break;
@@ -964,7 +946,7 @@ static JSValue native_ws_open(JSContext *ctx, JSValueConst this_val, int argc, J
     for (int i = 0; i < SILVER_MAX_WS; i++) if (!sc->ws[i].used) { w = &sc->ws[i]; break; }
     if (!w) { JS_FreeCString(ctx, url); return JS_FALSE; }
     memset(w, 0, sizeof *w);
-    w->used = 1; w->id = id; w->fd = -1; w->t0 = now_ms();
+    w->used = 1; w->id = id; w->fd = NET_INVALID; w->t0 = now_ms(); net_sock_init();
     int is_wss = strncmp(url, "wss://", 6) == 0;
     if (strncmp(url, "ws://", 5) != 0 && !is_wss) { w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
 #ifndef SILVER_TLS
@@ -989,13 +971,13 @@ static JSValue native_ws_open(JSContext *ctx, JSValueConst this_val, int argc, J
     hints.ai_socktype = SOCK_STREAM;
     int gai = getaddrinfo(hostbuf, port, &hints, &res);
     if (gai != 0 || !res) { w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    int cr = connect(fd, res->ai_addr, res->ai_addrlen);
+    net_sock_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd == NET_INVALID) { freeaddrinfo(res); w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
+    net_set_nonblock(fd);
+    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    int cr = connect(fd, res->ai_addr, (int)res->ai_addrlen);
     freeaddrinfo(res);
-    if (cr < 0 && errno != EINPROGRESS) { close(fd); w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
+    if (cr != 0 && !net_in_progress()) { net_close(fd); w->state = -1; JS_FreeCString(ctx, url); return JS_TRUE; }
     w->fd = fd; w->state = 0;
     JS_FreeCString(ctx, url);
     return JS_TRUE;
@@ -1041,20 +1023,561 @@ static JSValue native_ws_close(JSContext *ctx, JSValueConst this_val, int argc, 
     }
     return JS_UNDEFINED;
 }
-#else
-static void ws_poll(SilverJsCtx *sc) { (void)sc; }
-static int ws_any_open(SilverJsCtx *sc) { (void)sc; return 0; }
-static void ws_close_all(SilverJsCtx *sc) { (void)sc; }
-static JSValue native_ws_open(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)ctx; (void)t; (void)argc; (void)argv; return JS_FALSE; }
-static JSValue native_ws_send(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)ctx; (void)t; (void)argc; (void)argv; return JS_FALSE; }
-static JSValue native_ws_close(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)ctx; (void)t; (void)argc; (void)argv; return JS_UNDEFINED; }
-#endif
+
+
+/* ====================================================================
+ *  0.5: fetch asynchroniczny (wątki + silver_net.h), odczyt plików tekstowych
+ * ==================================================================== */
+/* __silver_fetch_start(id, method, url, headersText, body, timeoutMs, maxRedirects) -> bool
+ * body: string (UTF-8) albo ArrayBuffer. Wynik wraca przez __silver_fetch_done(...) z js_tick. */
+static JSValue native_fetch_start(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    SilverJsCtx *sc = by_ctx(ctx);
+    if (!sc || argc < 7) return JS_FALSE;
+    int32_t id = 0, tmo = 30000, red = 20;
+    JS_ToInt32(ctx, &id, argv[0]); JS_ToInt32(ctx, &tmo, argv[5]); JS_ToInt32(ctx, &red, argv[6]);
+    const char *method = JS_ToCString(ctx, argv[1]);
+    const char *url = JS_ToCString(ctx, argv[2]);
+    const char *hdrs = JS_ToCString(ctx, argv[3]);
+    const unsigned char *body = NULL; size_t blen = 0;
+    const char *bstr = NULL;
+    if (JS_IsString(argv[4])) { bstr = JS_ToCStringLen(ctx, &blen, argv[4]); body = (const unsigned char *)bstr; }
+    else if (JS_IsObject(argv[4])) {
+        size_t sz = 0; uint8_t *ab = JS_GetArrayBuffer(ctx, &sz, argv[4]);
+        if (ab) { body = ab; blen = sz; } else { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); }
+    }
+    int ok = (method && url) ? net_job_start(sc->gen, id, method, url, hdrs ? hdrs : "", body, blen, tmo, red) : 0;
+    if (method) JS_FreeCString(ctx, method);
+    if (url) JS_FreeCString(ctx, url);
+    if (hdrs) JS_FreeCString(ctx, hdrs);
+    if (bstr) JS_FreeCString(ctx, bstr);
+    return ok ? JS_TRUE : JS_FALSE;
+}
+
+/* __silver_fetch_cancel(id) */
+static JSValue native_fetch_cancel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    SilverJsCtx *sc = by_ctx(ctx);
+    if (!sc || argc < 1) return JS_UNDEFINED;
+    int32_t id = 0; JS_ToInt32(ctx, &id, argv[0]);
+    net_job_cancel(sc->gen, id);
+    return JS_UNDEFINED;
+}
+
+
+/* __silver_utf8_decode(ArrayBuffer|TypedArray) -> string ; __silver_utf8_encode(string) -> ArrayBuffer */
+static JSValue native_utf8_decode(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NewString(ctx, "");
+    size_t sz = 0; uint8_t *p = JS_GetArrayBuffer(ctx, &sz, argv[0]);
+    if (!p) { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); return JS_UNDEFINED; }
+    if (sz >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) { p += 3; sz -= 3; }   /* BOM */
+    return JS_NewStringLen(ctx, (const char *)p, sz);
+}
+static JSValue native_utf8_encode(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    size_t n = 0;
+    const char *s = argc > 0 ? JS_ToCStringLen(ctx, &n, argv[0]) : NULL;
+    if (!s) return JS_UNDEFINED;
+    JSValue r = JS_NewArrayBufferCopy(ctx, (const uint8_t *)s, n);
+    JS_FreeCString(ctx, s);
+    return r;
+}
+
+/* __silver_read_text(path) -> string | null (plik lokalny albo zasób wbudowany) */
+static JSValue native_read_text(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NULL;
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_NULL;
+    size_t len = 0;
+    char *src = read_whole_file(path, &len);
+    JS_FreeCString(ctx, path);
+    if (!src) return JS_NULL;
+    JSValue r = JS_NewStringLen(ctx, src, len);
+    free(src);
+    return r;
+}
+
+static void fetch_deliver(SilverJsCtx *sc) {
+    NetJob *j;
+    while ((j = net_job_take_done(sc->gen)) != NULL) {
+        JSContext *ctx = sc->ctx;
+        JSValue fn = JS_GetPropertyStr(ctx, sc->global, "__silver_fetch_done");
+        if (JS_IsFunction(ctx, fn)) {
+            JSValue a[8];
+            int okr = j->rc == 0;
+            a[0] = JS_NewInt32(ctx, j->id);
+            a[1] = JS_NewInt32(ctx, okr ? j->resp.status : 0);
+            a[2] = JS_NewString(ctx, okr ? j->resp.status_text : "");
+            a[3] = JS_NewString(ctx, okr && j->resp.headers ? j->resp.headers : "");
+            a[4] = JS_NewArrayBufferCopy(ctx, okr && j->resp.body ? j->resp.body : (const uint8_t *)"", okr && j->resp.body ? j->resp.body_len : 0);
+            a[5] = JS_NewString(ctx, okr && j->resp.final_url ? j->resp.final_url : j->url);
+            a[6] = JS_NewBool(ctx, okr ? j->resp.redirected : 0);
+            a[7] = JS_NewString(ctx, okr ? "" : (j->resp.err[0] ? j->resp.err : "błąd sieci"));
+            enter_js(sc);
+            JSValue ret = JS_Call(ctx, fn, sc->global, 8, a);
+            if (JS_IsException(ret)) report_exception(sc, "__silver_fetch_done");
+            JS_FreeValue(ctx, ret);
+            for (int i = 0; i < 8; i++) JS_FreeValue(ctx, a[i]);
+            leave_js(sc);
+        }
+        JS_FreeValue(ctx, fn);
+        net_job_free(j);
+    }
+}
+
+/* ====================================================================
+ *  0.5: Workery w osobnych wątkach — własny JSRuntime/JSContext na wątek.
+ *  Komunikacja: dwie kolejki tekstów (serializacja z silver_serial.js), odbierane z js_tick.
+ * ==================================================================== */
+#define SILVER_MAX_WORKERS     64
+#define SILVER_WK_MAX_TIMERS   256
+
+typedef struct WMsg { struct WMsg *next; int kind; char *data; } WMsg;   /* kind: 0 wiadomość, 1 błąd, 2 koniec */
+typedef struct SilverWorker {
+    uint64_t owner; int id;
+    volatile int stop, closing, finished, orphan;
+    net_mutex_t mu; net_cond_t cv;
+    WMsg *in_h, *in_t, *out_h, *out_t;
+    char *code, *name, *base; int is_module;
+    JSRuntime *rt; JSContext *ctx;
+    Timer timers[SILVER_WK_MAX_TIMERS];
+} SilverWorker;
+
+static SilverWorker *g_wk[SILVER_MAX_WORKERS];
+static net_mutex_t g_wk_lock;
+static int g_wk_ready = 0;
+
+static void wq_push(SilverWorker *w, int out, int kind, const char *data, size_t len) {
+    WMsg *m = (WMsg *)calloc(1, sizeof *m);
+    if (!m) return;
+    m->kind = kind;
+    m->data = (char *)malloc(len + 1);
+    if (!m->data) { free(m); return; }
+    memcpy(m->data, data, len); m->data[len] = 0;
+    net_mutex_lock(&w->mu);
+    WMsg **h = out ? &w->out_h : &w->in_h, **t = out ? &w->out_t : &w->in_t;
+    if (*t) (*t)->next = m; else *h = m;
+    *t = m;
+    net_cond_signal(&w->cv);
+    net_mutex_unlock(&w->mu);
+}
+
+static void wq_free_list(WMsg *m) { while (m) { WMsg *n = m->next; free(m->data); free(m); m = n; } }
+
+static void worker_free(SilverWorker *w) {
+    wq_free_list(w->in_h); wq_free_list(w->out_h);
+    free(w->code); free(w->name); free(w->base);
+    free(w);
+}
+
+static SilverWorker *wk_of(JSContext *ctx) { return (SilverWorker *)JS_GetContextOpaque(ctx); }
+
+static JSValue wn_post(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverWorker *w = wk_of(ctx);
+    if (!w || argc < 1) return JS_UNDEFINED;
+    size_t n = 0; const char *s = JS_ToCStringLen(ctx, &n, argv[0]);
+    if (s) { wq_push(w, 1, 0, s, n); JS_FreeCString(ctx, s); }
+    return JS_UNDEFINED;
+}
+static JSValue wn_error(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverWorker *w = wk_of(ctx);
+    if (!w || argc < 1) return JS_UNDEFINED;
+    int handled = argc > 1 && JS_ToBool(ctx, argv[1]);
+    size_t n = 0; const char *s = JS_ToCStringLen(ctx, &n, argv[0]);
+    if (s) {
+        fprintf(stderr, "[worker %s] %s\n", w->name ? w->name : "", s);
+        if (!handled) wq_push(w, 1, 1, s, n);
+        JS_FreeCString(ctx, s);
+    }
+    return JS_UNDEFINED;
+}
+static JSValue wn_log(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverWorker *w = wk_of(ctx);
+    if (argc < 2) return JS_UNDEFINED;
+    const char *lvl = JS_ToCString(ctx, argv[0]), *txt = JS_ToCString(ctx, argv[1]);
+    fprintf(stderr, "[js:%s] [worker %s] %s\n", lvl ? lvl : "log", w && w->name ? w->name : "", txt ? txt : "");
+    if (lvl) JS_FreeCString(ctx, lvl);
+    if (txt) JS_FreeCString(ctx, txt);
+    return JS_UNDEFINED;
+}
+static JSValue wn_now(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    return JS_NewFloat64(ctx, (double)now_ms());
+}
+static JSValue wn_close(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    SilverWorker *w = wk_of(ctx);
+    if (w) w->closing = 1;
+    return JS_UNDEFINED;
+}
+static JSValue wn_timer_set(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverWorker *w = wk_of(ctx);
+    if (!w || argc < 3) return JS_FALSE;
+    int32_t id = 0, delay = 0;
+    JS_ToInt32(ctx, &id, argv[0]); JS_ToInt32(ctx, &delay, argv[1]);
+    int repeat = JS_ToBool(ctx, argv[2]);
+    if (delay < 0) delay = 0;
+    if (repeat && delay < 1) delay = 1;
+    for (int i = 0; i < SILVER_WK_MAX_TIMERS; i++)
+        if (!w->timers[i].used) {
+            w->timers[i].used = 1; w->timers[i].id = id;
+            w->timers[i].due = now_ms() + delay; w->timers[i].interval = repeat ? delay : 0;
+            return JS_TRUE;
+        }
+    return JS_FALSE;
+}
+static JSValue wn_timer_clear(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverWorker *w = wk_of(ctx);
+    if (!w || argc < 1) return JS_UNDEFINED;
+    int32_t id = 0; JS_ToInt32(ctx, &id, argv[0]);
+    for (int i = 0; i < SILVER_WK_MAX_TIMERS; i++) if (w->timers[i].used && w->timers[i].id == id) w->timers[i].used = 0;
+    return JS_UNDEFINED;
+}
+
+static int is_http_url(const char *u) { return strncasecmp(u, "http://", 7) == 0 || strncasecmp(u, "https://", 8) == 0; }
+
+/* __w_read_text(url) -> string | null */
+static JSValue wn_read_text(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverWorker *w = wk_of(ctx);
+    if (argc < 1) return JS_NULL;
+    const char *url = JS_ToCString(ctx, argv[0]);
+    if (!url) return JS_NULL;
+    JSValue ret = JS_NULL;
+    if (is_http_url(url)) {
+        NetResp r;
+        if (net_http_request("GET", url, "", NULL, 0, 20000, 10, w ? &w->stop : NULL, &r) == 0 && r.status >= 200 && r.status < 300 && r.body)
+            ret = JS_NewStringLen(ctx, (const char *)r.body, r.body_len);
+        net_resp_free(&r);
+    } else {
+        size_t len = 0; char *src = read_whole_file(url, &len);
+        if (src) { ret = JS_NewStringLen(ctx, src, len); free(src); }
+    }
+    JS_FreeCString(ctx, url);
+    return ret;
+}
+
+/* __w_fetch(method, url, headers, body, timeoutMs, maxRedirects) -> {status,statusText,headers,body,url,redirected} | {error} */
+static JSValue wn_fetch(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverWorker *w = wk_of(ctx);
+    JSValue o = JS_NewObject(ctx);
+    if (argc < 6) { JS_SetPropertyStr(ctx, o, "error", JS_NewString(ctx, "argumenty")); return o; }
+    int32_t tmo = 30000, red = 20; JS_ToInt32(ctx, &tmo, argv[4]); JS_ToInt32(ctx, &red, argv[5]);
+    const char *method = JS_ToCString(ctx, argv[0]), *url = JS_ToCString(ctx, argv[1]), *hdrs = JS_ToCString(ctx, argv[2]);
+    const unsigned char *body = NULL; size_t blen = 0; const char *bstr = NULL;
+    if (JS_IsString(argv[3])) { bstr = JS_ToCStringLen(ctx, &blen, argv[3]); body = (const unsigned char *)bstr; }
+    else if (JS_IsObject(argv[3])) { size_t sz = 0; uint8_t *ab = JS_GetArrayBuffer(ctx, &sz, argv[3]); if (ab) { body = ab; blen = sz; } else { JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex); } }
+    if (method && url && is_http_url(url)) {
+        NetResp r;
+        if (net_http_request(method, url, hdrs ? hdrs : "", body, blen, tmo, red, w ? &w->stop : NULL, &r) == 0) {
+            JS_SetPropertyStr(ctx, o, "status", JS_NewInt32(ctx, r.status));
+            JS_SetPropertyStr(ctx, o, "statusText", JS_NewString(ctx, r.status_text));
+            JS_SetPropertyStr(ctx, o, "headers", JS_NewString(ctx, r.headers ? r.headers : ""));
+            JS_SetPropertyStr(ctx, o, "body", JS_NewArrayBufferCopy(ctx, r.body ? r.body : (const uint8_t *)"", r.body ? r.body_len : 0));
+            JS_SetPropertyStr(ctx, o, "url", JS_NewString(ctx, r.final_url ? r.final_url : url));
+            JS_SetPropertyStr(ctx, o, "redirected", JS_NewBool(ctx, r.redirected));
+        } else JS_SetPropertyStr(ctx, o, "error", JS_NewString(ctx, r.err));
+        net_resp_free(&r);
+    } else if (url) {                                  /* plik lokalny / zasób wbudowany */
+        size_t len = 0; char *src = read_whole_file(url, &len);
+        if (src) {
+            JS_SetPropertyStr(ctx, o, "status", JS_NewInt32(ctx, 200));
+            JS_SetPropertyStr(ctx, o, "statusText", JS_NewString(ctx, "OK"));
+            JS_SetPropertyStr(ctx, o, "headers", JS_NewString(ctx, ""));
+            JS_SetPropertyStr(ctx, o, "body", JS_NewArrayBufferCopy(ctx, (const uint8_t *)src, len));
+            JS_SetPropertyStr(ctx, o, "url", JS_NewString(ctx, url));
+            JS_SetPropertyStr(ctx, o, "redirected", JS_FALSE);
+            free(src);
+        } else JS_SetPropertyStr(ctx, o, "error", JS_NewString(ctx, "nie znaleziono pliku"));
+    }
+    if (method) JS_FreeCString(ctx, method);
+    if (url) JS_FreeCString(ctx, url);
+    if (hdrs) JS_FreeCString(ctx, hdrs);
+    if (bstr) JS_FreeCString(ctx, bstr);
+    return o;
+}
+
+static int worker_interrupt(void *unused, void *opaque) {
+    (void)unused;
+    return ((SilverWorker *)opaque)->stop;
+}
+
+static void wk_report(SilverWorker *w, const char *where) {
+    JSContext *ctx = w->ctx;
+    JSValue exc = JS_GetException(ctx);
+    const char *msg = JS_ToCString(ctx, exc);
+    const char *stack = NULL; JSValue st = JS_UNDEFINED;
+    if (JS_IsObject(exc)) { st = JS_GetPropertyStr(ctx, exc, "stack"); if (!JS_IsUndefined(st)) stack = JS_ToCString(ctx, st); }
+    if (!w->stop) {
+        char buf[4096];
+        snprintf(buf, sizeof buf, "%s%s%s%s", msg ? msg : "(wyjątek)", stack ? "\n" : "", stack ? stack : "", where && where[0] ? "" : "");
+        fprintf(stderr, "[worker %s] %s: %s\n", w->name ? w->name : "", where ? where : "", buf);
+        wq_push(w, 1, 1, buf, strlen(buf));
+    }
+    if (msg) JS_FreeCString(ctx, msg);
+    if (stack) JS_FreeCString(ctx, stack);
+    JS_FreeValue(ctx, st); JS_FreeValue(ctx, exc);
+}
+
+static void wk_drain(SilverWorker *w) {
+    for (;;) {
+        JSContext *jc = NULL;
+        int r = JS_ExecutePendingJob(w->rt, &jc);
+        if (r == 0) break;
+        if (r < 0) wk_report(w, "zadanie Promise");
+    }
+}
+
+static void wk_call(SilverWorker *w, const char *fname, const char *a, const char *b, int nargs) {
+    JSContext *ctx = w->ctx;
+    JSValue g = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, g, fname);
+    if (JS_IsFunction(ctx, fn)) {
+        JSValue args[2] = { JS_NewString(ctx, a ? a : ""), JS_NewString(ctx, b ? b : "") };
+        JSValue ret = JS_Call(ctx, fn, g, nargs, args);
+        if (JS_IsException(ret)) wk_report(w, fname);
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]);
+    }
+    JS_FreeValue(ctx, fn); JS_FreeValue(ctx, g);
+    wk_drain(w);
+}
+
+static void *worker_main(void *arg) {
+    SilverWorker *w = (SilverWorker *)arg;
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+    if (!ctx) {
+        if (rt) JS_FreeRuntime(rt);
+        wq_push(w, 1, 1, "Worker: brak pamięci na środowisko JS", 38);
+        goto done;
+    }
+    w->rt = rt; w->ctx = ctx;
+    JS_SetMemoryLimit(rt, SILVER_MEM_LIMIT);
+    JS_SetMaxStackSize(rt, SILVER_STACK_LIMIT);
+    JS_SetInterruptHandler(rt, (JSInterruptHandler *)worker_interrupt, w);
+    JS_SetModuleLoaderFunc(rt, mod_normalize, mod_loader, NULL);
+    JS_SetContextOpaque(ctx, w);
+    JSValue g = JS_GetGlobalObject(ctx);
+    set_fn(ctx, g, "__w_post", wn_post, 1);
+    set_fn(ctx, g, "__w_error", wn_error, 2);
+    set_fn(ctx, g, "__w_log", wn_log, 2);
+    set_fn(ctx, g, "__w_now", wn_now, 0);
+    set_fn(ctx, g, "__w_close", wn_close, 0);
+    set_fn(ctx, g, "__w_timer_set", wn_timer_set, 3);
+    set_fn(ctx, g, "__w_timer_clear", wn_timer_clear, 1);
+    set_fn(ctx, g, "__w_read_text", wn_read_text, 1);
+    set_fn(ctx, g, "__w_fetch", wn_fetch, 6);
+    set_fn(ctx, g, "__silver_utf8_decode", native_utf8_decode, 1);
+    set_fn(ctx, g, "__silver_utf8_encode", native_utf8_encode, 1);
+    JS_FreeValue(ctx, g);
+
+    JSValue r = JS_Eval(ctx, (const char *)silver_worker_js, silver_worker_js_len, "silver_worker.js", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(r)) { wk_report(w, "silver_worker.js"); JS_FreeValue(ctx, r); goto cleanup; }
+    JS_FreeValue(ctx, r);
+    wk_call(w, "__w_init", w->name ? w->name : "", w->base ? w->base : "", 2);
+
+    if (w->is_module) {
+        JSValue fv = JS_Eval(ctx, w->code, strlen(w->code), w->base ? w->base : "worker.mjs", JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(fv)) wk_report(w, "moduł Workera");
+        else {
+            JSValue res = JS_EvalFunction(ctx, fv);
+            if (JS_IsException(res)) wk_report(w, "moduł Workera");
+            JS_FreeValue(ctx, res);
+        }
+    } else {
+        JSValue res = JS_Eval(ctx, w->code, strlen(w->code), w->base && w->base[0] ? w->base : "worker.js", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(res)) wk_report(w, "skrypt Workera");
+        JS_FreeValue(ctx, res);
+    }
+    wk_drain(w);
+
+    while (!w->stop && !w->closing) {
+        WMsg *batch = NULL;
+        net_mutex_lock(&w->mu);
+        if (!w->in_h) {
+            int64_t now = now_ms(), wait = 100;
+            for (int i = 0; i < SILVER_WK_MAX_TIMERS; i++)
+                if (w->timers[i].used) { int64_t d = w->timers[i].due - now; if (d < 0) d = 0; if (d < wait) wait = d; }
+            if (wait > 0) net_cond_wait_ms(&w->cv, &w->mu, (int)wait);
+        }
+        batch = w->in_h; w->in_h = w->in_t = NULL;
+        net_mutex_unlock(&w->mu);
+        for (WMsg *m = batch; m && !w->stop && !w->closing; m = m->next) wk_call(w, "__w_deliver", m->data, NULL, 1);
+        wq_free_list(batch);
+        int64_t now = now_ms();
+        for (int i = 0; i < SILVER_WK_MAX_TIMERS && !w->stop && !w->closing; i++) {
+            Timer *t = &w->timers[i];
+            if (!t->used || t->due > now) continue;
+            int id = t->id;
+            if (t->interval > 0) t->due = now + t->interval; else t->used = 0;
+            char idb[24]; snprintf(idb, sizeof idb, "%d", id);
+            wk_call(w, "__w_fire_timer", idb, NULL, 1);
+        }
+        wk_drain(w);
+    }
+cleanup:
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    w->ctx = NULL; w->rt = NULL;
+done:
+    wq_push(w, 1, 2, "", 0);
+    net_mutex_lock(&g_wk_lock);
+    w->finished = 1;
+    int orphan = w->orphan;
+    net_mutex_unlock(&g_wk_lock);
+    if (orphan) worker_free(w);
+    return NULL;
+}
+
+static void wk_lock_ensure(void) { if (!g_wk_ready) { net_mutex_init(&g_wk_lock); g_wk_ready = 1; } }
+
+static int wk_index(SilverJsCtx *sc, int id) {
+    for (int i = 0; i < SILVER_MAX_WORKERS; i++) if (g_wk[i] && g_wk[i]->owner == sc->gen && g_wk[i]->id == id) return i;
+    return -1;
+}
+
+/* __silver_worker_spawn(id, code, name, baseUrl, isModule) -> bool */
+static JSValue native_worker_spawn(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverJsCtx *sc = by_ctx(ctx);
+    if (!sc || argc < 5) return JS_FALSE;
+    wk_lock_ensure();
+    int slot = -1;
+    for (int i = 0; i < SILVER_MAX_WORKERS; i++) if (!g_wk[i]) { slot = i; break; }
+    if (slot < 0) return JS_FALSE;
+    int32_t id = 0; JS_ToInt32(ctx, &id, argv[0]);
+    SilverWorker *w = (SilverWorker *)calloc(1, sizeof *w);
+    if (!w) return JS_FALSE;
+    const char *code = JS_ToCString(ctx, argv[1]), *name = JS_ToCString(ctx, argv[2]), *base = JS_ToCString(ctx, argv[3]);
+    w->owner = sc->gen; w->id = id; w->is_module = JS_ToBool(ctx, argv[4]);
+    w->code = strdup(code ? code : ""); w->name = strdup(name ? name : ""); w->base = strdup(base ? base : "");
+    if (code) JS_FreeCString(ctx, code);
+    if (name) JS_FreeCString(ctx, name);
+    if (base) JS_FreeCString(ctx, base);
+    net_mutex_init(&w->mu); net_cond_init(&w->cv);
+    g_wk[slot] = w;
+    if (!net_thread_start(worker_main, w)) { g_wk[slot] = NULL; worker_free(w); return JS_FALSE; }
+    return JS_TRUE;
+}
+
+/* __silver_worker_post(id, text) -> bool */
+static JSValue native_worker_post(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverJsCtx *sc = by_ctx(ctx);
+    if (!sc || argc < 2) return JS_FALSE;
+    int32_t id = 0; JS_ToInt32(ctx, &id, argv[0]);
+    int i = wk_index(sc, id);
+    if (i < 0 || g_wk[i]->stop) return JS_FALSE;
+    size_t n = 0; const char *s = JS_ToCStringLen(ctx, &n, argv[1]);
+    if (!s) return JS_FALSE;
+    wq_push(g_wk[i], 0, 0, s, n);
+    JS_FreeCString(ctx, s);
+    return JS_TRUE;
+}
+
+/* __silver_worker_terminate(id) */
+static JSValue native_worker_terminate(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    SilverJsCtx *sc = by_ctx(ctx);
+    if (!sc || argc < 1) return JS_UNDEFINED;
+    int32_t id = 0; JS_ToInt32(ctx, &id, argv[0]);
+    int i = wk_index(sc, id);
+    if (i >= 0) { SilverWorker *w = g_wk[i]; w->stop = 1; net_mutex_lock(&w->mu); net_cond_signal(&w->cv); net_mutex_unlock(&w->mu); }
+    return JS_UNDEFINED;
+}
+
+static int wk_any(SilverJsCtx *sc) {
+    for (int i = 0; i < SILVER_MAX_WORKERS; i++) if (g_wk[i] && g_wk[i]->owner == sc->gen) return 1;
+    return 0;
+}
+
+/* odbiera komunikaty od Workerów (z js_tick) i sprząta zakończone */
+static void wk_pump(SilverJsCtx *sc) {
+    if (!g_wk_ready) return;
+    for (int i = 0; i < SILVER_MAX_WORKERS; i++) {
+        SilverWorker *w = g_wk[i];
+        if (!w || w->owner != sc->gen) continue;
+        int exited = 0;
+        for (;;) {
+            net_mutex_lock(&w->mu);
+            WMsg *m = w->out_h;
+            if (m) { w->out_h = m->next; if (!w->out_h) w->out_t = NULL; }
+            net_mutex_unlock(&w->mu);
+            if (!m) break;
+            if (m->kind == 2) exited = 1;
+            JSContext *ctx = sc->ctx;
+            JSValue fn = JS_GetPropertyStr(ctx, sc->global, "__silver_worker_event");
+            if (JS_IsFunction(ctx, fn)) {
+                JSValue a[3] = { JS_NewInt32(ctx, w->id), JS_NewString(ctx, m->kind == 0 ? "message" : m->kind == 1 ? "error" : "exit"), JS_NewString(ctx, m->data) };
+                enter_js(sc);
+                JSValue ret = JS_Call(ctx, fn, sc->global, 3, a);
+                if (JS_IsException(ret)) report_exception(sc, "__silver_worker_event");
+                JS_FreeValue(ctx, ret);
+                for (int k = 0; k < 3; k++) JS_FreeValue(ctx, a[k]);
+                leave_js(sc);
+            }
+            JS_FreeValue(ctx, fn);
+            free(m->data); free(m);
+            if (g_wk[i] != w) break;                    /* ktoś zmienił rejestr w obsłudze zdarzenia */
+        }
+        if (exited && g_wk[i] == w) {
+            net_mutex_lock(&g_wk_lock);
+            int fin = w->finished;
+            net_mutex_unlock(&g_wk_lock);
+            if (fin) { g_wk[i] = NULL; worker_free(w); }
+        }
+    }
+}
+
+/* zamyka wszystkie Workery kontekstu (js_shutdown) */
+static void wk_shutdown(SilverJsCtx *sc) {
+    if (!g_wk_ready) return;
+    for (int i = 0; i < SILVER_MAX_WORKERS; i++) {
+        SilverWorker *w = g_wk[i];
+        if (!w || w->owner != sc->gen) continue;
+        w->stop = 1;
+        net_mutex_lock(&w->mu); net_cond_signal(&w->cv); net_mutex_unlock(&w->mu);
+    }
+    int64_t until = now_ms() + 1500;
+    for (int i = 0; i < SILVER_MAX_WORKERS; i++) {
+        SilverWorker *w = g_wk[i];
+        if (!w || w->owner != sc->gen) continue;
+        for (;;) {
+            net_mutex_lock(&g_wk_lock);
+            int fin = w->finished;
+            if (!fin && now_ms() >= until) w->orphan = 1;     /* wątek sam się posprząta po zakończeniu */
+            net_mutex_unlock(&g_wk_lock);
+            if (fin) { worker_free(w); break; }
+            if (w->orphan) break;
+            net_sleep_ms(2);
+        }
+        g_wk[i] = NULL;
+    }
+}
 
 /* ====================================================================
  *  0.3: moduły ES (import/export) — loader z systemu plików
  * ==================================================================== */
 static char *mod_normalize(JSContext *ctx, const char *base, const char *name, void *opaque) {
     (void)opaque;
+    /* 0.5: moduły po URL — import('https://…') oraz importy względne wewnątrz takiego modułu */
+    if (base && is_http_url(base) && (name[0] == '.' || name[0] == '/') && !is_http_url(name)) {
+        NetUrl bu;
+        if (net_url_parse(base, &bu)) {
+            char *j = net_url_join(&bu, name);
+            net_url_free(&bu);
+            if (j) { char *r = js_strdup(ctx, j); free(j); return r; }
+        }
+    }
     if (name[0] != '.') return js_strdup(ctx, name);
     size_t dl = 0;
     const char *slash = strrchr(base, '/');
@@ -1097,8 +1620,21 @@ static char *mod_normalize(JSContext *ctx, const char *base, const char *name, v
 static JSModuleDef *mod_loader(JSContext *ctx, const char *name, void *opaque) {
     (void)opaque;
     size_t len = 0;
-    char *src = read_whole_file(name, &len);
+    char *src = NULL;
     char *alt = NULL;
+    if (is_http_url(name)) {
+        const char *off = getenv("SILVER_NO_REMOTE_IMPORT");
+        if (off && off[0] == '1') { JS_ThrowReferenceError(ctx, "import po URL wyłączony (SILVER_NO_REMOTE_IMPORT=1): '%s'", name); return NULL; }
+        NetResp r;
+        if (net_http_request("GET", name, "Accept: text/javascript, application/javascript, */*\n", NULL, 0, 20000, 10, NULL, &r) != 0
+            || r.status < 200 || r.status >= 300 || !r.body) {
+            JS_ThrowReferenceError(ctx, "nie można pobrać modułu '%s' (%s)", name, r.err[0] ? r.err : "błąd HTTP");
+            net_resp_free(&r);
+            return NULL;
+        }
+        src = (char *)r.body; len = r.body_len; r.body = NULL;       /* nb_add gwarantuje końcowe \0 */
+        net_resp_free(&r);
+    } else src = read_whole_file(name, &len);
     if (!src) {
         static const char *suffixes[] = { ".js", ".mjs", "/index.js", "/index.mjs" };
         size_t nl = strlen(name);
@@ -1200,6 +1736,8 @@ int js_tick(int h) {
         fired++;
     }
     ws_poll(sc);
+    fetch_deliver(sc);
+    wk_pump(sc);
     enter_js(sc);
     leave_js(sc);
     flush_rejections(sc->ctx, 0);
@@ -1218,10 +1756,25 @@ int js_next_timer_ms(int h) {
         if (best < 0 || d < best) best = d;
     }
     if (ws_any_open(sc) && (best < 0 || best > 15)) best = 15;   /* odpytuj gniazda WebSocket */
+    if ((net_jobs_pending(sc->gen) > 0 || wk_any(sc)) && (best < 0 || best > 8)) best = 8;   /* wyniki fetch i komunikaty Workerów */
     return (int)best;
 }
 
 int js_has_jobs(int h) { return VALID(h) ? (JS_IsJobPending(g_ctx[h].rt) ? 1 : 0) : 0; }
+
+/* 0.5 (testy): kopiuje globalną zmienną JS (jako tekst) do bufora; zwraca 1, gdy istnieje */
+int js_get_global_string(int h, const char *name, char *out, int cap) {
+    if (!VALID(h) || !name || cap < 1) return 0;
+    SilverJsCtx *sc = &g_ctx[h];
+    JSValue v = JS_GetPropertyStr(sc->ctx, sc->global, name);
+    int ok = 0;
+    if (!JS_IsUndefined(v)) {
+        const char *c = JS_ToCString(sc->ctx, v);
+        if (c) { snprintf(out, (size_t)cap, "%s", c); JS_FreeCString(sc->ctx, c); ok = 1; }
+    }
+    JS_FreeValue(sc->ctx, v);
+    return ok;
+}
 
 const char *js_last_error(int h) { return VALID(h) ? g_ctx[h].last_error : ""; }
 
@@ -1230,6 +1783,8 @@ int js_shutdown(int h) {
     SilverJsCtx *sc = &g_ctx[h];
     while (sc->count > 0) js_poll_invoke(h);
     ws_close_all(sc);
+    wk_shutdown(sc);
+    net_jobs_discard(sc->gen);
     free(sc->poll_buf);
     JS_FreeValue(sc->ctx, sc->global);
     flush_rejections(sc->ctx, 1);
