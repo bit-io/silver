@@ -88,6 +88,7 @@ pub struct InteractionState is
     pub cq_w:        [int]     ;; @container: szerokość zawartości kontenera wg id węzła (-1 = nie jest kontenerem)
     pub cq_h:        [int]     ;; wysokość (-1 = brak / kontener tylko w osi inline)
     pub cq_names:    [string]  ;; nazwy kontenerów wg id węzła, spacjami
+    pub cq_vars:     [string]  ;; 0.5: zmienne CSS ("\u0002--nazwa\u0001wartość…") wg id węzła — dla zapytań @container style(--x: v)
     pub excl:        [int]     ;; wykluczenia wrap-flow: grupy [x, y, w, h, tryb, id węzła]
     pub tcur:        int       ;; :target-current — id węzła aktualnego odnośnika grupy scroll-target-group (-1 = brak)
 end
@@ -95,23 +96,23 @@ end
 pub fn copy_interaction(i: InteractionState) -> InteractionState is
     return InteractionState { hovered_id: i.hovered_id, focused_id: i.focused_id, active_id: i.active_id, focused_node: i.focused_node,
                               viewport_w: i.viewport_w, viewport_h: i.viewport_h, dark: i.dark, forced: i.forced, print: i.print, print_bg: i.print_bg,
-                              cq_w: i.cq_w, cq_h: i.cq_h, cq_names: i.cq_names, excl: i.excl, tcur: i.tcur }
+                              cq_w: i.cq_w, cq_h: i.cq_h, cq_names: i.cq_names, cq_vars: i.cq_vars, excl: i.excl, tcur: i.tcur }
 end
 
 pub fn no_interaction() -> InteractionState is
     return InteractionState { hovered_id: -1, focused_id: "", active_id: -1, focused_node: -1,
-                              viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], excl: [], tcur: -1 }
+                              viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], cq_vars: [], excl: [], tcur: -1 }
 end
 
 pub fn interaction(hovered: int, focused_node: int, active: int) -> InteractionState is
     return InteractionState { hovered_id: hovered, focused_id: "", active_id: active,
-                              focused_node: focused_node, viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], excl: [], tcur: -1 }
+                              focused_node: focused_node, viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], cq_vars: [], excl: [], tcur: -1 }
 end
 
 ;; Zgodność z 0.1: fokus po attr_id zamiast id węzła.
 pub fn ix_legacy(hovered: int, focused_id: string, active: int) -> InteractionState is
     return InteractionState { hovered_id: hovered, focused_id: focused_id, active_id: active, focused_node: -1,
-                              viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], excl: [], tcur: -1 }
+                              viewport_w: 800, viewport_h: 600, dark: false, forced: false, print: false, print_bg: false, cq_w: [], cq_h: [], cq_names: [], cq_vars: [], excl: [], tcur: -1 }
 end
 
 pub fn empty_sheet() -> Stylesheet is
@@ -891,7 +892,7 @@ fn import_entry(raw: string) -> string is
     return url + "\u0001" + rest
 end
 
-;; Preferencja formatu czcionki: TTF/OTF/TTC (3) > WOFF (2, dekodowany w warstwie natywnej) > reszta (WOFF2 — 0).
+;; Preferencja formatu czcionki: TTF/OTF/TTC (3) > WOFF (2) > WOFF2 (1; dekodowany w warstwie natywnej przez Brotli, 0.5) > reszta (0).
 pub fn font_src_score(u: string) -> int is
     let mut lu: string = string_lower(u)
     let q: int = string_find(lu, "?")
@@ -900,6 +901,7 @@ pub fn font_src_score(u: string) -> int is
     if h >= 0 is lu = string_slice(lu, 0, h) end
     if string_ends_with(lu, ".ttf") || string_ends_with(lu, ".otf") || string_ends_with(lu, ".ttc") is return 3 end
     if string_ends_with(lu, ".woff") is return 2 end
+    if string_ends_with(lu, ".woff2") is return 1 end
     return 0
 end
 
@@ -1919,7 +1921,10 @@ pub fn cq_matches(cqs: string, d: dom::Dom, start: int, ix: InteractionState) ->
     while i < array_len(conds) is
         let parts: [string] = cq_split(conds[i])
         i += 1
-        if string_starts_with(parts[1], "style(") is return false end
+        if string_starts_with(parts[1], "style(") is
+            if !cq_style_ok(parts[0], parts[1], d, start, ix) is return false end
+            continue
+        end
         let c: int = cq_find_container(d, start, parts[0], ix)
         if c < 0 is return false end
         let mut ix2: InteractionState = ix
@@ -1930,10 +1935,138 @@ pub fn cq_matches(cqs: string, d: dom::Dom, start: int, ix: InteractionState) ->
     return true
 end
 
+
+;; ---------- 0.5: @container style(--nazwa: wartość) oraz jednostki kontenera ----------
+;; Wartość zmiennej CSS z łańcucha "\u0002--nazwa\u0001wartość\u0002--inna\u0001…" ("" gdy brak).
+fn cq_var_value(vars: string, key: string) -> string is
+    let needle: string = "\u0002" + key + "\u0001"
+    let at: int = string_find(vars, needle)
+    if at < 0 is return "" end
+    let from: int = at + string_len(needle)
+    let rest: string = string_slice(vars, from, string_len(vars))
+    let nx: int = string_find(rest, "\u0002")
+    if nx < 0 is return rest end
+    return string_slice(rest, 0, nx)
+end
+
+;; style(--x: v) → prawda, gdy zmienna --x przodka ma wartość v; style(--x) → zmienna jest ustawiona.
+;; Bez nazwy kontenera pytamy rodzica elementu, z nazwą — najbliższy kontener o tej nazwie.
+fn cq_style_ok(name: string, cond: string, d: dom::Dom, start: int, ix: InteractionState) -> bool is
+    let e: int = paren_end(cond, 5)
+    if e < 0 is return false end
+    let inner: string = string_trim(string_slice(cond, 6, e))
+    let mut c: int = -1
+    if name == "" is c = d.nodes[start].parent end
+    if name != "" is c = cq_find_container(d, start, name, ix) end
+    if c <= 0 || c >= array_len(ix.cq_vars) is return false end
+    let vars: string = ix.cq_vars[c]
+    let colon: int = string_find(inner, ":")
+    if colon < 0 is return cq_var_value(vars, string_trim(inner)) != "" end
+    let key: string = string_trim(string_slice(inner, 0, colon))
+    let want: string = string_lower(string_trim(string_slice(inner, colon + 1, string_len(inner))))
+    return string_lower(string_trim(cq_var_value(vars, key))) == want
+end
+
+fn cq_is_numch(c: string) -> bool is
+    return c != "" && string_find("0123456789.", c) >= 0
+end
+
+fn cq_unit_at(s: string, i: int) -> string is
+    let n: int = string_len(s)
+    if i + 5 <= n is
+        let u5: string = string_slice(s, i, i + 5)
+        if u5 == "cqmin" || u5 == "cqmax" is return u5 end
+    end
+    if i + 3 <= n is
+        let u3: string = string_slice(s, i, i + 3)
+        if u3 == "cqw" || u3 == "cqh" || u3 == "cqi" || u3 == "cqb" is return u3 end
+    end
+    return ""
+end
+
+;; Jednostki kontenera cqw/cqh/cqi/cqb/cqmin/cqmax → calc(N * Wpx / 100). cw/ch = rozmiar zawartości najbliższego
+;; kontenera (px); bez kontenera (przebieg pomiarowy, brak przodka) używany jest rozmiar viewportu.
+pub fn cq_rewrite_units(val: string, cw: int, ch: int) -> string is
+    if string_find(val, "cq") < 0 is return val end
+    let n: int = string_len(val)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(val, i)
+        let mut st: int = i
+        if (c == "-" || c == "+") && i + 1 < n && cq_is_numch(string_at(val, i + 1)) is st = i + 1 end
+        if cq_is_numch(string_at(val, st)) is
+            let mut j: int = st
+            while j < n && cq_is_numch(string_at(val, j)) is j += 1 end
+            let unit: string = cq_unit_at(val, j)
+            if unit == "" is
+                out = out + string_slice(val, i, j)
+                i = j
+            end
+            if unit != "" is
+                let mut px: int = cw
+                if unit == "cqh" || unit == "cqb" is px = ch end
+                if unit == "cqmin" is px = if cw < ch then cw else ch end
+                if unit == "cqmax" is px = if cw > ch then cw else ch end
+                let sign: string = if st > i then c else ""
+                out = out + "calc(" + sign + string_slice(val, st, j) + " * " + to_string(px) + "px / 100)"
+                i = j + string_len(unit)
+            end
+        end
+        if !cq_is_numch(string_at(val, st)) is
+            out = out + c
+            i += 1
+        end
+    end
+    return out
+end
+
+;; Podstawia jednostki kontenera w deklaracjach węzła (rzadkie: tylko gdy wartość zawiera "cq").
+fn cq_apply_units(decls: [CssDecl], d: dom::Dom, target: int, ix: InteractionState) -> [CssDecl] is
+    let mut any: bool = false
+    let mut k: int = 0
+    while k < array_len(decls) is
+        if string_find(decls[k].val, "cq") >= 0 is any = true end
+        k += 1
+    end
+    if !any is return decls end
+    let mut cw: int = ix.viewport_w
+    let mut ch: int = ix.viewport_h
+    let par: int = if target >= 0 && target < array_len(d.nodes) then d.nodes[target].parent else -1
+    let c: int = if par > 0 then cq_find_container(d, par, "", ix) else -1
+    if c > 0 is
+        cw = ix.cq_w[c]
+        if ix.cq_h[c] >= 0 is ch = ix.cq_h[c] end
+    end
+    let mut out: [CssDecl] = []
+    k = 0
+    while k < array_len(decls) is
+        let dc: CssDecl = decls[k]
+        out = array_push(out, CssDecl { prop: dc.prop, val: cq_rewrite_units(dc.val, cw, ch), important: dc.important })
+        k += 1
+    end
+    return out
+end
+
+;; 0.5: czy któraś reguła ma warunek @container style(...) (wtedy drugi przebieg jest potrzebny nawet bez container-type)
+pub fn sheet_has_style_cq(sheet: Stylesheet) -> bool is
+    let mut i: int = 0
+    while i < array_len(sheet.rules) is
+        if string_find(sheet.rules[i].cq, "style(") >= 0 is return true end
+        i += 1
+    end
+    return false
+end
+
 pub fn sheet_has_cq(sheet: Stylesheet) -> bool is
     let mut i: int = 0
     while i < array_len(sheet.rules) is
         if sheet.rules[i].cq != "" is return true end
+        let mut j: int = 0
+        while j < array_len(sheet.rules[i].decls) is   ;; 0.5: jednostki cqw/cqh/… też wymagają przebiegu pomiarowego kontenerów
+            if string_find(sheet.rules[i].decls[j].val, "cq") >= 0 is return true end
+            j += 1
+        end
         i += 1
     end
     return false
@@ -2032,7 +2165,7 @@ pub fn matching_decls_ctx(sheet: Stylesheet, d: dom::Dom, node_id: int, ix: Inte
         end
         pass += 1
     end
-    return decls
+    return cq_apply_units(decls, d, target, ix)
 end
 
 ;; Wersja bez kontekstu drzewa (testy, proste zastosowania): dopasowuje po
