@@ -57,3 +57,16 @@ Rysowanie: `silver_fill_round_rect`, `silver_stroke_round_rect`, `silver_fill_gr
 (rozmiar + styl), `silver_text_fit` (zawijanie), `silver_draw_image`. UTF-8: `silver_utf8_prev/next/len/offset`.
 JS: `js_init` (ładuje wbudowane API), `js_load_file`, `js_eval`, `js_poll_invoke`, `js_resolve/reject`, `js_emit`, `js_tick`,
 `js_next_timer_ms`, `js_set_budget`, `js_last_error`.
+
+
+## 0.5 — nowe moduły
+| Plik | Rola |
+|---|---|
+| `silver_net.h` | gniazda POSIX/Winsock, TLS (OpenSSL, `SILVER_TLS`), klient HTTP/1.1+HTTPS, asynchroniczne zadania w wątkach, wątki/muteksy |
+| `silver_woff2.h` | dekoder WOFF2 → SFNT (Brotli, transformacje glyf/loca/hmtx); `SILVER_WOFF2` |
+| `silver_quickjs_shim.c` | `fetch` natywny, Workery w wątkach (osobny `JSRuntime`), `import()` po URL, `__silver_read_text`, szybkie UTF-8 |
+| `tests/run-all.sh` | wszystkie testy natywne (patrz niżej) |
+
+`sh native/tests/run-all.sh` buduje i uruchamia: `net_test` (klient HTTP/TLS), testy JS w QuickJS (`tests/js/t_*.js`: fetch, Worker, import()+wss, Shadow DOM,
+Intl+structuredClone), test dekodera WOFF2 (wymaga fontTools), selftest SDL2 (`software` i `auto`). Zmienne: `CC`, `QUICKJS_DIR`, `SILVER_TLS=0`.
+Serwer testowy: `tests/net_server.py` (HTTP, HTTPS z certyfikatem własnym, WebSocket echo, moduły ES).
