@@ -12,7 +12,8 @@
 #   SILVER_STATIC     1 (domyślnie): zbuduj statyczny SDL2 (X11 + Wayland) i linkuj w pełni statycznie
 #                     0: tylko warianty dynamiczne (`h# compile --dynamic`)
 #   SILVER_WAYLAND    1 (domyślnie): statyczny SDL z Waylandem, 0: tylko X11 (patrz build-static-deps.sh)
-#   SILVER_TLS        1 (domyślnie, gdy jest OpenSSL .a): wss:// w WebSocket; 0: bez TLS
+#   SILVER_TLS        1 (domyślnie, gdy jest OpenSSL .a): wss:// w WebSocket i https:// we fetch(); 0: bez TLS
+#   SILVER_WOFF2      1 (domyślnie, gdy jest libbrotlidec): dekodowanie czcionek WOFF2; 0: bez WOFF2
 set -eu
 cd "$(dirname "$0")"
 OUT=build
@@ -22,7 +23,9 @@ AR="${AR:-ar}"
 CFLAGS="${CFLAGS:--O2 -fPIC -Wall -Wextra -Wno-unused-parameter}"
 VERSION="$(cat ../VERSION 2>/dev/null || echo 0.5.0)"
 
-if [ "${SILVER_STATIC:-1}" = "1" ] && [ ! -f "$OUT/deps/lib/libSDL2.a" ]; then
+# 0.5: zawsze wołaj build-static-deps.sh (sam pomija pracę, gdy cache jest aktualny ORAZ ma Wayland, o ile Wayland jest wymagany) —
+# dawniej stary cache bez Waylanda był używany w nieskończoność i aplikacje startowały przez X11.
+if [ "${SILVER_STATIC:-1}" = "1" ]; then
     sh ./build-static-deps.sh
 fi
 
@@ -41,14 +44,34 @@ else
     echo "[silver] UWAGA: brak harfbuzz/freetype2 (pkg-config) — font-variant-alternates, font-language-override, font-palette i font-optical-sizing bez efektu (apt install libharfbuzz-dev libfreetype-dev)"
 fi
 
+# 0.5: WOFF2 (Brotli) — libbrotlidec przez pkg-config
+WOFF2_CFLAGS=""; WOFF2_LIBS=""
+if [ "${SILVER_WOFF2:-1}" = "1" ] && command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libbrotlidec 2>/dev/null; then
+    WOFF2_CFLAGS="-DSILVER_WOFF2=1 $(pkg-config --cflags libbrotlidec)"
+    WOFF2_LIBS="$(pkg-config --libs libbrotlidec)"
+    echo "[silver] WOFF2: libbrotlidec"
+else
+    echo "[silver] UWAGA: brak libbrotlidec (apt install libbrotli-dev) — czcionki WOFF2 będą pomijane (WOFF/TTF/OTF działają)"
+fi
+# Windows (MSYS2/MinGW): Winsock dla WebSocket i fetch
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) NET_LIBS="-lws2_32" ;; *) NET_LIBS="" ;; esac
+
+# 0.5: prezenter wl_shm (Wayland bez OpenGL) — wymaga nagłówków i libwayland-client
+WLC_CFLAGS=""; WLC_LIBS=""
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists wayland-client 2>/dev/null; then
+    WLC_CFLAGS="$(pkg-config --cflags wayland-client)"; WLC_LIBS="$(pkg-config --libs wayland-client)"
+fi
+WL_STATIC_CFLAGS=""
+if [ "$(cat "$OUT/wayland.flag" 2>/dev/null || echo 0)" = "1" ]; then WL_STATIC_CFLAGS="-I$OUT/deps/include"; fi
+
 echo "[silver] libsilvershim.a (SDL2)"
 # shellcheck disable=SC2086
-$CC $CFLAGS $SDL_CFLAGS $SHAPE_CFLAGS -DSILVER_VERSION="\"$VERSION\"" -c silver_shim.c -o "$OUT/silver_shim.o"
+$CC $CFLAGS $SDL_CFLAGS $SHAPE_CFLAGS $WOFF2_CFLAGS $WLC_CFLAGS -DSILVER_VERSION="\"$VERSION\"" -c silver_shim.c -o "$OUT/silver_shim.o"
 $AR rcs "$OUT/libsilvershim.a" "$OUT/silver_shim.o"
 if [ -x "$OUT/deps/bin/sdl2-config" ]; then
     echo "[silver] libsilvershim_static.a (SDL2, domyślnie renderer programowy)"
     # shellcheck disable=SC2086
-    $CC $CFLAGS $SDL_CFLAGS -DSILVER_VERSION="\"$VERSION\"" -DSILVER_STATIC_BUILD=1 -c silver_shim.c -o "$OUT/silver_shim_static.o"
+    $CC $CFLAGS $SDL_CFLAGS $WOFF2_CFLAGS $WL_STATIC_CFLAGS -DSILVER_VERSION="\"$VERSION\"" -DSILVER_STATIC_BUILD=1 -c silver_shim.c -o "$OUT/silver_shim_static.o"
     $AR rcs "$OUT/libsilvershim_static.a" "$OUT/silver_shim_static.o"
 fi
 
@@ -58,7 +81,7 @@ $CC $CFLAGS -c silver_dialogs_shim.c -o "$OUT/silver_dialogs_shim.o"
 $AR rcs "$OUT/libsilverdialogs.a" "$OUT/silver_dialogs_shim.o"
 
 # --- JS: QuickJS wbudowany w repo -------------------------------------------------------------
-echo "[silver] libsilverjs.a (QuickJS wbudowany)"
+echo "[silver] libsilverjs.a (QuickJS wbudowany; fetch/Workery w wątkach, import() po URL)"
 QJS="${QUICKJS_DIR:-third_party/quickjs-ng}"
 if [ ! -f "$QJS/quickjs.h" ]; then
     # Nie trzeba kopiować QuickJS ręcznie: gdy w repo brakuje third_party/quickjs-ng, pobieramy przypięty tag.
@@ -105,7 +128,7 @@ for f in quickjs libregexp libunicode cutils dtoa xsum; do
 done
 # shellcheck disable=SC2086
 $AR rcs "$OUT/libsilverjs.a" $OBJS
-echo "$TLS_LIBS" > "$OUT/js-libs.txt"
+echo "$TLS_LIBS -lpthread $NET_LIBS" > "$OUT/js-libs.txt"
 
 # --- pliki pkg-config -----------------------------------------------------------------------
 ABS_OUT="$(cd "$OUT" && pwd)"
@@ -121,8 +144,8 @@ write_pc() { # nazwa opis libs
         echo "Libs: -L\${libdir} -l$1 $3"
     } > "$PC/$1.pc"
 }
-write_pc silvershim    "Silver: warstwa okienna SDL2" "-lSDL2_image -lSDL2_ttf -lSDL2 $SHAPE_LIBS -lz -lm"
-write_pc silverjs      "Silver: QuickJS + mostek JS"  "$TLS_LIBS -lm -lpthread"
+write_pc silvershim    "Silver: warstwa okienna SDL2" "-lSDL2_image -lSDL2_ttf -lSDL2 $SHAPE_LIBS $WOFF2_LIBS $WLC_LIBS -lz -lm"
+write_pc silverjs      "Silver: QuickJS + mostek JS"  "$TLS_LIBS -lm -lpthread $NET_LIBS"
 write_pc silverdialogs "Silver: natywne dialogi"      ""
 
 if [ -f "$OUT/static-libs.txt" ]; then
@@ -151,4 +174,8 @@ sh ./pack-bit.sh
 
 echo "[silver] gotowe: $(ls $OUT/*.a | tr '\n' ' ')"
 echo "[silver] backend wideo: $( [ -f "$OUT/wayland.flag" ] && [ "$(cat "$OUT/wayland.flag")" = 1 ] && echo 'Wayland (domyślny) + X11 (opcja)' || echo 'X11 (statyczny SDL bez Waylanda albo wariant dynamiczny: Wayland z systemowego SDL2)')"
+# znacznik dla `bit` (native-skip-if): bez niego (stary build 0.4/X11) native zostanie zbudowany ponownie
+if [ -d "$OUT/bit" ]; then
+    echo "silver $VERSION native-0.5 wayland=$(cat "$OUT/wayland.flag" 2>/dev/null || echo 0)" > "$OUT/bit/silver-native.stamp"
+fi
 echo "[silver] pkg-config: . native/env.sh  (albo export PKG_CONFIG_PATH=$ABS_OUT/pkgconfig)"
