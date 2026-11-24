@@ -8041,11 +8041,13 @@ fn layout_full_b(d0: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport
     let mut cw: [int] = []
     let mut ch: [int] = []
     let mut cn: [string] = []
+    let mut cv: [string] = []
     let mut i: int = 0
     while i < n is
         cw = array_push(cw, -1)
         ch = array_push(ch, -1)
         cn = array_push(cn, "")
+        cv = array_push(cv, "")
         i += 1
     end
     let mut found_c: bool = false
@@ -8054,6 +8056,7 @@ fn layout_full_b(d0: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport
         let b: LayoutBox = r1.boxes[i]
         i += 1
         if b.kind != "box" || b.node_id <= 0 || b.node_id >= n is continue end
+        cv[b.node_id] = b.st.vars     ;; 0.5: zmienne CSS każdego elementu — dla @container style(--x: v)
         let ty: string = props::xget(b.st.xp, "container-type")
         if ty == "" || ty == "normal" is continue end
         cw[b.node_id] = b.w - b.st.pad_left - b.st.pad_right - b.st.bl - b.st.br
@@ -8062,8 +8065,9 @@ fn layout_full_b(d0: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport
         cn[b.node_id] = if nm == "none" then "" else nm
         found_c = true
     end
-    if !found_c is return r1 end
+    if !found_c && !css::sheet_has_style_cq(sheet) is return r1 end
     let mut ix2: css::InteractionState = ix
+    ix2.cq_vars = cv
     ix2.cq_w = cw
     ix2.cq_h = ch
     ix2.cq_names = cn
