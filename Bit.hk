@@ -1,6 +1,6 @@
 [package]
 -> name        => silver
--> version     => 0.4.0
+-> version     => 0.5.0
 -> description => Tauri-podobny framework okienkowy z własnym silnikiem renderującym (bez WebView)
 -> authors     => ["Bit Developers"]
 -> license     => MIT
@@ -13,7 +13,7 @@
 -> link => static
 -> native          => sh native/build.sh
 -> native-lib-path => native/build/bit
--> native-skip-if  => native/build/bit/libsilvershim.a
+-> native-skip-if  => native/build/bit/silver-native.stamp
 
 [lib]
 -> output => hlib
@@ -21,7 +21,7 @@
 [commands]
 -> test
 --> run => sh native/tests/run-all.sh
---> description => Typy H# + test natywny (SDL2/QuickJS/DOM) [+ run-js.sh gdy jest node]
+--> description => Testy natywne 0.5: klient HTTP(S), fetch/Worker/import()/wss/Shadow DOM/Intl w QuickJS, dekoder WOFF2, selftest SDL2
 -> native
 --> run => sh native/build.sh
 --> description => Zbuduj statyczne SDL2 + biblioteki natywne i złóż native/build/bit (samodzielne libsilvershim.a dla bit)
