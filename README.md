@@ -101,7 +101,7 @@ silver bundle <appimage|deb|macos|dmg|windows>
 - [docs/embedding.md](docs/embedding.md) — frontend wbudowany w binarkę (`silver embed`)
 - [docs/npm.md](docs/npm.md) — typy `@hackeros/silver-types` i publikacja na npm
 - [native/README.md](native/README.md) — warstwa natywna (SDL2, QuickJS, dialogi)
-- [ROADMAP.md](ROADMAP.md) — czego jeszcze nie ma · [CHANGELOG.md](CHANGELOG.md)
+- [ROADMAP.md](ROADMAP.md) — czego jeszcze nie ma · [CHANGELOG.md](CHANGELOG.md) · testy natywne: `sh native/tests/run-all.sh`
 
 ## Co jest zweryfikowane, a co nie (0.5)
 
@@ -113,6 +113,18 @@ silver bundle <appimage|deb|macos|dmg|windows>
 - **599 testów silnika** (`sh tools/run_engine_tests.sh`; kolejnych 12 wymaga fixtur/HarfBuzz — `SILVER_TEST_FULL=1`);
 - test natywny (`sh native/tests/run.sh`), type-check `@hackeros/silver-types` (`tsc`), `.deb` z jedną binarką.
 
-**Niesprawdzone / ograniczenia** — patrz [ROADMAP.md](ROADMAP.md): statyczny SDL nie ma libdecor (na GNOME/Wayland użyj `frameless` +
-`app-region` albo budowy dynamicznej), `wss://` nie było testowane na prawdziwym serwerze, macOS/Windows nie były uruchamiane,
-ścieżka pobierania źródeł wayland/xkbcommon z gitlaba nie była sprawdzona (przetestowano tarballe Ubuntu).
+**Sprawdzone w iteracji „0.5 rozbudowa”** (kompilator H# **nie** był dostępny; testowano warstwę C/JS: `sh native/tests/run-all.sh`):
+
+- klient HTTP/HTTPS w C (chunked, przekierowania, timeout, TLS z weryfikacją), `fetch` bez blokowania pętli, **`wss://` na prawdziwym serwerze TLS**;
+- **Workery w osobnych wątkach** (komunikacja, `importScripts`, timery, `fetch`, błędy, `terminate` pętli nieskończonej), `import()` po URL;
+- **dekoder WOFF2** zgodny z fontTools na ponad 20 tys. glifów; sonda GL `SILVER_RENDERER=auto` (dynamicznie i w pełni statycznie, Xvfb);
+- Shadow DOM (scoping CSS, `:host`, `::slotted`, fallback slotu, `slotchange`), `Intl` z danymi CLDR (porównanie z ICU), `structuredClone`;
+- pełny **statyczny build SDL2 + Wayland + xkbcommon** z zapasowych źródeł (Ubuntu 24.04), kompilacja shima i klienta sieci pod **MinGW (Windows)**.
+
+**Wayland:** jeśli aplikacje z `bit build --release` startują na X11, patrz `docs/backends.md` (sekcja „Aplikacje startują na X11…”): przebuduj warstwę natywną
+(`rm -rf native/build && sh native/build.sh`, potrzebne `meson ninja bison libexpat1-dev libffi-dev`). Statyczny build ma teraz prezenter `wl_shm` (okno Wayland bez OpenGL).
+
+**Nadal niesprawdzone / ograniczenia** — patrz [ROADMAP.md](ROADMAP.md): zmiany w silniku H# (jednostki `cq*`, `style()`) nie były kompilowane;
+statyczny SDL nie ma libdecor (na GNOME/Wayland użyj `frameless` + `app-region` albo budowy dynamicznej); macOS i Windows nie były *uruchamiane*
+(od teraz robi to CI: `.github/workflows/ci.yml`); AppImage zbudowano i uruchomiono (Linux), ale skrypty .app/.dmg/Windows oraz podpisywanie i notaryzacja nie były uruchamiane
+(`build.yml` je weryfikuje przy ręcznym starcie).
