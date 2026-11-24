@@ -181,8 +181,11 @@
   var focusedId = -1;
   var winInfo = { w: 0, h: 0 };
 
+  var shadowSeq = 0;
   function queueOp(o) {
+    var extra = (shadowSeq > 0 || (o.o === 'text' && typeof o.v === 'string' && o.v.indexOf('::part(') >= 0)) ? shadowPatch(o) : null;      // 0.5: enkapsulacja CSS Shadow DOM
     ops.push(o);
+    if (extra) for (var xi = 0; xi < extra.length; xi++) ops.push(extra[xi]);
     if (!flushQueued) { flushQueued = true; Promise.resolve().then(flush); }
   }
   function flush() {
@@ -412,6 +415,7 @@
       if (hh && hh.light) { var li = hh.light.indexOf(r.i); if (li >= 0) hh.light.splice(li, 1); }
       par = hh || par;
       r.slotHost = undefined;
+      r.isSlotted = false;
     }
     detach(r);
     queueOp({ o: 'remove', n: r.i });
@@ -1230,6 +1234,204 @@
     }
   }
 
+  // ---------- Shadow DOM 0.5: enkapsulacja CSS przez przepisywanie selektorów ----------
+  // Każdy element drzewa cienia dostaje atrybut data-silver-sh="N", host — data-silver-host="N".
+  // Reguły ze <style> wewnątrz cienia są przepisywane: każdy człon złożony dostaje [data-silver-sh="N"],
+  // :host / :host(x) / :host-context(x) → [data-silver-host="N"], ::slotted(x) → slot[data-silver-sh="N"] > x.
+  function cssParse(css) {
+    var blocks = [], i = 0, n = css.length, pre = '';
+    while (i < n) {
+      var ch = css[i];
+      if (ch === '/' && css[i + 1] === '*') { var e = css.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
+      if (ch === '"' || ch === "'") {
+        var j = i + 1; while (j < n && css[j] !== ch) { if (css[j] === '\\') j++; j++; }
+        pre += css.slice(i, j + 1); i = j + 1; continue;
+      }
+      if (ch === '(') {
+        var d = 0, k = i;
+        for (; k < n; k++) {
+          if (css[k] === '"' || css[k] === "'") { var q = css[k]; k++; while (k < n && css[k] !== q) { if (css[k] === '\\') k++; k++; } }
+          else if (css[k] === '(') d++;
+          else if (css[k] === ')') { d--; if (!d) break; }
+        }
+        pre += css.slice(i, k + 1); i = k + 1; continue;
+      }
+      if (ch === ';') { if (pre.trim()) blocks.push({ pre: pre.trim(), body: null }); pre = ''; i++; continue; }
+      if (ch === '{') {
+        var depth = 1, s = i + 1, p = s;
+        for (; p < n && depth; p++) {
+          var c2 = css[p];
+          if (c2 === '/' && css[p + 1] === '*') { var e2 = css.indexOf('*/', p + 2); p = e2 < 0 ? n : e2 + 1; }
+          else if (c2 === '"' || c2 === "'") { p++; while (p < n && css[p] !== c2) { if (css[p] === '\\') p++; p++; } }
+          else if (c2 === '{') depth++;
+          else if (c2 === '}') depth--;
+        }
+        blocks.push({ pre: pre.trim(), body: css.slice(s, depth ? n : p - 1) });
+        pre = ''; i = p; continue;
+      }
+      pre += ch; i++;
+    }
+    if (pre.trim()) blocks.push({ pre: pre.trim(), body: null });
+    return blocks;
+  }
+  function splitTop(s, sep) {
+    var out = [], d = 0, cur = '', q = '';
+    for (var i = 0; i < s.length; i++) {
+      var c = s[i];
+      if (q) { cur += c; if (c === '\\') { cur += s[++i] || ''; } else if (c === q) q = ''; continue; }
+      if (c === '"' || c === "'") { q = c; cur += c; continue; }
+      if (c === '(' || c === '[') d++; else if (c === ')' || c === ']') d--;
+      if (c === sep && d === 0) { out.push(cur); cur = ''; } else cur += c;
+    }
+    out.push(cur);
+    return out;
+  }
+  function parenEnd(s, open) {
+    var d = 0;
+    for (var i = open; i < s.length; i++) { if (s[i] === '(') d++; else if (s[i] === ')') { d--; if (!d) return i; } }
+    return s.length - 1;
+  }
+  function scopeAttr(sid) { return '[data-silver-sh="' + sid + '"]'; }
+  function hostAttr(sid) { return '[data-silver-host="' + sid + '"]'; }
+  function withScope(c, sid) {
+    var d = 0, pos = c.length;
+    for (var i = 0; i < c.length; i++) {
+      var ch = c[i];
+      if (ch === '(' || ch === '[') d++; else if (ch === ')' || ch === ']') d--;
+      else if (!d && ch === ':') {
+        if (c[i + 1] === ':' || /^:(before|after|first-line|first-letter)(?![\w-])/.test(c.slice(i))) { pos = i; break; }
+      }
+    }
+    var head = c.slice(0, pos);
+    if (head === '') head = '*';
+    return head + scopeAttr(sid) + c.slice(pos);
+  }
+  function scopeCompound(c, sid) {
+    if (/^:host(?![\w-])/.test(c)) {
+      if (c[5] === '(') { var e = parenEnd(c, 5); return hostAttr(sid) + c.slice(6, e) + c.slice(e + 1); }
+      return hostAttr(sid) + c.slice(5);
+    }
+    var si = c.indexOf('::slotted(');
+    if (si >= 0) {
+      var pre = c.slice(0, si) || 'slot', e2 = parenEnd(c, si + 9);
+      return withScope(pre, sid) + ' > ' + (c.slice(si + 10, e2) || '*') + c.slice(e2 + 1);
+    }
+    return withScope(c, sid);
+  }
+  function scopeSelector(sel, sid) {
+    sel = sel.trim();
+    if (!sel) return '';
+    var parts = [], cur = '', d = 0, q = '';
+    for (var i = 0; i < sel.length; i++) {
+      var c = sel[i];
+      if (q) { cur += c; if (c === '\\') cur += sel[++i] || ''; else if (c === q) q = ''; continue; }
+      if (c === '"' || c === "'") { q = c; cur += c; continue; }
+      if (c === '(' || c === '[') d++; else if (c === ')' || c === ']') d--;
+      if (!d && (c === ' ' || c === '\t' || c === '\n' || c === '>' || c === '+' || c === '~')) {
+        var comb = c;
+        var j = i;
+        while (j < sel.length && /[\s>+~]/.test(sel[j])) { if (sel[j] !== ' ' && sel[j] !== '\t' && sel[j] !== '\n') comb = sel[j]; j++; }
+        if (cur) parts.push(cur);
+        parts.push({ comb: /[>+~]/.test(comb) ? comb : ' ' });
+        cur = ''; i = j - 1; continue;
+      }
+      cur += c;
+    }
+    if (cur) parts.push(cur);
+    var variants = [''];
+    parts.forEach(function (p) {
+      if (typeof p !== 'string') { variants = variants.map(function (v) { return v + (p.comb === ' ' ? ' ' : ' ' + p.comb + ' '); }); return; }
+      if (/^:host-context\(/.test(p)) {                    // :host-context(x) → x host  |  x+host
+        var e = parenEnd(p, 13), inner = p.slice(14, e), rest = hostAttr(sid) + p.slice(e + 1);
+        var nv = [];
+        variants.forEach(function (v) { nv.push(v + inner + ' ' + rest); nv.push(v + inner + rest); });
+        variants = nv; return;
+      }
+      var sc = scopeCompound(p, sid);
+      variants = variants.map(function (v) { return v + sc; });
+    });
+    return variants.join(', ');
+  }
+  var BLOCK_AT = { media: 1, supports: 1, container: 1, layer: 1, document: 1, scope: 1, 'starting-style': 1 };
+  function scopeCss(css, sid) {
+    var out = '';
+    cssParse(String(css)).forEach(function (b) {
+      if (b.pre[0] === '@') {
+        var nm = (/^@([\w-]+)/.exec(b.pre) || [])[1] || '';
+        if (b.body === null) out += b.pre + ';\n';
+        else if (BLOCK_AT[nm]) out += b.pre + '{' + scopeCss(b.body, sid) + '}\n';
+        else out += b.pre + '{' + b.body + '}\n';
+      } else if (b.body !== null) {
+        out += splitTop(b.pre, ',').map(function (s) { return scopeSelector(s, sid); }).filter(Boolean).join(', ') + '{' + b.body + '}\n';
+      }
+    });
+    return out;
+  }
+  // ::part(nazwa) w stylach dokumentu: host::part(a b) → host [part~="a"][part~="b"][data-silver-sh]
+  // (elementy cienia są fizycznie potomkami hosta i mają znacznik data-silver-sh).
+  function rewriteParts(css) {
+    var out = '';
+    cssParse(String(css)).forEach(function (b) {
+      if (b.pre[0] === '@') {
+        var nm = (/^@([\w-]+)/.exec(b.pre) || [])[1] || '';
+        if (b.body === null) out += b.pre + ';\n';
+        else if (BLOCK_AT[nm]) out += b.pre + '{' + rewriteParts(b.body) + '}\n';
+        else out += b.pre + '{' + b.body + '}\n';
+      } else if (b.body !== null) {
+        var sels = splitTop(b.pre, ',').map(function (sel) {
+          var i = sel.indexOf('::part(');
+          if (i < 0) return sel;
+          var e = parenEnd(sel, i + 6), names = sel.slice(i + 7, e).trim().split(/\s+/).filter(Boolean);
+          if (!names.length) return sel;
+          return sel.slice(0, i).replace(/\s+$/, '') + ' ' + names.map(function (n) { return '[part~="' + n + '"]'; }).join('') + '[data-silver-sh]' + sel.slice(e + 1);
+        });
+        out += sels.join(', ') + '{' + b.body + '}\n';
+      }
+    });
+    return out;
+  }
+  g.__silver_scope_css = scopeCss;
+  g.__silver_rewrite_parts = rewriteParts;
+
+  function shadowIdOf(r) {                // id cienia, w którego drzewie (nie light DOM) leży rekord; 0 = brak
+    var c = r, n = 0;
+    while (c && n++ < 400) {
+      if (c.isSlotted) return 0;
+      if (c.isShadowBox) return c.shid || 0;
+      c = rec(c.p);
+    }
+    return 0;
+  }
+  function stampTree(r, sid, out) {
+    if (!r) return;
+    if (r.t === 'text') { var pr = rec(r.p); if (pr && pr.t === 'style') out.push({ o: 'text', n: r.i, v: scopeCss(r.x, sid) }); return; }
+    if (r.t === '#comment' || r.t === '#fragment') return;
+    if (r.isShadowBox && r.shid !== sid) return;                // zagnieżdżony cień ma własne znaczniki
+    if (r.sh !== sid) { r.sh = sid; out.push({ o: 'attr', n: r.i, k: 'data-silver-sh', v: String(sid) }); }
+    for (var i = 0; i < r.k.length; i++) {
+      var c = rec(r.k[i]);
+      if (c && !c.isSlotted && c.slotHost === undefined) stampTree(c, sid, out);
+    }
+  }
+  function shadowPatch(o) {
+    if (o.o === 'text') {
+      var r = rec(o.n); if (!r) return null;
+      var st = r.t === 'style' ? r : (r.t === 'text' && r.p !== -1 ? rec(r.p) : null);
+      if (st && st.t === 'style') { var sid = shadowIdOf(st); if (sid) o.v = scopeCss(String(o.v), sid); else if (String(o.v).indexOf('::part(') >= 0) o.v = rewriteParts(String(o.v)); }
+      return null;
+    }
+    if (o.o === 'append') {
+      var par = rec(o.n), ch = rec(o.c);
+      if (!par || !ch || ch.isSlotted || ch.slotHost !== undefined) return null;
+      var sid2 = shadowIdOf(par);
+      if (!sid2) return null;
+      var out = [];
+      stampTree(ch, sid2, out);
+      return out.length ? out : null;
+    }
+    return null;
+  }
+
   // ---------- Shadow DOM (spłaszczony: slotowanie fizycznie przenosi węzły light DOM) ----------
   var slotTimers = {};
   function shadowOwner(r) {
@@ -1260,14 +1462,29 @@
       var tgt = null;
       for (var i = 0; i < slots.length; i++) if ((slots[i].a.name || '') === nm) { tgt = slots[i]; break; }
       if (tgt) { if (!desired.has(tgt.i)) desired.set(tgt.i, []); desired.get(tgt.i).push(c); }
-      else if (c.p !== -1) { detach(c); queueOp({ o: 'remove', n: c.i }); }
+      else { c.isSlotted = false; if (c.p !== -1) { detach(c); queueOp({ o: 'remove', n: c.i }); } }
     });
+    var changed = [];
     slots.forEach(function (sl) {
       var want = desired.get(sl.i) || [];
-      var same = want.length === sl.k.length;
-      for (var i = 0; same && i < want.length; i++) if (sl.k[i] !== want[i].i) same = false;
-      if (same) return;
-      want.forEach(function (c) { var holder = c.slotHost; c.slotHost = undefined; insertRecRaw(sl, c); c.slotHost = holder; });
+      var cur = sl.k.filter(function (id) { var cc = rec(id); return cc && cc.isSlotted; });
+      var same = want.length === cur.length;
+      for (var i = 0; same && i < want.length; i++) if (cur[i] !== want[i].i) same = false;
+      if (!same) {
+        want.forEach(function (c) { c.isSlotted = true; var holder = c.slotHost; c.slotHost = undefined; insertRecRaw(sl, c); c.slotHost = holder; });
+        changed.push(sl);
+      }
+      // zawartość zapasowa <slot>…</slot>: widoczna tylko, gdy nic nie przypisano
+      var fb = sl.k.filter(function (id) { var cc = rec(id); return cc && !cc.isSlotted; });
+      if (want.length > 0 && !sl.fbOff) { fb.forEach(function (id) { queueOp({ o: 'remove', n: id }); }); sl.fbOff = true; }
+      else if (want.length === 0 && sl.fbOff) { fb.forEach(function (id) { queueOp({ o: 'append', n: sl.i, c: id, b: -1 }); }); sl.fbOff = false; }
+      else if (want.length > 0 && sl.fbOff && !same) { fb.forEach(function (id) { queueOp({ o: 'remove', n: id }); }); }
+    });
+    if (changed.length) Promise.resolve().then(function () {
+      changed.forEach(function (sl) {
+        var el = wrap(sl);
+        if (el) el.dispatchEvent(new g.Event('slotchange', { bubbles: true }));
+      });
     });
   }
   function insertRecRaw(parent, child) {
@@ -1315,6 +1532,8 @@
     var c = el.__r;
     c.isShadowBox = true;
     c.shadowOf = h.i;
+    c.shid = ++shadowSeq;
+    queueOp({ o: 'attr', n: h.i, k: 'data-silver-host', v: String(c.shid) });
     setAttr(c, 'data-silver-shadow', '');
     // dotychczasowe dzieci stają się light DOM
     var existing = h.k.slice();
@@ -1328,15 +1547,62 @@
     Object.defineProperty(root, 'mode', { value: init.mode === 'closed' ? 'closed' : 'open', configurable: true });
     Object.defineProperty(root, 'nodeType', { value: 11, configurable: true });
     Object.defineProperty(root, 'nodeName', { value: '#document-fragment', configurable: true });
-    root.adoptedStyleSheets = [];
+    defineAdopted(root, function () { return root; });
     root.__isShadowRoot = true;
     h.shadowEl = root;
     if (init.mode !== 'closed') Object.defineProperty(this, 'shadowRoot', { get: function () { return root; }, configurable: true });
     return root;
   };
   if (!Object.getOwnPropertyDescriptor(P, 'shadowRoot')) def('shadowRoot', function () { var r = this.__r; return r.shadowEl && r.shadowEl.mode === 'open' ? r.shadowEl : null; });
-  P.assignedNodes = function () { return this.__r.k.map(function (i) { return wrap(rec(i)); }).filter(function (n) { return n && n.__r.slotHost !== undefined; }); };
+  P.assignedNodes = function (opts) {
+    var r = this.__r, flatten = !!(opts && opts.flatten);
+    var own = r.k.map(function (i) { return rec(i); }).filter(function (c) { return c && c.isSlotted; });
+    if (!flatten) return own.map(wrap);
+    var out = [];
+    own.forEach(function (c) { if (c.t === 'slot') out.push.apply(out, wrap(c).assignedNodes({ flatten: true })); else out.push(wrap(c)); });
+    if (!own.length) r.k.forEach(function (i) { var c = rec(i); if (c && !c.isSlotted) { if (c.t === 'slot') out.push.apply(out, wrap(c).assignedNodes({ flatten: true })); else out.push(wrap(c)); } });
+    return out;
+  };
+  def('assignedSlot', function () { var r = this.__r; if (!r.isSlotted) return null; var s = rec(r.p); return s ? wrap(s) : null; });
   P.assignedElements = function () { return this.assignedNodes().filter(function (n) { return n.nodeType === 1; }); };
+  // ---- CSSStyleSheet (konstruowalne arkusze) + adoptedStyleSheets (0.5) ----
+  if (typeof g.CSSStyleSheet !== 'function') {
+    g.CSSStyleSheet = function CSSStyleSheet(opts) {
+      Object.defineProperty(this, '_users', { value: [], enumerable: false });
+      Object.defineProperty(this, '_rules', { value: [], enumerable: false, writable: true });
+      this.media = opts && opts.media ? String(opts.media) : ''; this.disabled = !!(opts && opts.disabled);
+    };
+    var SSP = g.CSSStyleSheet.prototype;
+    Object.defineProperty(SSP, '_css', { get: function () { return this.disabled ? '' : this._rules.join('\n'); } });
+    Object.defineProperty(SSP, 'cssRules', { get: function () { return this._rules.map(function (t) { return { cssText: t }; }); } });
+    SSP._notify = function () { this._users.slice().forEach(function (f) { f(); }); };
+    SSP.replaceSync = function (css) { this._rules = [String(css)]; this._notify(); };
+    SSP.replace = function (css) { this.replaceSync(css); return Promise.resolve(this); };
+    SSP.insertRule = function (rule, idx) { idx = idx === undefined ? 0 : idx; this._rules.splice(idx, 0, String(rule)); this._notify(); return idx; };
+    SSP.deleteRule = function (idx) { this._rules.splice(idx, 1); this._notify(); };
+  }
+  // root: obiekt z adoptedStyleSheets; host() zwraca element, do którego trafi <style> (cień → sam root, dokument → head)
+  function defineAdopted(root, host) {
+    var list = [], styleEl = null;
+    function sync() {
+      var h = host();
+      if (!h) return;
+      var css = list.map(function (sh) { return sh && sh._css ? sh._css : ''; }).join('\n');
+      if (!styleEl) { styleEl = document.createElement('style'); styleEl.setAttribute('data-silver-adopted', ''); h.appendChild(styleEl); }
+      styleEl.textContent = css;
+    }
+    Object.defineProperty(root, 'adoptedStyleSheets', {
+      configurable: true, enumerable: true,
+      get: function () { return list; },
+      set: function (v) {
+        list.forEach(function (sh) { if (sh && sh._users) { var k = sh._users.indexOf(sync); if (k >= 0) sh._users.splice(k, 1); } });
+        list = Array.prototype.slice.call(v || []);
+        list.forEach(function (sh) { if (!(sh instanceof g.CSSStyleSheet)) throw new TypeError('adoptedStyleSheets: oczekiwano CSSStyleSheet'); sh._users.push(sync); });
+        sync();
+      }
+    });
+  }
+  if (typeof document === 'object' && document && !('adoptedStyleSheets' in document)) defineAdopted(document, function () { return document.head || document.documentElement; });
   g.ShadowRoot = function ShadowRoot() { throw new TypeError('Illegal constructor'); };
   Object.defineProperty(g.ShadowRoot, Symbol.hasInstance, { value: function (v) { return !!(v && v.__isShadowRoot); } });
 
@@ -1483,15 +1749,17 @@
   function makeResponse(r, url) {
     var headers = new g.Headers(r.headers || {});
     var used = false;
-    function take() { if (used) return Promise.reject(new TypeError('Body już został odczytany')); used = true; return Promise.resolve(r.body === undefined ? '' : r.body); }
+    var bytes = r.bytes;                         // ArrayBuffer (fetch natywny) albo undefined (tekst)
+    function raw() { return bytes ? new g.TextDecoder().decode(bytes) : (r.body === undefined ? '' : r.body); }
+    function take(fn) { if (used) return Promise.reject(new TypeError('Body już został odczytany')); used = true; return Promise.resolve().then(fn); }
     var resp = {
-      ok: !!r.ok, status: r.status | 0, url: String(url), statusText: r.statusText || (r.ok ? 'OK' : ''), headers: headers, redirected: false, type: 'basic',
+      ok: !!r.ok, status: r.status | 0, url: String(r.url || url), statusText: r.statusText || (r.ok ? 'OK' : ''), headers: headers, redirected: !!r.redirected, type: 'basic',
       get bodyUsed() { return used; },
-      text: function () { return take(); },
-      json: function () { return take().then(function (t) { return JSON.parse(t); }); },
-      arrayBuffer: function () { return take().then(function (t) { return new g.TextEncoder().encode(t).buffer; }); },
-      blob: function () { return take().then(function (t) { return new g.Blob([t], { type: headers.get('content-type') || '' }); }); },
-      clone: function () { return makeResponse(r, url); }
+      text: function () { return take(raw); },
+      json: function () { return take(function () { return JSON.parse(raw()); }); },
+      arrayBuffer: function () { return take(function () { return bytes ? bytes.slice(0) : new g.TextEncoder().encode(raw()).buffer; }); },
+      blob: function () { return take(function () { var b = new g.Blob([raw()], { type: headers.get('content-type') || '' }); if (bytes) b._bytes = bytes.slice(0); return b; }); },
+      clone: function () { if (used) throw new TypeError('Body już został odczytany'); return makeResponse(r, url); }
     };
     return resp;
   }
@@ -1523,19 +1791,60 @@
       var bl = blobUrls[url];
       return Promise.resolve(makeResponse({ ok: true, status: 200, body: bodyToString(bl), headers: { 'content-type': bl.type || '' } }, url));
     }
-    var p = invoke('__fetch', { url: url, method: method, body: body, headers: headers })
-      .then(function (r) { return makeResponse(r, url); });
+    var rawBody = opts.body !== undefined ? opts.body : (req && req.body);
+    var p;
+    if (typeof __silver_fetch_start === 'function' && /^https?:\/\//i.test(url)) {
+      var nb = (rawBody instanceof ArrayBuffer) ? rawBody : (rawBody && ArrayBuffer.isView(rawBody)) ? rawBody.buffer.slice(rawBody.byteOffset, rawBody.byteOffset + rawBody.byteLength) : body;
+      p = nativeFetch(url, method, headers, nb, (opts.redirect === 'manual' || opts.redirect === 'error') ? 0 : 20, opts.redirect === 'error')
+        .catch(function (e) {
+          if (e && e.__fallback) return invoke('__fetch', { url: url, method: method, body: body, headers: headers }).then(function (r) { return makeResponse(r, url); });
+          throw e;
+        });
+    } else {
+      p = invoke('__fetch', { url: url, method: method, body: body, headers: headers })
+        .then(function (r) { return makeResponse(r, url); });
+    }
     if (!signal) return p;
     return new Promise(function (resolve, reject) {
       signal.addEventListener('abort', function () { reject(signal.reason !== undefined ? signal.reason : Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })); });
       p.then(resolve, reject);
     });
   };
+  // 0.5: fetch natywny (wątek + klient HTTP(S) w C): nie blokuje pętli, pełne nagłówki, TLS, przekierowania
+  var fetchSeq = 0, fetchWait = {};
+  function nativeFetch(url, method, headers, body, redirects, errOnRedirect) {
+    return new Promise(function (resolve, reject) {
+      var id = ++fetchSeq, hs = [];
+      Object.keys(headers).forEach(function (k) { hs.push(k + ': ' + String(headers[k]).replace(/[\r\n]+/g, ' ')); });
+      fetchWait[id] = { resolve: resolve, reject: reject, url: url, err: errOnRedirect };
+      var ok = false;
+      try { ok = __silver_fetch_start(id, method, url, hs.join('\n'), body === undefined ? '' : body, 30000, redirects); } catch (e) { ok = false; }
+      if (!ok) { delete fetchWait[id]; var f = new TypeError('Failed to fetch'); f.__fallback = true; reject(f); }
+    });
+  }
+  g.__silver_fetch_done = function (id, status, statusText, headersText, bytes, finalUrl, redirected, err) {
+    var w = fetchWait[id];
+    if (!w) return;
+    delete fetchWait[id];
+    if (err) {
+      var e = new TypeError('Failed to fetch: ' + err);
+      if (/OpenSSL|SILVER_TLS/.test(err)) e.__fallback = true;     // brak TLS w buildzie → stara ścieżka (curl)
+      w.reject(e); return;
+    }
+    if (w.err && status >= 300 && status < 400) { w.reject(new TypeError('Failed to fetch: redirect')); return; }
+    var hd = {};
+    String(headersText || '').split('\n').forEach(function (l) {
+      var i = l.indexOf(':'); if (i <= 0) return;
+      var k = l.slice(0, i), v = l.slice(i + 1).trim();
+      hd[k] = hd[k] !== undefined ? hd[k] + ', ' + v : v;
+    });
+    w.resolve(makeResponse({ ok: status >= 200 && status < 300, status: status, statusText: statusText, headers: hd, bytes: bytes, url: finalUrl, redirected: redirected }, w.url));
+  };
 
-  // ---------- Worker (w tym samym wątku, bez izolacji) ----------
+  // Zapas: Worker w tym samym wątku (gdy natywna warstwa nie ma wątków)
   var workerSeq = 0;
-  g.Worker = function Worker(url, opts) {
-    if (!(this instanceof g.Worker)) throw new TypeError("Worker: użyj 'new'");
+  var SameThreadWorker = function Worker(url, opts) {
+    if (!(this instanceof SameThreadWorker)) throw new TypeError("Worker: użyj 'new'");
     g.EventTarget.call(this);
     var self = this, id = ++workerSeq;
     this.onmessage = null; this.onerror = null; this.onmessageerror = null;
@@ -1556,7 +1865,13 @@
     scope.addEventListener = function (t, f, o) { inner.addEventListener(t, f, o); };
     scope.removeEventListener = function (t, f) { inner.removeEventListener(t, f); };
     scope.close = function () { dead = true; };
-    scope.importScripts = function () { throw new Error('importScripts nie jest dostępne (Worker działa w tym samym wątku) — użyj bundla'); };
+    scope.importScripts = function () {
+      for (var i = 0; i < arguments.length; i++) {
+        var txt = typeof __silver_read_text === 'function' ? __silver_read_text(String(arguments[i])) : null;
+        if (txt === null || txt === undefined) throw new Error('importScripts: nie można odczytać ' + arguments[i]);
+        new Function('scope', 'with (scope) {\n' + txt + '\n}').call(scope, scope);
+      }
+    };
     function deliver(data) {
       var ev = new g.Event('message'); ev.data = data; ev.target = scope;
       if (typeof scope.onmessage === 'function') { try { scope.onmessage(ev); } catch (e) { reportErr(e); } }
@@ -1583,8 +1898,72 @@
       queue.splice(0).forEach(function (d) { setTimeout(function () { if (!dead) deliver(d); }, 0); });
     }).catch(reportErr);
   };
+  SameThreadWorker.prototype = Object.create(g.EventTarget.prototype);
+  SameThreadWorker.prototype.constructor = SameThreadWorker;
+
+
+  // ---------- Worker: prawdziwy wątek z własnym środowiskiem QuickJS (0.5) ----------
+  var workerMap = {};
+  g.Worker = function Worker(url, opts) {
+    if (typeof __silver_worker_spawn !== 'function') return new SameThreadWorker(url, opts);
+    if (!(this instanceof g.Worker)) throw new TypeError("Worker: użyj 'new'");
+    g.EventTarget.call(this);
+    var self = this, id = ++workerSeq;
+    opts = opts || {};
+    this.onmessage = null; this.onerror = null; this.onmessageerror = null;
+    var dead = false, ready = false, queue = [];
+    workerMap[id] = this;
+    var href = typeof url === 'object' && url && url.href ? url.href : String(url);
+    var base = href;
+    this.__id = id;
+    this.postMessage = function (data) {
+      if (dead) return;
+      var text = g.__silver_ser(data);               // rzuca DataCloneError dla funkcji/symboli
+      if (!ready) { queue.push(text); return; }
+      __silver_worker_post(id, text);
+    };
+    this.terminate = function () {
+      if (dead) return;
+      dead = true; queue = [];
+      __silver_worker_terminate(id);
+      delete workerMap[id];
+    };
+    function fail(e) {
+      var ev = new g.Event('error', { cancelable: true });
+      ev.message = String(e && e.message !== undefined ? e.message : e); ev.error = e; ev.filename = base;
+      if (typeof self.onerror === 'function') self.onerror(ev);
+      self.dispatchEvent(ev);
+      if (!ev.defaultPrevented) console.error(ev.message);
+    }
+    self.__event = function (type, data) {
+      if (dead && type !== 'exit') return;
+      if (type === 'message') {
+        var ev = new g.Event('message');
+        try { ev.data = g.__silver_deser(data); } catch (e) { var me = new g.Event('messageerror'); if (typeof self.onmessageerror === 'function') self.onmessageerror(me); self.dispatchEvent(me); return; }
+        ev.origin = ''; ev.lastEventId = ''; ev.source = null; ev.ports = [];
+        if (typeof self.onmessage === 'function') { try { self.onmessage(ev); } catch (e) { console.error(e); } }
+        self.dispatchEvent(ev);
+      } else if (type === 'error') {
+        fail(new Error(data));
+      } else if (type === 'exit') {
+        dead = true; delete workerMap[id];
+      }
+    };
+    var local = !/^(https?|blob|data):/i.test(href) && typeof __silver_read_text === 'function' ? __silver_read_text(href.replace(/^file:\/\//, '')) : null;
+    (local !== null && local !== undefined ? Promise.resolve(local) : g.fetch(href).then(function (r) { if (!r.ok) throw new Error('Worker: nie można pobrać ' + href + ' (' + r.status + ')'); return r.text(); })).then(function (code) {
+      if (dead) return;
+      var ok = __silver_worker_spawn(id, code, String(opts.name || ''), href, opts.type === 'module');
+      if (!ok) { fail(new Error('Worker: nie można uruchomić wątku (limit Workerów?)')); dead = true; delete workerMap[id]; return; }
+      ready = true;
+      queue.splice(0).forEach(function (t) { __silver_worker_post(id, t); });
+    }).catch(function (e) { dead = true; delete workerMap[id]; fail(e); });
+  };
   g.Worker.prototype = Object.create(g.EventTarget.prototype);
   g.Worker.prototype.constructor = g.Worker;
+  g.__silver_worker_event = function (id, type, data) {
+    var w = workerMap[id];
+    if (w) w.__event(type, data);
+  };
 
   // ---------- WebSocket (natywny klient ws://) ----------
   var wsSeq = 0, wsMap = new Map();
