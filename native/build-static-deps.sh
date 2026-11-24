@@ -42,6 +42,8 @@ SDL2_IMAGE_VER="${SDL2_IMAGE_VER:-2.8.2}"
 WAYLAND_VER="${WAYLAND_VER:-1.23.1}"
 WAYLAND_PROTOCOLS_VER="${WAYLAND_PROTOCOLS_VER:-1.38}"
 XKBCOMMON_VER="${XKBCOMMON_VER:-1.7.0}"
+# SILVER_WAYLAND: 1 (domyślnie) = Wayland WYMAGANY — brak narzędzi/źródeł kończy się błędem (nie ma cichego zejścia do X11);
+#                 auto = spróbuj, a gdy się nie da, zbuduj samo X11 (stare zachowanie, z ostrzeżeniem); 0 = tylko X11.
 SILVER_WAYLAND="${SILVER_WAYLAND:-1}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 2)}"
 export CC="${CC:-cc}"
@@ -49,6 +51,7 @@ export CC="${CC:-cc}"
 if [ -f "$DEPS/lib/libSDL2.a" ] && [ -f "$DEPS/lib/libSDL2_ttf.a" ] \
    && [ -f "$DEPS/lib/libSDL2_image.a" ] && [ -f "$OUT/static-libs.txt" ] \
    && [ "$(cat "$DEPS/.stamp" 2>/dev/null)" = "$STAMP" ] \
+   && { [ "$SILVER_WAYLAND" = "0" ] || [ "$(cat "$OUT/wayland.flag" 2>/dev/null)" = "1" ] || [ "$SILVER_WAYLAND" = "auto" ]; } \
    && [ "${FORCE:-0}" != "1" ]; then
     echo "[silver] statyczne SDL2 już zbudowane ($DEPS) — FORCE=1 aby przebudować"
     exit 0
@@ -104,12 +107,17 @@ if [ "$SILVER_WAYLAND" = "1" ]; then
     export PKG_CONFIG_PATH="$DEPS/lib/pkgconfig:$DEPS/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     export PATH="$DEPS/bin:$PATH"
     wl_missing=""
-    for t in meson ninja pkg-config; do command -v $t >/dev/null 2>&1 || wl_missing="$wl_missing $t"; done
+    for t in meson ninja pkg-config bison; do command -v $t >/dev/null 2>&1 || wl_missing="$wl_missing $t"; done
     need_a libexpat.a; need_a libffi.a
     if [ -n "$wl_missing" ] || [ -n "$missing" ]; then
         echo "[silver] UWAGA: brak narzędzi/bibliotek do zbudowania Waylanda:$wl_missing $missing" >&2
         echo "         Debian/Ubuntu: apt install meson ninja-build pkg-config libexpat1-dev libffi-dev bison flex" >&2
-        echo "         → budowa BEZ Waylanda (tylko X11). Wymuś brak ostrzeżenia: SILVER_WAYLAND=0" >&2
+        if [ "$SILVER_WAYLAND" = "1" ]; then
+            echo "[silver] BŁĄD: Wayland jest wymagany (domyślnie), a brakuje narzędzi — inaczej aplikacje działałyby przez X11/XWayland." >&2
+            echo "         Doinstaluj pakiety wyżej i uruchom ponownie. Świadomie bez Waylanda: SILVER_WAYLAND=0, z zapasem na X11: SILVER_WAYLAND=auto" >&2
+            exit 1
+        fi
+        echo "         → budowa BEZ Waylanda (tylko X11; SILVER_WAYLAND=$SILVER_WAYLAND)" >&2
         missing=""
     else
         fetch_src() { # nazwa katalog url_xz url_gz [tarball_env]
@@ -125,8 +133,11 @@ if [ "$SILVER_WAYLAND" = "1" ]; then
         WL_URL="https://gitlab.freedesktop.org/wayland/wayland/-/releases/$WAYLAND_VER/downloads/wayland-$WAYLAND_VER.tar.xz"
         WP_URL="https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/$WAYLAND_PROTOCOLS_VER/downloads/wayland-protocols-$WAYLAND_PROTOCOLS_VER.tar.xz"
         echo "[silver] Wayland $WAYLAND_VER (statyczny)"
-        if fetch_src wayland wayland "$WL_URL" "" "${WAYLAND_TARBALL:-}" \
-           && fetch_src wayland-protocols wayland-protocols "$WP_URL" "" "${WAYLAND_PROTOCOLS_TARBALL:-}"; then
+        # 0.5: zapasowe źródła (gdy gitlab.freedesktop.org jest niedostępny / za proxy): orig.tar archiwum Ubuntu
+        WL_URL2="http://archive.ubuntu.com/ubuntu/pool/main/w/wayland/wayland_1.22.0.orig.tar.gz"
+        WP_URL2="http://archive.ubuntu.com/ubuntu/pool/main/w/wayland-protocols/wayland-protocols_1.34.orig.tar.xz"
+        if fetch_src wayland wayland "$WL_URL" "$WL_URL2" "${WAYLAND_TARBALL:-}" \
+           && fetch_src wayland-protocols wayland-protocols "$WP_URL" "$WP_URL2" "${WAYLAND_PROTOCOLS_TARBALL:-}"; then
             rm -rf "$SRC/wayland/b"
             ( meson setup "$SRC/wayland/b" "$SRC/wayland" --prefix="$DEPS" --libdir=lib --default-library=static \
                 -Ddocumentation=false -Dtests=false -Ddtd_validation=false -Dscanner=true -Dlibraries=true >/dev/null \
@@ -140,10 +151,17 @@ if [ "$SILVER_WAYLAND" = "1" ]; then
             XKB="${XKBCOMMON_DIR:-$SRC/libxkbcommon}"
             if [ ! -f "$XKB/meson.build" ]; then
                 echo "[silver] pobieram libxkbcommon $XKBCOMMON_VER…"
-                rm -rf "$SRC/libxkbcommon"
-                GIT_LFS_SKIP_SMUDGE=1 git clone -q --depth 1 --branch "xkbcommon-$XKBCOMMON_VER" \
-                    https://github.com/xkbcommon/libxkbcommon "$SRC/libxkbcommon" >/dev/null 2>&1 \
-                    || { echo "[silver] BŁĄD: nie mogę pobrać libxkbcommon (ustaw XKBCOMMON_DIR)" >&2; exit 1; }
+                rm -rf "$SRC/libxkbcommon"; mkdir -p "$SRC/libxkbcommon"
+                # 0.5: najpierw tarball z GitHuba (bez gita), potem płytki git clone
+                if dl "https://github.com/xkbcommon/libxkbcommon/archive/refs/tags/xkbcommon-$XKBCOMMON_VER.tar.gz" "$SRC/libxkbcommon.tgz" \
+                   && tar xzf "$SRC/libxkbcommon.tgz" -C "$SRC/libxkbcommon" --strip-components=1 2>/dev/null; then :
+                else
+                    rm -rf "$SRC/libxkbcommon"
+                    command -v git >/dev/null 2>&1 \
+                      && GIT_LFS_SKIP_SMUDGE=1 git clone -q --depth 1 --branch "xkbcommon-$XKBCOMMON_VER" \
+                           https://github.com/xkbcommon/libxkbcommon "$SRC/libxkbcommon" >/dev/null 2>&1 \
+                      || { echo "[silver] BŁĄD: nie mogę pobrać libxkbcommon (ustaw XKBCOMMON_DIR)" >&2; exit 1; }
+                fi
                 XKB="$SRC/libxkbcommon"
             fi
             echo "[silver] libxkbcommon (statyczny)"
@@ -155,6 +173,10 @@ if [ "$SILVER_WAYLAND" = "1" ]; then
               || { echo "[silver] BŁĄD: budowa libxkbcommon nie powiodła się" >&2; exit 1; }
             WAYLAND_OK=1
         else
+            if [ "$SILVER_WAYLAND" = "1" ]; then
+                echo "[silver] BŁĄD: nie mogę pobrać źródeł Waylanda (ustaw WAYLAND_TARBALL / WAYLAND_PROTOCOLS_TARBALL albo SILVER_WAYLAND=auto|0)" >&2
+                exit 1
+            fi
             echo "[silver] UWAGA: nie mogę pobrać źródeł Waylanda — budowa tylko z X11 (ustaw WAYLAND_TARBALL / WAYLAND_PROTOCOLS_TARBALL)" >&2
         fi
     fi
