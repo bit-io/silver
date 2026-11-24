@@ -3025,6 +3025,45 @@ fn t03q_container_shorthand_parsed() is
     assert_eq(props::xget(st.xp, "container-name"), "card")
 end
 
+#[test]
+fn t05q_container_units_cqw() is
+    let css_t: string = ".wrap { container-type: inline-size; width: 400px; } .item { width: 10cqw; height: 10px; }"
+    let boxes: [layout::LayoutBox] = lay_full("<div class=\"wrap\"><div class=\"item\">x</div></div>", css_t, 800)
+    assert_eq(find_box(boxes, 2, "box").w, 40)
+end
+
+#[test]
+fn t05q_container_units_cqmin_cqmax_in_calc() is
+    let css_t: string = ".wrap { container-type: size; width: 300px; height: 200px; } .item { width: calc(50cqmax + 2px); height: 10cqmin; }"
+    let boxes: [layout::LayoutBox] = lay_full("<div class=\"wrap\"><div class=\"item\">x</div></div>", css_t, 800)
+    let it: layout::LayoutBox = find_box(boxes, 2, "box")
+    assert_eq(it.w, 152)
+    assert_eq(it.h, 20)
+end
+
+#[test]
+fn t05q_container_units_without_container_use_viewport() is
+    let boxes: [layout::LayoutBox] = lay_full("<div class=\"item\">x</div>", ".item { width: 10cqw; height: 10px; }", 800)
+    assert_eq(find_box(boxes, 1, "box").w, 80)
+end
+
+#[test]
+fn t05q_container_style_query_custom_property() is
+    let css_t: string = ".card { --theme: dark; } .item { width: 10px; } @container style(--theme: dark) { .item { width: 66px; } } @container style(--theme: light) { .item { height: 44px; } }"
+    let boxes: [layout::LayoutBox] = lay_full("<div class=\"card\"><div class=\"item\">x</div></div>", css_t, 800)
+    let it: layout::LayoutBox = find_box(boxes, 2, "box")
+    assert_eq(it.w, 66)
+    assert_true(it.h != 44)
+end
+
+#[test]
+fn t05q_rewrite_units_pure() is
+    assert_eq(css::cq_rewrite_units("10cqw", 200, 100), "calc(10 * 200px / 100)")
+    assert_eq(css::cq_rewrite_units("-2.5cqh 3px", 200, 100), "calc(-2.5 * 100px / 100) 3px")
+    assert_eq(css::cq_rewrite_units("1cqmin", 200, 100), "calc(1 * 100px / 100)")
+    assert_eq(css::cq_rewrite_units("12px", 200, 100), "12px")
+end
+
 ;; ---------- 0.3: układ wielokolumnowy ----------
 fn lines_html(n: int) -> string is
     let mut out: string = ""
