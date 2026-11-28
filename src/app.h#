@@ -589,6 +589,32 @@ fn dump_tree(a: App, res: layout::LayoutResult, sts: [style::ComputedStyle], nid
     return left
 end
 
+;; SILVER_DUMP_CLASS=<fragment klasy> (z SILVER_DEBUG=3): dla pasujących węzłów wypisuje obliczone style i pudełko layoutu.
+fn dump_class(a: App, res: layout::LayoutResult) is
+    let target: string = env::get("SILVER_DUMP_CLASS")
+    if target == "" is return end
+    let sts: [style::ComputedStyle] = layout::debug_styles(a.dom, a.sheet, interaction_state(a))
+    let nn: int = array_len(a.dom.nodes)
+    let mut i: int = 0
+    while i < nn is
+        let nd: dom::DomNode = a.dom.nodes[i]
+        if !nd.removed && string_find(nd.attr_class, target) >= 0 && i < array_len(sts) is
+            let st: style::ComputedStyle = sts[i]
+            let mut bw: string = "-"
+            let mut k: int = 0
+            while k < array_len(res.boxes) is
+                if res.boxes[k].node_id == i is
+                    bw = to_string(res.boxes[k].x) + "," + to_string(res.boxes[k].y) + " " + to_string(res.boxes[k].w) + "x" + to_string(res.boxes[k].h)
+                    break
+                end
+                k += 1
+            end
+            js::js_debug("  CLS n=" + to_string(i) + " parent=" + to_string(nd.parent) + " <" + nd.tag + " ." + nd.attr_class + "> disp=" + st.display + " cols='" + st.grid_cols + "' w=" + to_string(st.width) + "/" + to_string(st.width_pct) + "/" + st.width_mode + " maxw=" + to_string(st.max_width) + " align=" + st.align + " cspan=" + to_string(st.grid_col_span) + " rspan=" + to_string(st.grid_row_span) + " rstart=" + to_string(st.grid_row_start) + " cstart=" + to_string(st.grid_col_start) + " area=" + st.grid_area + " flow=" + st.grid_auto_flow + " gap=" + to_string(st.gap) + "/" + to_string(st.row_gap) + " box=" + bw)
+        end
+        i += 1
+    end
+end
+
 fn dump_layout(a: App, res: layout::LayoutResult) is
     let nb: int = array_len(res.boxes)
     let nn: int = array_len(a.dom.nodes)
@@ -3282,16 +3308,25 @@ fn page_background(a: App) -> style::Color is
     return col
 end
 
+fn rssm(tag: string) is
+    if env::get("SILVER_RSS") == "" is return end
+    let t: string = process::run("grep VmRSS /proc/$PPID/status")
+    println("[RSS] " + tag + " " + string_trim(string_replace(t, "VmRSS:", "")))
+end
+
 pub fn relayout(a0: App, now: int) -> App is
     let mut a: App = a0
+    rssm("relayout-start")
     a.viewport_w = window::ffi_width(a.win)
     a.viewport_h = window::ffi_height(a.win)
     let ix_now: css::InteractionState = interaction_state(a)
     let mut act: anim::AnimCtx = anim::no_anim()
     if a.has_motion || dom_has_motion(a) is
         let raw: [style::ComputedStyle] = layout::compute_styles(a.dom, a.sheet, ix_now)
+        rssm("compute_styles(motion)")
         a = update_motion(a, raw, now)
         act = motion_ctx(a, now)
+        rssm("update_motion")
     elsif array_len(a.prev_st) > 0 || a.anim_busy is
         a.prev_st = []
         a.kf_nodes = []
@@ -3311,6 +3346,7 @@ pub fn relayout(a0: App, now: int) -> App is
     let zp: int = if a.zoom_pct < 25 then 100 else a.zoom_pct
     let res: layout::LayoutResult = layout::layout_full_a(a.dom, a.sheet, a.viewport_w * 100 / zp, a.viewport_h * 100 / zp, a.win.handle,
                                                           ix_now, a.elem_scroll, act)
+    rssm("layout_full_a")
     let rboxes: [layout::LayoutBox] = if zp == 100 then res.boxes else layout::scale_all(res.boxes, zp)
     let anchor_dy: int = layout::scroll_anchor_delta(a.boxes, rboxes, a.scroll_y, a.viewport_h)
     a.boxes = rboxes
@@ -3319,14 +3355,21 @@ pub fn relayout(a0: App, now: int) -> App is
     if debug_on() is
         log::info("silver[debug]: layout viewport=" + to_string(a.viewport_w) + "x" + to_string(a.viewport_h) + " dom=" + to_string(array_len(a.dom.nodes)) + " boxes=" + to_string(array_len(res.boxes)) + " doc_h=" + to_string(res.height) + " css_rules=" + to_string(array_len(a.sheet.rules)))
     end
-    if debug_boxes() is dump_layout(a, res) end
+    if debug_boxes() is
+        dump_layout(a, res)
+        dump_class(a, res)
+    end
     let mx: int = max_page_scroll(a)
     if a.scroll_y > mx is a.scroll_y = mx end
     a.dirty_layout = false
     a.dirty_paint = true
+    rssm("pre-transitions")
     a = detect_transitions(a, now)
+    rssm("detect_transitions")
     a = push_layout(a)
+    rssm("push_layout")
     a = sync_drag_regions(a)
+    rssm("sync_drag")
     ;; IME: podpowiedz pozycję pola
     if a.focused_node >= 0 && a.focused_node < array_len(a.dom.nodes) is
         let b: layout::LayoutBox = box_of(a, a.focused_node)
