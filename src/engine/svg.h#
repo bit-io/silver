@@ -765,6 +765,22 @@ pub fn markup(d: dom::Dom, styles: [style::ComputedStyle], root: int, w: int, h:
     let sr: string = string_lower(props::xget(styles[root].xp, "shape-rendering"))
     let sr_attr: string = if sr == "crispedges" || sr == "optimizespeed" then " data-sr=\"" + sr + "\"" else ""
     let root_open: string = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + to_string(w) + "\" height=\"" + to_string(h) + "\" viewBox=\"" + vbs + "\"" + par_attr + sr_attr + ">"
+    ;; Atrybuty prezentacyjne samego <svg> (fill, stroke, stroke-width… — tak rysują ikony lucide: fill="none" stroke="currentColor")
+    ;; dziedziczą potomkowie, więc przekazujemy je jako atrybuty <g> wokół zawartości (currentColor → kolor węzła <svg>).
+    let pres_names: [string] = ["fill", "fill-opacity", "fill-rule", "stroke", "stroke-opacity", "stroke-width", "stroke-linecap",
+        "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset"]
+    let mut root_g: string = ""
+    let mut pi: int = 0
+    while pi < array_len(pres_names) is
+        let pv: string = string_trim(dom::get_attr(n, pres_names[pi]))
+        if pv != "" && props::xget(styles[root].xp, pres_names[pi]) == "" is
+            root_g = root_g + " " + camel_attr(pres_names[pi]) + "=\"" + esc_attr(resolve_current(pv, styles[root])) + "\""
+        end
+        pi += 1
+    end
+    if root_g != "" && string_find(inner, "\u001e") < 0 is
+        return root_open + "<g" + root_g + ">" + inner + "</g></svg>"
+    end
     if string_find(inner, "\u001e") < 0 is return root_open + inner + "</svg>" end
     ;; 0.4: są elementy z efektami — dokument rozbity na warstwy (patrz native/silver_svgfx.h)
     let mut vbx: f64 = 0.0
