@@ -56,6 +56,8 @@ pub struct LayoutCtx is
     pub scrolls: [int]    ;; płaskie pary [id, offset, id, offset, …]
     pub floats: [int]     ;; aktywne floaty: rekordy [strona(0=lewa,1=prawa), góra, dół, x0, x1]
     pub excl:   [int]     ;; wrap-flow: wykluczenia [x, y, w, h, tryb, id węzła] z poprzedniego przebiegu
+    pub force_id: int     ;; węzeł, któremu flex narzucił wysokość (-1 = brak): dzieci z height:100% liczą od niej
+    pub force_h:  int     ;; narzucona wysokość ramki (border-box) dla force_id
 end
 
 struct BlockRes is
@@ -1813,7 +1815,7 @@ fn contains_any(st: style::ComputedStyle, words: string) -> bool is
 end
 
 fn with_floats(cx: LayoutCtx, fls: [int]) -> LayoutCtx is
-    return LayoutCtx { dom: cx.dom, styles: cx.styles, win: cx.win, vw: cx.vw, vh: cx.vh, scrolls: cx.scrolls, floats: fls, excl: cx.excl }
+    return LayoutCtx { dom: cx.dom, styles: cx.styles, win: cx.win, vw: cx.vw, vh: cx.vh, scrolls: cx.scrolls, floats: fls, excl: cx.excl, force_id: cx.force_id, force_h: cx.force_h }
 end
 
 ;; Granice poziome w pasie [y0, y1): [lewa, prawa, czy_kolizja(0/1)] we współrzędnych bezwzględnych.
@@ -2627,6 +2629,9 @@ fn flex_items(cx: LayoutCtx, id: int, row: bool, container_align: string, inner_
         let cn: dom::DomNode = cx.dom.nodes[cid]
         let cst: style::ComputedStyle = cx.styles[cid]
         if cn.tag != "text" && is_out_of_flow(cst) is continue end
+        ;; CSS: tekst złożony wyłącznie z białych znaków w kontenerze flex/grid nie jest elementem (Svelte/JSX wstawiają spację
+        ;; między rodzeństwem — bez tego zajmuje komórkę siatki albo dokłada przerwę we flexie).
+        if cn.tag == "text" && string_trim(cn.text) == "" && string_find(cx.styles[id].white_space, "pre") < 0 is continue end
         let is_text: bool = cn.tag == "text"
         let own_h: int = if is_text then 0 else pad_border_h(cst)
         let mut basis: int = 0
@@ -2813,7 +2818,7 @@ fn layout_flex(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
             let mut line_cross: int = 0
             k = from
             while k < to is
-                let r: BlockRes = layout_item(cx, items[k], id, items[k].main, w, -1, false)
+                let r: BlockRes = layout_item(cx, items[k], id, items[k].main, w, inner_h, false)
                 results = array_push(results, r)
                 let outer_h: int = r.h + items[k].mt + items[k].mb
                 if outer_h > line_cross is line_cross = outer_h end
@@ -2899,7 +2904,7 @@ fn layout_flex(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
         else is
             let cst: style::ComputedStyle = cx.styles[it.id]
             let stretch: bool = it.align == "stretch" && cst.width_mode == "auto" && !is_replaced(cx.dom.nodes[it.id].tag)
-            r = layout_block(cx, it.id, 0, 0, w, -1, if stretch then avail else -1, !stretch)
+            r = layout_block(cx, it.id, 0, 0, w, inner_h, if stretch then avail else -1, !stretch)
         end
         results = array_push(results, r)
         heights = array_push(heights, r.h)
@@ -2909,6 +2914,24 @@ fn layout_flex(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
     end
     total = total + main_gap * (count - 1)
     let free: int = if inner_h >= 0 then inner_h - total else 0
+    ;; flex-shrink w kolumnie: elementy z overflow ≠ visible (min-height:auto → 0) oddają brakujące miejsce proporcjonalnie do
+    ;; wysokości × flex-shrink — dzięki temu `flex-1 overflow-y-auto` nie wypycha stopki poza okno.
+    let mut shr_w: [int] = []
+    let mut shr_sum: int = 0
+    if free < 0 is
+        let mut q: int = 0
+        while q < count is
+            let sit: FItem = items[q]
+            let mut wq: int = 0
+            if !sit.is_text is
+                let sst: style::ComputedStyle = cx.styles[sit.id]
+                if sst.overflow_y != "visible" && sst.flex_shrink > 0 is wq = heights[q] * sst.flex_shrink / 1000 end
+            end
+            shr_w = array_push(shr_w, wq)
+            shr_sum = shr_sum + wq
+            q += 1
+        end
+    end
     let mut cursor: int = y
     let mut offset: int = 0
     let mut extra_gap: int = 0
@@ -2934,9 +2957,33 @@ fn layout_flex(cx: LayoutCtx, id: int, x: int, y: int, w: int, inner_h: int, box
         let r: BlockRes = results[i]
         let mut boxes_i: [LayoutBox] = r.boxes
         let mut h: int = r.h
+        if free < 0 && shr_sum > 0 && array_len(shr_w) > i && shr_w[i] > 0 && !it.is_text is
+            let mut sub: int = (0 - free) * shr_w[i] / shr_sum
+            if sub > h is sub = h end
+            let mut hmin: int = cx.styles[it.id].min_height
+            if hmin < 0 is hmin = 0 end
+            if h - sub < hmin is sub = h - hmin end
+            if sub > 0 is
+                h = h - sub
+                let cx3: LayoutCtx = LayoutCtx { dom: cx.dom, styles: cx.styles, win: cx.win, vw: cx.vw, vh: cx.vh, scrolls: cx.scrolls, floats: cx.floats, excl: cx.excl, force_id: it.id, force_h: h }
+                let cst3: style::ComputedStyle = cx.styles[it.id]
+                let stretch3: bool = it.align == "stretch" && cst3.width_mode == "auto" && !is_replaced(cx.dom.nodes[it.id].tag)
+                let r3: BlockRes = layout_block(cx3, it.id, 0, 0, w, inner_h, if stretch3 then w - it.ml - it.mr else -1, !stretch3)
+                boxes_i = r3.boxes
+                if array_len(boxes_i) > 0 is boxes_i[0].h = h end
+            end
+        end
         if free > 0 && grow_sum > 0 && it.grow > 0 is
             let add: int = free * it.grow / grow_sum
             h = h + add
+            if !it.is_text is
+                ;; ponowne ułożenie z narzuconą wysokością, żeby dzieci (height:100%, flex-1…) zobaczyły nową wysokość
+                let cx2: LayoutCtx = LayoutCtx { dom: cx.dom, styles: cx.styles, win: cx.win, vw: cx.vw, vh: cx.vh, scrolls: cx.scrolls, floats: cx.floats, excl: cx.excl, force_id: it.id, force_h: h }
+                let cst2: style::ComputedStyle = cx.styles[it.id]
+                let stretch2: bool = it.align == "stretch" && cst2.width_mode == "auto" && !is_replaced(cx.dom.nodes[it.id].tag)
+                let r2: BlockRes = layout_block(cx2, it.id, 0, 0, w, inner_h, if stretch2 then w - it.ml - it.mr else -1, !stretch2)
+                boxes_i = r2.boxes
+            end
             if array_len(boxes_i) > 0 is boxes_i[0].h = h end
         end
         let outer_w: int = r.w + r.ml + r.mr + it.ml + it.mr
@@ -5214,7 +5261,7 @@ fn layout_vertical(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avail_h
     styles2[id].xp = props::xset(st.xp, "x-vert-inner", "1")
     styles2[id].height_mode = "auto"
     styles2[id].min_height = 0
-    let cx2: LayoutCtx = LayoutCtx { dom: cx.dom, styles: styles2, win: cx.win, vw: cx.vw, vh: cx.vh, scrolls: cx.scrolls, floats: [], excl: cx.excl }
+    let cx2: LayoutCtx = LayoutCtx { dom: cx.dom, styles: styles2, win: cx.win, vw: cx.vw, vh: cx.vh, scrolls: cx.scrolls, floats: [], excl: cx.excl, force_id: cx.force_id, force_h: cx.force_h }
     let r: BlockRes = layout_block(cx2, id, 0, 0, inline_size + m_or_zero(st.mar_left) + m_or_zero(st.mar_right), -1, inline_size, false)
     let mut bx: [LayoutBox] = r.boxes
     if kind == "lr" is bx = mirror_block_axis(bx, r.h) end
@@ -5247,6 +5294,11 @@ fn layout_block_inner(cx: LayoutCtx, id: int, x: int, y: int, avail_w: int, avai
     let replaced: bool = is_replaced(n.tag)
     let mut w_spec: int = style::size_of(st.width, st.width_pct, st.width_mode, avail_w)
     let mut h_spec: int = style::size_of(st.height, st.height_pct, st.height_mode, avail_h)
+    ;; wysokość narzucona przez flex (po rozdzieleniu wolnego miejsca) — dzieci z height:100% mają od czego liczyć
+    if id == cx.force_id && cx.force_h >= 0 is
+        h_spec = if st.border_box then cx.force_h else cx.force_h - own_v
+        if h_spec < 0 is h_spec = 0 end
+    end
     ;; 0.4: resize — rozmiar ustawiony przez użytkownika (ramka border-box) nadpisuje width/height
     let rz_w: int = scroll_offset(cx, resize_key_w(id))
     let rz_h: int = scroll_offset(cx, resize_key_h(id))
@@ -8256,7 +8308,7 @@ fn layout_core(d0: dom::Dom, sheet: css::Stylesheet, viewport_w: int, viewport_h
     let styles1: [style::ComputedStyle] = used_font_fixups(d1, contents_fix_styles(d1, compute_styles_a(d1, sheet, ix, act)), win_handle)
     let d: dom::Dom = hoist_contents(d1, styles1)
     let styles: [style::ComputedStyle] = styles1
-    let cx: LayoutCtx = LayoutCtx { dom: d, styles: styles, win: win_handle, vw: viewport_w, vh: viewport_h, scrolls: scrolls, floats: [], excl: ix.excl }
+    let cx: LayoutCtx = LayoutCtx { dom: d, styles: styles, win: win_handle, vw: viewport_w, vh: viewport_h, scrolls: scrolls, floats: [], excl: ix.excl, force_id: -1, force_h: -1 }
     let res: BlockRes = layout_block(cx, 0, 0, 0, viewport_w, viewport_h, viewport_w, false)
     let mut boxes: [LayoutBox] = apply_line_grids(cx, res.boxes)
     let mut doc_h: int = res.h
