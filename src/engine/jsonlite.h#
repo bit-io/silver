@@ -13,49 +13,69 @@ end
 
 ;; Odwrotność escape dla zawartości napisu JSON (bez otaczających cudzysłowów).
 pub fn unescape(s: string) -> string is
-    if string_find(s, "\\") < 0 is return s end
+    ;; Bajt po bajcie (byte_at nie alokuje; w H# każdy string_slice(s, i, i + 1) to malloc bez zwolnienia) i kawałkami —
+    ;; zamiast sklejać wynik znak po znaku.
+    let first: int = find_byte(s, 92, 0)
+    if first < 0 is return s end
     let n: int = string_len(s)
     let mut out: string = ""
     let mut i: int = 0
     while i < n is
-        let c: string = string_slice(s, i, i + 1)
-        if c == "\\" && i + 1 < n is
-            let e: string = string_slice(s, i + 1, i + 2)
-            if e == "n" is
-                out = out + "\n"
-            elsif e == "t" is
-                out = out + "\t"
-            elsif e == "r" is
-                out = out + "\r"
-            elsif e == "b" is
-                out = out + "\u0008"
-            elsif e == "f" is
-                out = out + "\u000c"
-            elsif e == "u" && i + 5 < n is
-                let hex: string = string_slice(s, i + 2, i + 6)
-                out = out + char_code_to_str(hex_val(hex))
-                i += 4
-            else is
-                out = out + e
-            end
-            i += 2
+        let j: int = find_byte(s, 92, i)
+        if j < 0 is
+            out = out + string_slice(s, i, n)
+            break
+        end
+        if j > i is out = out + string_slice(s, i, j) end
+        if j + 1 >= n is
+            out = out + "\\"
+            break
+        end
+        let e: int = byte_at(s, j + 1)
+        if e == 110 is
+            out = out + "\n"
+            i = j + 2
+        elsif e == 116 is
+            out = out + "\t"
+            i = j + 2
+        elsif e == 114 is
+            out = out + "\r"
+            i = j + 2
+        elsif e == 98 is
+            out = out + "\u0008"
+            i = j + 2
+        elsif e == 102 is
+            out = out + "\u000c"
+            i = j + 2
+        elsif e == 117 && j + 5 < n is
+            out = out + char_code_to_str(hex_val(string_slice(s, j + 2, j + 6)))
+            i = j + 6
         else is
-            out = out + c
-            i += 1
+            out = out + string_slice(s, j + 1, j + 2)
+            i = j + 2
         end
     end
     return out
 end
 
+fn find_byte(s: string, b: int, from: int) -> int is
+    let n: int = string_len(s)
+    let mut i: int = from
+    while i < n is
+        if byte_at(s, i) == b is return i end
+        i += 1
+    end
+    return -1
+end
+
 fn hex_val(s: string) -> int is
-    let digits: string = "0123456789abcdef"
-    let lower: string = string_lower(s)
     let mut r: int = 0
     let mut i: int = 0
-    while i < string_len(lower) is
-        let idx: int = string_find(digits, string_slice(lower, i, i + 1))
-        if idx < 0 is return 63 end
-        r = r * 16 + idx
+    while i < string_len(s) is
+        let c: int = byte_at(s, i)
+        let d: int = if c >= 48 && c <= 57 then c - 48 elsif c >= 97 && c <= 102 then c - 87 elsif c >= 65 && c <= 70 then c - 55 else -1
+        if d < 0 is return 63 end
+        r = r * 16 + d
         i += 1
     end
     return r
@@ -68,8 +88,7 @@ end
 ;; Rozbija tekst obiektu/tablicy na elementy najwyższego poziomu (surowe teksty).
 ;; Dla obiektu elementem jest "klucz:wartość" (klucz z cudzysłowami).
 fn split_top(body: string) -> [string] is
-    ;; Wycina kawałki (string_slice) zamiast sklejać je znak po znaku: `cur = cur + c` robiło O(n²) śmieci,
-    ;; a backend C++ H# nie zwalnia pamięci (każdy get_raw na kilkukilobajtowym store = MB wycieku).
+    ;; byte_at zamiast string_slice(body, i, i + 1): H# nie zwalnia stringów, więc alokacja na znak = MB wycieku na każdy get_raw.
     let n: int = string_len(body)
     let mut out: [string] = []
     let mut depth: int = 0
@@ -78,25 +97,25 @@ fn split_top(body: string) -> [string] is
     let mut start: int = 0
     let mut i: int = 0
     while i < n is
-        let c: string = string_slice(body, i, i + 1)
+        let c: int = byte_at(body, i)
         i += 1
         if in_str is
             if esc is
                 esc = false
-            elsif c == "\\" is
+            elsif c == 92 is
                 esc = true
-            elsif c == "\"" is
+            elsif c == 34 is
                 in_str = false
             end
             continue
         end
-        if c == "\"" is
+        if c == 34 is
             in_str = true
-        elsif c == "[" || c == "{" is
+        elsif c == 91 || c == 123 is
             depth += 1
-        elsif c == "]" || c == "}" is
+        elsif c == 93 || c == 125 is
             depth -= 1
-        elsif c == "," && depth == 0 is
+        elsif c == 44 && depth == 0 is
             let seg: string = string_trim(string_slice(body, start, i - 1))
             if seg != "" is out = array_push(out, seg) end
             start = i
@@ -109,8 +128,9 @@ end
 
 fn inner_of(raw: string, open: string, close: string) -> string is
     let t: string = string_trim(raw)
-    if string_len(t) >= 2 && string_slice(t, 0, 1) == open && string_ends_with(t, close) is
-        return string_slice(t, 1, string_len(t) - 1)
+    let n: int = string_len(t)
+    if n >= 2 && byte_at(t, 0) == byte_at(open, 0) && byte_at(t, n - 1) == byte_at(close, 0) is
+        return string_slice(t, 1, n - 1)
     end
     return ""
 end
@@ -127,18 +147,18 @@ fn colon_pos(entry: string) -> int is
     let mut esc: bool = false
     let mut i: int = 0
     while i < n is
-        let c: string = string_slice(entry, i, i + 1)
+        let c: int = byte_at(entry, i)
         if in_str is
             if esc is
                 esc = false
-            elsif c == "\\" is
+            elsif c == 92 is
                 esc = true
-            elsif c == "\"" is
+            elsif c == 34 is
                 in_str = false
             end
-        elsif c == "\"" is
+        elsif c == 34 is
             in_str = true
-        elsif c == ":" is
+        elsif c == 58 is
             return i
         end
         i += 1
