@@ -553,32 +553,34 @@ end
 
 ;; Podział wartości po spacjach z poszanowaniem nawiasów: `1px solid rgb(0, 0, 0)`
 pub fn split_top(val: string) -> [string] is
+    ;; byte_at + cięcie (bez alokacji na znak; w H# stringi nie są zwalniane). Bajty ASCII nie występują wewnątrz sekwencji UTF-8,
+    ;; więc skanowanie bajtowe jest bezpieczne.
     let n: int = string_len(val)
     let mut out: [string] = []
     let mut depth: int = 0
-    let mut cur: string = ""
-    let mut quote: string = ""
+    let mut quote: int = 0
+    let mut start: int = -1
     let mut i: int = 0
     while i < n is
-        let nx: int = ffi_shim::silver_utf8_next(val, i)
-        let c: string = string_slice(val, i, nx)
-        if quote != "" is
-            if c == quote is quote = "" end
-            cur = cur + c
+        let c: int = byte_at(val, i)
+        if quote != 0 is
+            if c == quote is quote = 0 end
         else is
-            if c == "\"" || c == "'" is quote = c end
-            if c == "(" is depth += 1 end
-            if c == ")" is depth -= 1 end
-            if (c == " " || c == "\t" || c == "\n") && depth <= 0 && quote == "" is
-                if cur != "" is out = array_push(out, cur) end
-                cur = ""
-            else is
-                cur = cur + c
+            if c == 34 || c == 39 is quote = c end
+            if c == 40 is depth += 1 end
+            if c == 41 is depth -= 1 end
+            if (c == 32 || c == 9 || c == 10) && depth <= 0 && quote == 0 is
+                if start >= 0 is
+                    out = array_push(out, string_slice(val, start, i))
+                    start = -1
+                end
+            elsif start < 0 is
+                start = i
             end
         end
-        i = nx
+        i += 1
     end
-    if cur != "" is out = array_push(out, cur) end
+    if start >= 0 is out = array_push(out, string_slice(val, start, n)) end
     return out
 end
 
@@ -587,28 +589,24 @@ pub fn split_commas(val: string) -> [string] is
     let n: int = string_len(val)
     let mut out: [string] = []
     let mut depth: int = 0
-    let mut cur: string = ""
-    let mut quote: string = ""
+    let mut quote: int = 0
+    let mut start: int = 0
     let mut i: int = 0
     while i < n is
-        let nx: int = ffi_shim::silver_utf8_next(val, i)
-        let c: string = string_slice(val, i, nx)
-        if quote != "" is
-            if c == quote is quote = "" end
-            cur = cur + c
+        let c: int = byte_at(val, i)
+        if quote != 0 is
+            if c == quote is quote = 0 end
         else is
-            if c == "\"" || c == "'" is quote = c end
-            if c == "(" is depth += 1 end
-            if c == ")" is depth -= 1 end
-            if c == "," && depth <= 0 && quote == "" is
-                if true is out = array_push(out, string_trim(cur)) end
-                cur = ""
-            else is
-                cur = cur + c
+            if c == 34 || c == 39 is quote = c end
+            if c == 40 is depth += 1 end
+            if c == 41 is depth -= 1 end
+            if c == 44 && depth <= 0 && quote == 0 is
+                out = array_push(out, string_trim(string_slice(val, start, i)))
+                start = i + 1
             end
         end
-        i = nx
+        i += 1
     end
-    if true is out = array_push(out, string_trim(cur)) end
+    out = array_push(out, string_trim(string_slice(val, start, n)))
     return out
 end
