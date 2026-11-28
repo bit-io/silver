@@ -51,10 +51,24 @@ fn is_name_char(c: string) -> bool is
 end
 
 pub fn find_from(s: string, needle: string, from: int) -> int is
-    if from >= string_len(s) is return -1 end
-    let idx: int = string_find(string_slice(s, from, string_len(s)), needle)
-    if idx < 0 is return -1 end
-    return idx + from
+    ;; Bez alokacji: w runtime H# każdy string_slice/string_at to nigdy niezwalniane malloc, a poprzednia wersja kopiowała
+    ;; cały pozostały tekst przy każdym wywołaniu (100 KB CSS → setki MB).
+    let n: int = string_len(s)
+    let m: int = string_len(needle)
+    let mut i: int = if from < 0 then 0 else from
+    if i >= n is return -1 end
+    if m == 0 is return i end
+    let b0: int = byte_at(needle, 0)
+    let last: int = n - m
+    while i <= last is
+        if byte_at(s, i) == b0 is
+            let mut k: int = 1
+            while k < m && byte_at(s, i + k) == byte_at(needle, k) is k += 1 end
+            if k == m is return i end
+        end
+        i += 1
+    end
+    return -1
 end
 
 ;; ---------- encje ----------
